@@ -10,12 +10,12 @@ use tauri_plugin_opener::OpenerExt;
 use url::Url;
 
 use crate::cookies::{self, AccountSummary};
-use crate::db::{HistoryItem, LibraryItem};
+use crate::db::{HistoryItem, LibraryFilter, LibraryItem};
 use crate::download::{self, EnqueueResult, OrphanPart, PostOptions, TaskSnapshot};
 use crate::model::{AppError, AppResult, MediaInfo, MediaKind, PlaylistEntry, SeriesInfo};
 use crate::providers::{self, DetectedLink};
 use crate::settings::Settings;
-use crate::{clipboard, diagnostics, quality, tools, tray, AppState};
+use crate::{clipboard, diagnostics, phone, quality, tools, tray, AppState};
 
 const REPO: &str = "DiXuanAoYi/Short_Video-API";
 
@@ -73,6 +73,8 @@ pub async fn save_settings(app: AppHandle, state: St<'_>, settings: Settings) ->
     // 旧版明文 Cookie 字段不再写回
     s.cookies.clear();
     s.cookie_updated_at.clear();
+    // 手机发送的令牌和已配对设备只通过专门的命令修改，避免被设置页的旧数据覆盖
+    s.phone = old.phone.clone();
     s.save(&state.settings_path)?;
     *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
     if old.shortcut != s.shortcut {
@@ -82,6 +84,9 @@ pub async fn save_settings(app: AppHandle, state: St<'_>, settings: Settings) ->
         state.net.invalidate();
     }
     tray::sync_watch_item(&app);
+    if !s.prevent_sleep {
+        crate::power::keep_awake(false);
+    }
     if old.concurrency != s.concurrency || old.per_site_concurrency != s.per_site_concurrency {
         download::schedule(&app);
     }
@@ -188,6 +193,33 @@ pub async fn enqueue_entries(app: AppHandle, state: St<'_>, playlist: MediaInfo,
         let _ = app.emit(EVT_BATCH, p);
     });
     Ok(n)
+}
+
+// ---------- 手机发送 ----------
+
+#[tauri::command]
+pub fn phone_info(app: AppHandle) -> phone::PhoneInfo {
+    phone::info(&app)
+}
+
+#[tauri::command]
+pub async fn phone_enable(app: AppHandle, on: bool) -> AppResult<phone::PhoneInfo> {
+    phone::set_enabled(&app, on).await
+}
+
+#[tauri::command]
+pub fn phone_reset_token(app: AppHandle) -> AppResult<phone::PhoneInfo> {
+    phone::reset_token(&app)
+}
+
+#[tauri::command]
+pub fn phone_revoke(app: AppHandle, device_id: String) -> AppResult<phone::PhoneInfo> {
+    phone::revoke(&app, &device_id)
+}
+
+#[tauri::command]
+pub fn phone_pair_respond(app: AppHandle, device_id: String, accept: bool) -> AppResult<phone::PhoneInfo> {
+    phone::respond_pair(&app, &device_id, accept)
 }
 
 // ---------- 组件（yt-dlp / ffmpeg） ----------
@@ -299,8 +331,151 @@ pub async fn clear_history(state: St<'_>) -> AppResult<()> {
 }
 
 #[tauri::command]
-pub async fn list_library(state: St<'_>, query: Option<String>) -> AppResult<Vec<LibraryItem>> {
-    state.db.list_library(query.as_deref().unwrap_or(""), 1000)
+pub async fn list_library(state: St<'_>, filter: Option<LibraryFilter>) -> AppResult<Vec<LibraryItem>> {
+    state.db.search_library(&filter.unwrap_or_default(), 5000)
+}
+
+#[tauri::command]
+pub async fn library_platforms(state: St<'_>) -> AppResult<Vec<crate::db::PlatformCount>> {
+    state.db.library_platforms()
+}
+
+/// 重新下载媒体库里的一项（文件被移动或删除时）：重新解析原链接，下载同一个资源。
+#[tauri::command]
+pub async fn redownload(app: AppHandle, state: St<'_>, id: i64) -> AppResult<EnqueueResult> {
+    let item = state.db.library_item(id)?.ok_or_else(|| AppError::not_found("记录不存在"))?;
+    if item.source_url.is_empty() {
+        return Err(AppError::invalid("这条记录没有保存原链接，无法重新下载。请重新粘贴链接解析。"));
+    }
+    if item.exists {
+        return Err(AppError::invalid("文件还在原位置，不需要重新下载。"));
+    }
+    let settings = state.settings();
+    let info = providers::resolve_url(&state.parse_ctx(&settings), &item.source_url).await?;
+    let (ids, post) = match info.asset(&item.asset_id) {
+        Some(a) => (vec![a.id.clone()], PostOptions::default()),
+        None => quality::auto_selection(&info, &settings),
+    };
+    download::enqueue_with(&app, info, &ids, post)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthResult {
+    platform: String,
+    name: String,
+    sample: Option<String>,
+    ok: bool,
+    millis: u64,
+    message: String,
+    kind: Option<crate::error::ErrorKind>,
+}
+
+/// 内置示例链接（长期稳定的公开内容）；其他平台用最近一次成功解析的链接。
+const HEALTH_SAMPLES: &[(&str, &str)] =
+    &[("bilibili", "https://www.bilibili.com/video/BV1GJ411x7h7"), ("yt-dlp", "https://www.youtube.com/watch?v=jNQXAC9IVRw")];
+
+/// 平台健康检查：用示例链接测试各平台解析是否正常。
+#[tauri::command]
+pub async fn health_check(state: St<'_>) -> AppResult<Vec<HealthResult>> {
+    let settings = state.settings();
+    let mut targets: Vec<(String, String)> = providers::all().iter().map(|p| (p.id().to_string(), p.name().to_string())).collect();
+    targets.push(("yt-dlp".into(), "yt-dlp（其他网站）".into()));
+    let mut out = vec![];
+    for (id, name) in targets {
+        let sample = state.db.latest_source_url(&id)?.or_else(|| HEALTH_SAMPLES.iter().find(|(p, _)| *p == id).map(|(_, u)| u.to_string()));
+        let Some(url) = sample.clone() else {
+            out.push(HealthResult {
+                platform: id,
+                name,
+                sample: None,
+                ok: false,
+                millis: 0,
+                message: "没有示例链接：成功解析过一次该平台的链接后即可检测".into(),
+                kind: None,
+            });
+            continue;
+        };
+        let ctx = state.parse_ctx(&settings);
+        if id == "yt-dlp" && ctx.ytdlp.is_none() {
+            out.push(HealthResult {
+                platform: id,
+                name,
+                sample,
+                ok: false,
+                millis: 0,
+                message: "未安装 yt-dlp".into(),
+                kind: Some(crate::error::ErrorKind::NeedUpdate),
+            });
+            continue;
+        }
+        let t = std::time::Instant::now();
+        let r = if id == "yt-dlp" {
+            tokio::time::timeout(std::time::Duration::from_secs(60), providers::ytdlp::resolve(&ctx, &url)).await
+        } else {
+            tokio::time::timeout(std::time::Duration::from_secs(30), providers::resolve_url(&ctx, &url)).await
+        };
+        let millis = t.elapsed().as_millis() as u64;
+        out.push(match r {
+            Ok(Ok(info)) => HealthResult {
+                platform: id,
+                name,
+                sample,
+                ok: true,
+                millis,
+                message: format!("正常：{}（{} 个资源）", info.title, info.assets.len().max(info.entries.len())),
+                kind: None,
+            },
+            Ok(Err(e)) => HealthResult { platform: id, name, sample, ok: false, millis, message: e.message.clone(), kind: Some(e.kind) },
+            Err(_) => HealthResult { platform: id, name, sample, ok: false, millis, message: "超时".into(), kind: Some(crate::error::ErrorKind::Network) },
+        });
+    }
+    Ok(out)
+}
+
+// ---------- 队列排序、定时、完成后动作 ----------
+
+#[tauri::command]
+pub fn move_task(app: AppHandle, id: i64, to: String) {
+    download::move_task(&app, id, &to)
+}
+
+#[tauri::command]
+pub fn schedule_task(app: AppHandle, id: i64, start_at: Option<i64>) {
+    download::schedule_task(&app, id, start_at)
+}
+
+#[tauri::command]
+pub fn get_after_all_done(state: St<'_>) -> String {
+    state.after_all_done.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+#[tauri::command]
+pub fn set_after_all_done(state: St<'_>, action: String) -> AppResult<()> {
+    if !matches!(action.as_str(), "none" | "sleep" | "shutdown") {
+        return Err(AppError::invalid("未知操作"));
+    }
+    *state.after_all_done.lock().unwrap_or_else(|e| e.into_inner()) = action;
+    Ok(())
+}
+
+/// 读取拖入的文本文件（只读前 1 MB），用于批量导入链接。
+#[tauri::command]
+pub async fn read_links_file(path: String) -> AppResult<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(&path)?;
+    let mut buf = vec![];
+    f.by_ref().take(1024 * 1024).read_to_end(&mut buf)?;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    if providers::extract_urls(&text).is_empty() {
+        return Err(AppError::invalid("文件里没有找到链接。"));
+    }
+    Ok(text)
+}
+
+#[tauri::command]
+pub fn is_portable() -> bool {
+    crate::portable_dir().is_some()
 }
 
 #[tauri::command]

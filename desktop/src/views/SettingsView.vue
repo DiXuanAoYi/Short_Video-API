@@ -9,6 +9,8 @@ import { previewFilename } from '../utils/format'
 import AccountsPanel from '../components/AccountsPanel.vue'
 import NetworkPanel from '../components/NetworkPanel.vue'
 import ComponentsPanel from '../components/ComponentsPanel.vue'
+import PhonePanel from '../components/PhonePanel.vue'
+import type { HealthResult } from '../types'
 import { copyDiagnostics } from '../composables/diagnostics'
 
 const app = useAppStore()
@@ -18,6 +20,31 @@ const update = ref<UpdateInfo | null>(null)
 const checking = ref(false)
 // 快捷键在输入框失焦后才生效，避免输入到一半就注册
 const shortcutDraft = ref(form.value.shortcut)
+const domainsText = ref(form.value.clipboardDomains.join('\n'))
+const health = ref<HealthResult[] | null>(null)
+const checkingHealth = ref(false)
+const portable = ref(false)
+api.isPortable().then((v) => (portable.value = v)).catch(() => {})
+
+function saveDomains() {
+  form.value.clipboardDomains = domainsText.value
+    .split(/[\s,，]+/)
+    .map((d) => d.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '').replace(/^\*?\./, ''))
+    .filter((d) => d.includes('.'))
+  domainsText.value = form.value.clipboardDomains.join('\n')
+}
+
+async function runHealth() {
+  checkingHealth.value = true
+  health.value = null
+  try {
+    health.value = await api.healthCheck()
+  } catch (e) {
+    ElMessage.error(errorText(e))
+  } finally {
+    checkingHealth.value = false
+  }
+}
 
 const namePreview = computed(() =>
   previewFilename(form.value.filenameTemplate, { author: '山野厨房', title: '秋天第一锅板栗焖鸡', id: '7421234567890123456', platform: '抖音' }),
@@ -163,6 +190,38 @@ function insertVar(v: string) {
             </div>
             <small class="mute">关闭程序、断网或下载地址过期后，任务都会从已下载的位置继续；服务器不支持续传时会自动从头下载。</small>
           </section>
+
+          <section class="group card">
+            <h3>整理</h3>
+            <div class="kv">
+              <span>把标题、作者、封面写入文件<small class="mute block">需要 ffmpeg；视频和音频在播放器、音乐软件里能显示信息</small></span>
+              <el-switch v-model="form.embedMetadata" />
+            </div>
+            <div class="kv"><span>保存作品信息 JSON<small class="mute block">标题、作者、原链接、发布时间等，与视频同名</small></span><el-switch v-model="form.writeInfoJson" /></div>
+            <div class="kv"><span>生成 NFO 文件<small class="mute block">Jellyfin、Kodi、Plex 等媒体服务器能识别</small></span><el-switch v-model="form.writeNfo" /></div>
+            <div class="kv">
+              <span>音视频合并后的格式<small class="mute block">MKV 兼容的编码更多，MP4 播放兼容性更好</small></span>
+              <el-select v-model="form.mergeContainer" size="small" class="sel">
+                <el-option value="mp4" label="MP4" />
+                <el-option value="mkv" label="MKV" />
+              </el-select>
+            </div>
+          </section>
+
+          <section class="group card">
+            <h3>完成后</h3>
+            <div class="kv"><span>全部完成后打开下载文件夹</span><el-switch v-model="form.openFolderOnDone" /></div>
+            <div class="kv"><span>有下载任务时阻止系统休眠</span><el-switch v-model="form.preventSleep" /></div>
+            <div class="kv">
+              <span>每个任务完成后运行命令<small class="mute block">高级功能，只运行你自己填写的命令</small></span>
+              <el-switch v-model="form.postScriptEnabled" />
+            </div>
+            <div v-if="form.postScriptEnabled" class="field">
+              <el-input v-model="form.postScript" size="small" class="mono" placeholder='例如：python "D:\tools\upload.py"' />
+              <small class="mute">文件路径等信息通过环境变量传入：CLEARCLIP_FILE、CLEARCLIP_TITLE、CLEARCLIP_AUTHOR、CLEARCLIP_URL、CLEARCLIP_PLATFORM。</small>
+            </div>
+            <small class="mute">“全部完成后睡眠 / 关机”在下载队列页面设置，只对本次运行有效。</small>
+          </section>
         </div>
       </el-tab-pane>
 
@@ -180,6 +239,15 @@ function insertVar(v: string) {
               <el-input v-model="shortcutDraft" size="small" placeholder="CommandOrControl+Shift+D" class="mono" @change="form.shortcut = shortcutDraft.trim()" />
               <small v-if="app.shortcutError" class="err">{{ app.shortcutError }}</small>
               <small v-else class="mute">格式如 CommandOrControl+Shift+D，留空表示不使用。</small>
+            </div>
+            <div class="kv">
+              <span>识别所有网址<small class="mute block">关闭时只识别内置平台和下面列出的网站，避免复制普通网址时频繁弹窗</small></span>
+              <el-switch v-model="form.clipboardAllSites" />
+            </div>
+            <div v-if="!form.clipboardAllSites" class="field">
+              <label>额外识别的网站</label>
+              <el-input v-model="domainsText" type="textarea" :rows="3" size="small" class="mono" placeholder="youtube.com" @change="saveDomains" />
+              <small class="mute">每行一个域名，同时匹配子域名。</small>
             </div>
           </section>
           <section class="group card">
@@ -262,6 +330,10 @@ function insertVar(v: string) {
         <AccountsPanel />
       </el-tab-pane>
 
+      <el-tab-pane label="手机发送" name="phone">
+        <PhonePanel />
+      </el-tab-pane>
+
       <el-tab-pane label="组件" name="components">
         <ComponentsPanel v-model="form.componentMirrors" />
       </el-tab-pane>
@@ -285,6 +357,19 @@ function insertVar(v: string) {
             <p class="mute small">样本会去掉 Cookie、令牌和链接里的签名参数，但页面内容里仍可能有你的昵称等信息，分享前请检查。</p>
             <div class="inline"><el-button size="small" @click="call(api.openSamplesDir)">打开样本目录</el-button></div>
           </section>
+          <section class="group card wide">
+            <h3>平台健康检查</h3>
+            <p class="mute small">用示例链接（最近一次成功解析的链接，或内置示例）测试各平台解析是否正常，用于判断是网站改版还是网络问题。</p>
+            <div class="inline"><el-button size="small" type="primary" :loading="checkingHealth" @click="runHealth">开始检查</el-button></div>
+            <div v-if="health" class="health">
+              <div v-for="h in health" :key="h.platform" class="hrow">
+                <span :class="h.ok ? 'okc' : h.sample ? 'err' : 'mute'">{{ h.ok ? '●' : h.sample ? '●' : '○' }}</span>
+                <b>{{ h.name }}</b>
+                <small class="ellipsis" :class="h.ok ? '' : h.sample ? 'err' : 'mute'" :title="h.message">{{ h.message }}</small>
+                <small class="mono mute">{{ h.millis ? `${(h.millis / 1000).toFixed(1)}s` : '' }}</small>
+              </div>
+            </div>
+          </section>
         </div>
       </el-tab-pane>
 
@@ -302,6 +387,7 @@ function insertVar(v: string) {
             </div>
             <div class="kv"><span>关闭窗口时最小化到托盘</span><el-switch v-model="form.closeToTray" /></div>
             <div class="kv"><span>启动时检查更新</span><el-switch v-model="form.checkUpdate" /></div>
+            <small v-if="portable" class="mute">便携模式：设置、数据库和日志保存在程序目录下的 data 文件夹。</small>
           </section>
           <section class="group card">
             <h3>关于</h3>
@@ -424,6 +510,24 @@ h3 {
 .var:hover {
   border-color: var(--cc-acc);
   color: var(--cc-acc);
+}
+.wide {
+  grid-column: 1 / -1;
+}
+.health {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.hrow {
+  display: grid;
+  grid-template-columns: 14px 150px 1fr 48px;
+  gap: 8px;
+  align-items: center;
+  font-size: 12.5px;
+}
+.okc {
+  color: var(--cc-ok);
 }
 .small {
   font-size: 12px;

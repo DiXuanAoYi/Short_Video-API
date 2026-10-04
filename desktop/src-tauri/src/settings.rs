@@ -245,7 +245,51 @@ pub struct Settings {
     pub generic_sniffer: bool,
     /// 下载组件时使用的 GitHub 镜像前缀，如 `https://ghfast.top/`
     pub component_mirrors: Vec<String>,
+    /// 剪贴板监听是否识别所有网址；关闭时只识别内置平台和 `clipboard_domains`
+    pub clipboard_all_sites: bool,
+    /// 剪贴板监听额外识别的网站（域名后缀）
+    pub clipboard_domains: Vec<String>,
+    /// 手机发链接到电脑
+    pub phone: PhoneSettings,
+    /// 把标题、作者、封面写入视频 / 音频文件
+    pub embed_metadata: bool,
+    /// 保存作品信息 JSON（标题、简介、原链接等）
+    pub write_info_json: bool,
+    /// 生成 Jellyfin / Plex 能识别的 NFO 文件
+    pub write_nfo: bool,
+    /// 全部下载完成后打开下载文件夹
+    pub open_folder_on_done: bool,
+    /// 每个任务完成后运行的命令（默认关闭）。文件路径通过环境变量 CLEARCLIP_FILE 传入
+    pub post_script_enabled: bool,
+    pub post_script: String,
+    /// 有下载任务时阻止系统休眠
+    pub prevent_sleep: bool,
 }
+
+/// 已配对的手机。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairedDevice {
+    pub id: String,
+    pub name: String,
+    pub added_at: i64,
+    pub last_seen: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PhoneSettings {
+    pub enabled: bool,
+    /// 固定端口，让快捷指令里的地址保持不变；0 表示首次开启时随机选择
+    pub port: u16,
+    /// 访问令牌（写在二维码和快捷指令里）
+    pub token: String,
+    pub devices: Vec<PairedDevice>,
+}
+
+/// 剪贴板默认额外识别的常用网站。
+pub const DEFAULT_CLIPBOARD_DOMAINS: &[&str] =
+    &["youtube.com", "youtu.be", "pornhub.com", "x.com", "twitter.com", "tiktok.com", "instagram.com", "vimeo.com", "twitch.tv", "acfun.cn", "ixigua.com"];
 
 impl Default for Settings {
     fn default() -> Self {
@@ -291,6 +335,16 @@ impl Default for Settings {
             use_ytdlp: true,
             generic_sniffer: true,
             component_mirrors: vec![],
+            clipboard_all_sites: false,
+            clipboard_domains: DEFAULT_CLIPBOARD_DOMAINS.iter().map(|d| d.to_string()).collect(),
+            phone: PhoneSettings::default(),
+            embed_metadata: true,
+            write_info_json: false,
+            write_nfo: false,
+            open_folder_on_done: false,
+            post_script_enabled: false,
+            post_script: String::new(),
+            prevent_sleep: true,
         }
     }
 }
@@ -331,12 +385,13 @@ impl Settings {
         if !matches!(self.merge_container.as_str(), "mp4" | "mkv") {
             self.merge_container = "mp4".into();
         }
-        if !matches!(self.audio_format.as_str(), "mp3" | "m4a") {
+        if !matches!(self.audio_format.as_str(), "mp3" | "m4a" | "opus" | "flac") {
             self.audio_format = "mp3".into();
         }
-        if self.series_template.trim().is_empty() {
-            self.series_template = Settings::default().series_template;
-        }
+        self.series_template = self.series_template.trim().to_string();
+        self.clipboard_domains =
+            self.clipboard_domains.iter().map(|d| d.trim().trim_start_matches('.').to_ascii_lowercase()).filter(|d| d.contains('.')).collect();
+        self.phone.devices.truncate(50);
         self.component_mirrors = self
             .component_mirrors
             .iter()

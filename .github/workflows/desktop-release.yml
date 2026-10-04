@@ -68,3 +68,18 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+      # Windows 便携版：免安装 zip，数据保存在程序目录的 data 文件夹（旁边放一个 portable 文件即启用）
+      - name: Upload Windows portable zip
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = (Get-Content desktop/src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          $dir = "ClearClip-$version-portable"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item desktop/src-tauri/target/release/clearclip.exe $dir/
+          Set-Content -Path "$dir/portable" -Value "设置、数据和日志保存在本目录的 data 文件夹。删除此文件则改用系统应用数据目录。"
+          Compress-Archive -Path $dir -DestinationPath "$dir-windows-x64.zip" -Force
+          gh release upload "desktop-v$version" "$dir-windows-x64.zip" --clobber

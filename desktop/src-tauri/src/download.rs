@@ -80,6 +80,15 @@ pub struct JobSpec {
     pub inputs: Vec<Asset>,
     #[serde(default)]
     pub post: PostOptions,
+    /// 排序优先级：越大越先开始
+    #[serde(default)]
+    pub priority: i64,
+    /// 定时开始（Unix 秒）；未到时间时保持等待
+    #[serde(default)]
+    pub start_at: Option<i64>,
+    /// 来源：manual（默认）/ subscription / live
+    #[serde(default)]
+    pub origin: Option<String>,
 }
 
 impl JobSpec {
@@ -121,6 +130,8 @@ pub struct TaskSnapshot {
     pub step: Option<String>,
     /// 输入数量（大于 1 时需要合并）
     pub inputs: usize,
+    pub priority: i64,
+    pub start_at: Option<i64>,
     pub created_at: i64,
     pub finished_at: Option<i64>,
 }
@@ -163,6 +174,11 @@ impl DownloadManager {
 
     pub fn snapshots(&self) -> Vec<TaskSnapshot> {
         self.lock().iter().map(|e| e.snap.clone()).collect()
+    }
+
+    /// 是否有正在下载的任务（定时未到的不算）。
+    pub fn has_active_running(&self) -> bool {
+        self.lock().iter().any(|e| e.snap.status == TaskStatus::Running)
     }
 
     pub fn has_active(&self) -> bool {
@@ -213,10 +229,9 @@ pub fn input_part_path(settings: &Settings, job_id: i64, final_path: &Path, i: u
 }
 
 fn parse_spec(json: &str) -> Option<JobSpec> {
-    serde_json::from_str::<JobSpec>(json)
-        .ok()
-        .filter(|s| !s.inputs.is_empty())
-        .or_else(|| serde_json::from_str::<Asset>(json).ok().map(|a| JobSpec { inputs: vec![a], post: PostOptions::default() }))
+    serde_json::from_str::<JobSpec>(json).ok().filter(|s| !s.inputs.is_empty()).or_else(|| {
+        serde_json::from_str::<Asset>(json).ok().map(|a| JobSpec { inputs: vec![a], post: PostOptions::default(), priority: 0, start_at: None, origin: None })
+    })
 }
 
 fn parse_meta(json: &str) -> JobMeta {
@@ -307,6 +322,8 @@ fn snapshot_for(id: i64, media: &MediaInfo, spec: &JobSpec, path: &str, status: 
         resumable: None,
         step: None,
         inputs: spec.inputs.len(),
+        priority: spec.priority,
+        start_at: spec.start_at,
         created_at,
         finished_at: None,
     }
@@ -325,7 +342,7 @@ pub fn build_specs(media: &MediaInfo, asset_ids: &[String]) -> Vec<JobSpec> {
                     inputs.push(audio.clone());
                 }
             }
-            JobSpec { inputs, post: PostOptions::default() }
+            JobSpec { inputs, post: PostOptions::default(), priority: 0, start_at: None, origin: None }
         })
         .collect()
 }
@@ -370,6 +387,9 @@ pub fn enqueue_with(app: &AppHandle, media: MediaInfo, asset_ids: &[String], pos
                 continue;
             }
             let mut out_asset = primary.clone();
+            if spec.inputs.len() > 1 && settings.merge_container == "mkv" {
+                out_asset.ext = "mkv".into();
+            }
             if let Some(fmt) = &spec.post.extract_audio {
                 out_asset.ext = fmt.clone();
             }
@@ -381,7 +401,12 @@ pub fn enqueue_with(app: &AppHandle, media: MediaInfo, asset_ids: &[String], pos
                 }
                 ConflictPolicy::Overwrite => wanted,
                 _ => {
-                    let taken: Vec<String> = list.iter().filter(|e| e.snap.status != TaskStatus::Canceled).map(|e| e.snap.file_path.clone()).collect();
+                    // 已完成但文件已不在的任务不再占用文件名（重新下载时沿用原名）
+                    let taken: Vec<String> = list
+                        .iter()
+                        .filter(|e| e.snap.status != TaskStatus::Canceled && !(e.snap.status == TaskStatus::Done && !Path::new(&e.snap.file_path).exists()))
+                        .map(|e| e.snap.file_path.clone())
+                        .collect();
                     naming::unique_path(wanted, &|p: &Path| p.exists() || part_path(p).exists() || taken.iter().any(|t| Path::new(t) == p))
                 }
             };
@@ -429,11 +454,15 @@ pub fn schedule(app: &AppHandle) {
     {
         let mut list = st.downloads.lock();
         let mut running: Vec<String> = list.iter().filter(|e| e.snap.status == TaskStatus::Running).map(|e| e.snap.platform.clone()).collect();
-        for i in 0..list.len() {
+        let now = db::now();
+        // 按优先级（大的先）和加入顺序
+        let mut order: Vec<usize> = (0..list.len()).collect();
+        order.sort_by_key(|&i| (std::cmp::Reverse(list[i].spec.priority), list[i].snap.id));
+        for i in order {
             if running.len() >= settings.concurrency {
                 break;
             }
-            if list[i].snap.status != TaskStatus::Queued {
+            if list[i].snap.status != TaskStatus::Queued || list[i].spec.start_at.is_some_and(|t| t > now) {
                 continue;
             }
             let platform = list[i].snap.platform.clone();
@@ -454,7 +483,76 @@ pub fn schedule(app: &AppHandle) {
         let app = app.clone();
         tauri::async_runtime::spawn(async move { run_task(app, id).await });
     }
+    crate::power::keep_awake(settings.prevent_sleep && st.downloads.has_active_running());
     emit_all(app);
+}
+
+/// 定时任务：每 20 秒检查一次是否有到点的任务。
+pub fn spawn_timer(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            let st = state(&app);
+            let now = db::now();
+            let due = st.downloads.lock().iter().any(|e| e.snap.status == TaskStatus::Queued && e.spec.start_at.is_some_and(|t| t <= now));
+            if due {
+                schedule(&app);
+            }
+        }
+    });
+}
+
+/// 调整等待中任务的顺序：top / up / down / bottom。
+pub fn move_task(app: &AppHandle, id: i64, to: &str) {
+    let st = state(app);
+    {
+        let mut list = st.downloads.lock();
+        let waiting = |e: &Entry| matches!(e.snap.status, TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Failed);
+        let mut order: Vec<usize> = (0..list.len()).filter(|&i| waiting(&list[i])).collect();
+        order.sort_by_key(|&i| (std::cmp::Reverse(list[i].spec.priority), list[i].snap.id));
+        let Some(pos) = order.iter().position(|&i| list[i].snap.id == id) else { return };
+        reorder(&mut order, pos, to);
+        let n = order.len() as i64;
+        for (k, &i) in order.iter().enumerate() {
+            let p = n - k as i64;
+            if list[i].spec.priority != p {
+                list[i].spec.priority = p;
+                list[i].snap.priority = p;
+                let _ = st.db.update_job_asset(list[i].snap.id, &serde_json::to_string(&list[i].spec).unwrap_or_default());
+            }
+        }
+    }
+    emit_all(app);
+}
+
+/// 把 `pos` 处的元素移到 top / up / down / bottom。
+fn reorder<T>(v: &mut Vec<T>, pos: usize, to: &str) {
+    let item = v.remove(pos);
+    let new_pos = match to {
+        "top" => 0,
+        "up" => pos.saturating_sub(1),
+        "down" => (pos + 1).min(v.len()),
+        _ => v.len(),
+    };
+    v.insert(new_pos, item);
+}
+
+/// 设置定时开始时间（None 表示立即）；暂停或失败的任务会改为等待。
+pub fn schedule_task(app: &AppHandle, id: i64, start_at: Option<i64>) {
+    let st = state(app);
+    with_entry(&st, id, |e| {
+        e.spec.start_at = start_at;
+        e.snap.start_at = start_at;
+        if matches!(e.snap.status, TaskStatus::Paused | TaskStatus::Failed | TaskStatus::Canceled) {
+            e.snap.status = TaskStatus::Queued;
+            e.snap.error = None;
+            e.snap.error_kind = None;
+        }
+        let _ = st.db.update_job_asset(e.snap.id, &serde_json::to_string(&e.spec).unwrap_or_default());
+        persist(&st, e);
+    });
+    schedule(app);
 }
 
 fn with_entry<R>(st: &AppState, id: i64, f: impl FnOnce(&mut Entry) -> R) -> Option<R> {
@@ -600,6 +698,35 @@ async fn run_task(app: AppHandle, id: i64) {
                     Err(DlError::Other(e.message))
                 }
             };
+        }
+    }
+    // 写入标题、作者、封面
+    let primary = spec.primary();
+    let out_ext = final_path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    if outcome.is_ok()
+        && settings.embed_metadata
+        && matches!(primary.kind, AssetKind::Video | AssetKind::Audio)
+        && crate::organize::supports_metadata(&out_ext)
+        && postprocess::find_ffmpeg(&st).is_some()
+    {
+        set_step(&st, id, "post");
+        set_note(&app, id, Some("正在写入标题和封面…"));
+        let cover = crate::organize::fetch_cover(&st, &settings, &media, &final_part).await;
+        let out = suffixed(&final_part, ".meta");
+        match crate::organize::embed(&st, &media, &final_part, &out, &final_path, cover.as_deref()).await {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&final_part);
+                let _ = std::fs::rename(&out, &final_part);
+                outcome = Ok(file_len(&final_part));
+            }
+            // 写入元数据失败不影响下载结果
+            Err(e) => {
+                log::warn!("job {id}: embedding metadata failed: {e}");
+                let _ = std::fs::remove_file(&out);
+            }
+        }
+        if let Some(c) = cover {
+            let _ = std::fs::remove_file(c);
         }
     }
     finish(&app, &st, id, outcome, &final_part, &final_path, &parts, &settings);
@@ -827,6 +954,7 @@ fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
 #[allow(clippy::too_many_arguments)]
 fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>, part: &Path, final_path: &Path, inputs: &[PathBuf], settings: &Settings) {
     let mut notify: Option<(String, String)> = None;
+    let mut done_file: Option<(PathBuf, Arc<MediaInfo>)> = None;
     let leftovers: Vec<PathBuf> = inputs.iter().cloned().chain(std::iter::once(part.to_path_buf())).collect();
     let found = with_entry(st, id, |e| {
         e.snap.speed = 0;
@@ -861,8 +989,16 @@ fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>
                             cover: e.snap.cover.as_deref(),
                             path: &e.snap.file_path,
                             size: size as i64,
+                            kind: kind_str(e.snap.asset_kind),
+                            source: e.spec.origin.as_deref().unwrap_or("manual"),
+                            source_url: &e.media.source_url,
+                            platform_name: &e.media.platform_name,
                         });
                         notify = Some((e.snap.title.clone(), e.snap.asset_label.clone()));
+                        if matches!(e.snap.asset_kind, AssetKind::Video | AssetKind::Audio) {
+                            crate::organize::write_sidecars(settings, &e.media, e.spec.primary(), &dest);
+                        }
+                        done_file = Some((dest.clone(), e.media.clone()));
                     }
                     Err(err) => {
                         e.snap.status = TaskStatus::Failed;
@@ -897,13 +1033,128 @@ fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>
             remove_part(p);
         }
     }
+    if let Some((_, media)) = &done_file {
+        spawn_cover_cache(app, media.clone());
+    }
+    if let Some((file, media)) = &done_file {
+        if settings.post_script_enabled && !settings.post_script.trim().is_empty() {
+            run_post_script(&settings.post_script, file, media);
+        }
+    }
+    let all_done = !st.downloads.has_active();
     if let Some((title, label)) = notify {
-        if settings.notify_on_complete && !st.downloads.has_active() {
+        if settings.notify_on_complete && all_done {
             use tauri_plugin_notification::NotificationExt;
             let _ = app.notification().builder().title("下载完成").body(format!("{title}（{label}）")).show();
         }
     }
+    if all_done && done_file.is_some() {
+        on_all_done(app, st, settings, done_file.as_ref().map(|(f, _)| f.as_path()));
+    }
     schedule(app);
+}
+
+fn kind_str(k: AssetKind) -> &'static str {
+    match k {
+        AssetKind::Video => "video",
+        AssetKind::Image => "image",
+        AssetKind::Audio => "audio",
+        AssetKind::Cover => "cover",
+    }
+}
+
+/// 媒体库封面缓存目录。
+pub fn covers_dir(st: &AppState) -> PathBuf {
+    st.data_dir.join("covers")
+}
+
+/// 在后台把封面缓存到本地（远程封面地址常常会过期）。
+fn spawn_cover_cache(app: &AppHandle, media: Arc<MediaInfo>) {
+    if media.cover.is_none() {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let st = state(&app);
+        let settings = st.settings();
+        let dir = covers_dir(&st);
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        use sha2::Digest;
+        let key = hex::encode(&sha2::Sha256::digest(format!("{}:{}", media.platform, media.id).as_bytes())[..12]);
+        if let Some(existing) = ["jpg", "png"].iter().map(|e| dir.join(format!("{key}.{e}"))).find(|p| p.exists()) {
+            let _ = st.db.set_cover_path(&media.platform, &media.id, &existing.to_string_lossy());
+            return;
+        }
+        let near = dir.join(&key);
+        if let Some(tmp) = crate::organize::fetch_cover(&st, &settings, &media, &near).await {
+            let ext = tmp.extension().and_then(|e| e.to_str()).unwrap_or("jpg").to_string();
+            let dest = dir.join(format!("{key}.{ext}"));
+            if std::fs::rename(&tmp, &dest).is_ok() {
+                let _ = st.db.set_cover_path(&media.platform, &media.id, &dest.to_string_lossy());
+            }
+        }
+    });
+}
+
+/// 每个任务完成后运行用户设置的命令（文件路径、标题、原链接通过环境变量传入，不拼接进命令行）。
+fn run_post_script(script: &str, file: &Path, media: &MediaInfo) {
+    let mut cmd = if cfg!(windows) {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", script]);
+        c
+    } else {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", script]);
+        c
+    };
+    cmd.env("CLEARCLIP_FILE", file)
+        .env("CLEARCLIP_TITLE", &media.title)
+        .env("CLEARCLIP_AUTHOR", &media.author)
+        .env("CLEARCLIP_URL", &media.source_url)
+        .env("CLEARCLIP_PLATFORM", &media.platform)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    match cmd.spawn() {
+        Ok(_) => log::info!("post script started for {}", file.display()),
+        Err(e) => log::warn!("post script failed: {e}"),
+    }
+}
+
+pub const EVT_POWER_COUNTDOWN: &str = "app://power-countdown";
+
+/// 队列全部完成：打开文件夹、睡眠 / 关机（关机前倒计时 60 秒，期间可在界面取消）。
+fn on_all_done(app: &AppHandle, st: &AppState, settings: &Settings, last_file: Option<&Path>) {
+    crate::power::keep_awake(false);
+    if settings.open_folder_on_done {
+        if let Some(dir) = last_file.and_then(|f| f.parent()) {
+            use tauri_plugin_opener::OpenerExt;
+            let _ = app.opener().open_path(dir.to_string_lossy(), None::<&str>);
+        }
+    }
+    let action = st.after_all_done.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if action == "none" {
+        return;
+    }
+    let _ = app.emit(EVT_POWER_COUNTDOWN, serde_json::json!({ "action": action, "seconds": 60 }));
+    crate::tray::show_main(app);
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let st = state(&app);
+        let still = st.after_all_done.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if still == action && !st.downloads.has_active() {
+            *st.after_all_done.lock().unwrap_or_else(|e| e.into_inner()) = "none".into();
+            crate::power::run_power_action(&action);
+        }
+    });
 }
 
 /// 地址更新后判断能否保留已下载部分：新地址的文件总大小与记录一致才保留。
@@ -969,7 +1220,8 @@ fn all_parts(settings: &Settings, e: &Entry) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = (0..n).map(|i| input_part_path(settings, e.snap.id, fp, i, n)).collect();
     v.push(part_path(fp));
     // yt-dlp 下载时自己的临时文件，以及后处理的中间文件
-    let extra: Vec<PathBuf> = v.iter().flat_map(|p| [suffixed(p, ".remux"), suffixed(p, ".audio")].into_iter().chain(ytdlp_leftovers(p))).collect();
+    let extra: Vec<PathBuf> =
+        v.iter().flat_map(|p| [suffixed(p, ".remux"), suffixed(p, ".audio"), suffixed(p, ".meta")].into_iter().chain(ytdlp_leftovers(p))).collect();
     v.extend(extra);
     v
 }
@@ -1166,6 +1418,22 @@ mod tests {
         move_file(&dir.join("a"), &dir.join("b")).unwrap();
         assert!(dir.join("b").exists() && !dir.join("a").exists());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reorder_moves() {
+        let base = vec![1, 2, 3, 4];
+        let mv = |pos: usize, to: &str| {
+            let mut v = base.clone();
+            reorder(&mut v, pos, to);
+            v
+        };
+        assert_eq!(mv(2, "top"), vec![3, 1, 2, 4]);
+        assert_eq!(mv(2, "up"), vec![1, 3, 2, 4]);
+        assert_eq!(mv(0, "up"), vec![1, 2, 3, 4]);
+        assert_eq!(mv(1, "down"), vec![1, 3, 2, 4]);
+        assert_eq!(mv(3, "down"), vec![1, 2, 3, 4]);
+        assert_eq!(mv(0, "bottom"), vec![2, 3, 4, 1]);
     }
 
     #[test]

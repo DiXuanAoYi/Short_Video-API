@@ -105,6 +105,8 @@ export interface TaskSnapshot {
   resumable: boolean | null
   step: 'download' | 'merge' | 'post' | null
   inputs: number
+  priority: number
+  startAt: number | null
   createdAt: number
   finishedAt: number | null
 }
@@ -134,6 +136,69 @@ export interface LibraryItem {
   size: number
   finishedAt: number
   exists: boolean
+  kind: string
+  source: string
+  sourceUrl: string
+  platformName: string
+  coverPath: string | null
+}
+
+export interface LibraryFilter {
+  query: string
+  platform: string | null
+  kind: string | null
+  source: string | null
+  since: number | null
+  missingOnly: boolean
+}
+
+export interface PlatformCount {
+  platform: string
+  name: string
+  count: number
+}
+
+export interface PairedDevice {
+  id: string
+  name: string
+  addedAt: number
+  lastSeen: number
+}
+
+export interface PhoneSettings {
+  enabled: boolean
+  port: number
+  token: string
+  devices: PairedDevice[]
+}
+
+export interface PairRequest {
+  deviceId: string
+  name: string
+  ip: string
+}
+
+export interface PhoneInfo {
+  enabled: boolean
+  running: boolean
+  port: number
+  url: string | null
+  apiUrl: string | null
+  token: string
+  qrSvg: string | null
+  devices: PairedDevice[]
+  pending: PairRequest[]
+  error: string | null
+}
+
+export interface HealthResult {
+  platform: string
+  name: string
+  sample: string | null
+  ok: boolean
+  millis: number
+  message: string
+  kind: ErrorKind | null
 }
 
 export type ParseMode = 'local' | 'remote' | 'local_then_remote'
@@ -211,6 +276,16 @@ export interface Settings {
   useYtdlp: boolean
   genericSniffer: boolean
   componentMirrors: string[]
+  clipboardAllSites: boolean
+  clipboardDomains: string[]
+  phone: PhoneSettings
+  embedMetadata: boolean
+  writeInfoJson: boolean
+  writeNfo: boolean
+  openFolderOnDone: boolean
+  postScriptEnabled: boolean
+  postScript: string
+  preventSleep: boolean
 }
 
 export type QualityPreset = 'best' | 'max1080' | 'small' | 'audio'

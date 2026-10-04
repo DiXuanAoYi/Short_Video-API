@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::model::{AppResult, MediaInfo, MediaKind};
 
@@ -41,6 +41,34 @@ pub struct LibraryItem {
     pub size: i64,
     pub finished_at: i64,
     pub exists: bool,
+    pub kind: String,
+    pub source: String,
+    pub source_url: String,
+    pub platform_name: String,
+    /// 本地缓存的封面
+    pub cover_path: Option<String>,
+}
+
+/// 媒体库筛选条件。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LibraryFilter {
+    pub query: String,
+    pub platform: Option<String>,
+    pub kind: Option<String>,
+    pub source: Option<String>,
+    /// 只看这个时间（Unix 秒）之后完成的
+    pub since: Option<i64>,
+    /// 只看文件已丢失的
+    pub missing_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlatformCount {
+    pub platform: String,
+    pub name: String,
+    pub count: i64,
 }
 
 pub struct NewDownload<'a> {
@@ -52,6 +80,10 @@ pub struct NewDownload<'a> {
     pub cover: Option<&'a str>,
     pub path: &'a str,
     pub size: i64,
+    pub kind: &'a str,
+    pub source: &'a str,
+    pub source_url: &'a str,
+    pub platform_name: &'a str,
 }
 
 impl Db {
@@ -111,11 +143,36 @@ impl Db {
              CREATE INDEX IF NOT EXISTS idx_history_created ON history(created_at);
              CREATE INDEX IF NOT EXISTS idx_downloads_finished ON downloads(finished_at);",
         )?;
+        // 阶段 4 新增的列：旧数据库补上
+        let cols: Vec<String> = conn.prepare("PRAGMA table_info(downloads)")?.query_map([], |r| r.get::<_, String>(1))?.collect::<Result<_, _>>()?;
+        for (name, def) in [
+            ("kind", "TEXT NOT NULL DEFAULT 'video'"),
+            ("source", "TEXT NOT NULL DEFAULT 'manual'"),
+            ("source_url", "TEXT NOT NULL DEFAULT ''"),
+            ("platform_name", "TEXT NOT NULL DEFAULT ''"),
+            ("cover_path", "TEXT"),
+        ] {
+            if !cols.iter().any(|c| c == name) {
+                conn.execute_batch(&format!("ALTER TABLE downloads ADD COLUMN {name} {def}"))?;
+            }
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_downloads_platform ON downloads(platform);
+             CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);",
+        )?;
         Ok(Db { conn: Mutex::new(conn) })
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 某平台最近一次成功解析的原链接（健康检查用作示例）。
+    pub fn latest_source_url(&self, platform: &str) -> AppResult<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row("SELECT source_url FROM history WHERE platform=?1 AND source_url<>'' ORDER BY created_at DESC LIMIT 1", params![platform], |r| r.get(0))
+            .optional()?)
     }
 
     pub fn upsert_history(&self, info: &MediaInfo) -> AppResult<()> {
@@ -185,14 +242,70 @@ impl Db {
 
     pub fn record_download(&self, d: &NewDownload<'_>) -> AppResult<()> {
         self.conn().execute(
-            "INSERT INTO downloads (platform, media_id, asset_id, title, author, cover, path, size, finished_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO downloads (platform, media_id, asset_id, title, author, cover, path, size, finished_at, kind, source, source_url, platform_name)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(platform, media_id, asset_id) DO UPDATE SET
                 title=excluded.title, author=excluded.author, cover=excluded.cover, path=excluded.path,
-                size=excluded.size, finished_at=excluded.finished_at",
-            params![d.platform, d.media_id, d.asset_id, d.title, d.author, d.cover, d.path, d.size, now()],
+                size=excluded.size, finished_at=excluded.finished_at, kind=excluded.kind, source=excluded.source,
+                source_url=excluded.source_url, platform_name=excluded.platform_name",
+            params![d.platform, d.media_id, d.asset_id, d.title, d.author, d.cover, d.path, d.size, now(), d.kind, d.source, d.source_url, d.platform_name],
         )?;
         Ok(())
+    }
+
+    /// 封面缓存完成后记录本地路径。
+    pub fn set_cover_path(&self, platform: &str, media_id: &str, path: &str) -> AppResult<()> {
+        self.conn().execute("UPDATE downloads SET cover_path=?3 WHERE platform=?1 AND media_id=?2", params![platform, media_id, path])?;
+        Ok(())
+    }
+
+    pub fn library_item(&self, id: i64) -> AppResult<Option<LibraryItem>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!("SELECT {LIB_COLS} FROM downloads WHERE id=?1"))?;
+        Ok(stmt.query_row(params![id], lib_row).optional()?)
+    }
+
+    pub fn library_platforms(&self) -> AppResult<Vec<PlatformCount>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT platform, MAX(platform_name), COUNT(*) FROM downloads GROUP BY platform ORDER BY COUNT(*) DESC")?;
+        let rows = stmt.query_map([], |r| {
+            let platform: String = r.get(0)?;
+            let name: Option<String> = r.get(1)?;
+            Ok(PlatformCount { name: name.filter(|n| !n.is_empty()).unwrap_or_else(|| platform.clone()), platform, count: r.get(2)? })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn search_library(&self, f: &LibraryFilter, limit: i64) -> AppResult<Vec<LibraryItem>> {
+        let mut sql = format!("SELECT {LIB_COLS} FROM downloads WHERE (title LIKE ?1 OR author LIKE ?1)");
+        let mut args: Vec<rusqlite::types::Value> = vec![format!("%{}%", f.query.trim()).into()];
+        let mut push = |cond: &str, v: rusqlite::types::Value, sql: &mut String| {
+            args.push(v);
+            sql.push_str(&format!(" AND {cond}?{}", args.len()));
+        };
+        if let Some(p) = f.platform.as_ref().filter(|p| !p.is_empty()) {
+            push("platform=", p.clone().into(), &mut sql);
+        }
+        if let Some(k) = f.kind.as_ref().filter(|k| !k.is_empty()) {
+            push("kind=", k.clone().into(), &mut sql);
+        }
+        if let Some(s) = f.source.as_ref().filter(|s| !s.is_empty()) {
+            push("source=", s.clone().into(), &mut sql);
+        }
+        if let Some(t) = f.since {
+            push("finished_at>=", t.into(), &mut sql);
+        }
+        args.push(if f.missing_only { 20_000i64 } else { limit }.into());
+        sql.push_str(&format!(" ORDER BY finished_at DESC, id DESC LIMIT ?{}", args.len()));
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), lib_row)?;
+        let mut items: Vec<LibraryItem> = rows.collect::<Result<_, _>>()?;
+        if f.missing_only {
+            items.retain(|i| !i.exists);
+            items.truncate(limit as usize);
+        }
+        Ok(items)
     }
 
     /// 已下载且文件仍在磁盘上时返回文件路径。
@@ -205,29 +318,7 @@ impl Db {
     }
 
     pub fn list_library(&self, query: &str, limit: i64) -> AppResult<Vec<LibraryItem>> {
-        let like = format!("%{}%", query.trim());
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT id, platform, media_id, asset_id, title, author, cover, path, size, finished_at FROM downloads
-             WHERE title LIKE ?1 OR author LIKE ?1 ORDER BY finished_at DESC, id DESC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![like, limit], |r| {
-            let path: String = r.get(7)?;
-            Ok(LibraryItem {
-                id: r.get(0)?,
-                platform: r.get(1)?,
-                media_id: r.get(2)?,
-                asset_id: r.get(3)?,
-                title: r.get(4)?,
-                author: r.get(5)?,
-                cover: r.get(6)?,
-                exists: Path::new(&path).exists(),
-                path,
-                size: r.get(8)?,
-                finished_at: r.get(9)?,
-            })
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        self.search_library(&LibraryFilter { query: query.to_string(), ..Default::default() }, limit)
     }
 
     /// 删除媒体库记录，返回该记录的文件路径。
@@ -237,6 +328,30 @@ impl Db {
         conn.execute("DELETE FROM downloads WHERE id=?1", params![id])?;
         Ok(path)
     }
+}
+
+const LIB_COLS: &str = "id, platform, media_id, asset_id, title, author, cover, path, size, finished_at, kind, source, source_url, platform_name, cover_path";
+
+fn lib_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryItem> {
+    let path: String = r.get(7)?;
+    Ok(LibraryItem {
+        id: r.get(0)?,
+        platform: r.get(1)?,
+        media_id: r.get(2)?,
+        asset_id: r.get(3)?,
+        title: r.get(4)?,
+        author: r.get(5)?,
+        cover: r.get(6)?,
+        exists: Path::new(&path).exists(),
+        path,
+        size: r.get(8)?,
+        finished_at: r.get(9)?,
+        kind: r.get(10)?,
+        source: r.get(11)?,
+        source_url: r.get(12)?,
+        platform_name: r.get(13)?,
+        cover_path: r.get::<_, Option<String>>(14)?.filter(|p| Path::new(p).exists()),
+    })
 }
 
 /// 持久化的下载任务。
@@ -416,8 +531,21 @@ mod tests {
         let file = dir.join("a.mp4");
         std::fs::write(&file, b"x").unwrap();
         let path = file.to_string_lossy().to_string();
-        db.record_download(&NewDownload { platform: "douyin", media_id: "1", asset_id: "video", title: "t", author: "a", cover: None, path: &path, size: 1 })
-            .unwrap();
+        db.record_download(&NewDownload {
+            platform: "douyin",
+            media_id: "1",
+            asset_id: "video",
+            title: "t",
+            author: "a",
+            cover: None,
+            path: &path,
+            size: 1,
+            kind: "video",
+            source: "manual",
+            source_url: "",
+            platform_name: "抖音",
+        })
+        .unwrap();
         assert_eq!(db.existing_download("douyin", "1", "video").unwrap(), Some(path.clone()));
         std::fs::remove_file(&file).unwrap();
         assert_eq!(db.existing_download("douyin", "1", "video").unwrap(), None);

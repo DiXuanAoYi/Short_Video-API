@@ -157,6 +157,23 @@ pub fn detect_links(text: &str) -> Vec<DetectedLink> {
     out
 }
 
+/// 剪贴板 / 手机发送用的链接识别：内置平台，加上设置里的额外网站（或全部网址）。
+pub fn detect_links_with(text: &str, settings: &Settings) -> Vec<DetectedLink> {
+    let mut out = detect_links(text);
+    for raw in extract_urls(text) {
+        if out.iter().any(|d| d.url == raw) {
+            continue;
+        }
+        let Some(host) = Url::parse(&raw).ok().and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase())) else { continue };
+        let listed = settings.clipboard_domains.iter().any(|d| host == *d || host.ends_with(&format!(".{d}")));
+        if settings.clipboard_all_sites || listed {
+            let site = crate::cookies::registrable_domain(&host);
+            out.push(DetectedLink { url: raw, platform: site.clone(), platform_name: site });
+        }
+    }
+    out
+}
+
 /// 解析一段文本中的第一个链接，按设置决定本地 / 远程策略。
 pub async fn resolve_text(ctx: &Ctx<'_>, text: &str) -> AppResult<MediaInfo> {
     let urls = extract_urls(text);
@@ -326,6 +343,16 @@ mod tests {
         assert_eq!(links.len(), 2);
         assert_eq!(links[0].platform, "douyin");
         assert_eq!(links[1].platform, "kuaishou");
+    }
+
+    #[test]
+    fn clipboard_whitelist() {
+        let text = "https://www.youtube.com/watch?v=1 https://example.com/a https://v.douyin.com/x/";
+        let s = Settings::default();
+        let links: Vec<String> = detect_links_with(text, &s).into_iter().map(|d| d.platform).collect();
+        assert_eq!(links, vec!["douyin", "youtube.com"]);
+        let s = Settings { clipboard_all_sites: true, ..Settings::default() };
+        assert_eq!(detect_links_with(text, &s).len(), 3);
     }
 
     #[test]

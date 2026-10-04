@@ -9,7 +9,10 @@ pub mod error;
 pub mod model;
 pub mod naming;
 pub mod net;
+pub mod organize;
+pub mod phone;
 pub mod postprocess;
+pub mod power;
 pub mod providers;
 pub mod quality;
 pub mod secret;
@@ -52,6 +55,9 @@ pub struct AppState {
     pub tools_dir: PathBuf,
     pub tools: tools::ToolsState,
     pub data_dir: PathBuf,
+    pub phone: phone::PhoneState,
+    /// 全部下载完成后的动作：none / sleep / shutdown（不保存，每次启动为 none）
+    pub after_all_done: Mutex<String>,
 }
 
 impl AppState {
@@ -102,7 +108,19 @@ fn spawn_account_reminders(app: tauri::AppHandle) {
     });
 }
 
+/// 便携模式：程序目录下有 `portable` 文件（或 `data` 目录）时，设置、数据和日志都保存在程序目录的 `data` 下。
+pub fn portable_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    (dir.join("portable").exists() || dir.join("data").is_dir()).then(|| dir.join("data"))
+}
+
 pub fn run() {
+    let portable = portable_dir();
+    let log_target = match &portable {
+        Some(p) => tauri_plugin_log::TargetKind::Folder { path: p.join("logs"), file_name: Some("clearclip".into()) },
+        None => tauri_plugin_log::TargetKind::LogDir { file_name: Some("clearclip".into()) },
+    };
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             tray::show_main(app);
@@ -113,10 +131,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(
             tauri_plugin_log::Builder::new()
-                .targets([
-                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
-                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir { file_name: Some("clearclip".into()) }),
-                ])
+                .targets([tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout), tauri_plugin_log::Target::new(log_target)])
                 .level(log::LevelFilter::Info)
                 .max_file_size(2 * 1024 * 1024)
                 .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(5))
@@ -133,13 +148,15 @@ pub fn run() {
         )
         .setup(|app| {
             let handle = app.handle().clone();
-            let config_dir = app.path().app_config_dir()?;
-            let data_dir = app.path().app_data_dir()?;
+            let (config_dir, data_dir) = match portable_dir() {
+                Some(p) => (p.clone(), p),
+                None => (app.path().app_config_dir()?, app.path().app_data_dir()?),
+            };
             let default_dl = app.path().download_dir().or_else(|_| app.path().home_dir()).unwrap_or_else(|_| PathBuf::from(".")).join("ClearClip");
             let settings_path = config_dir.join("settings.json");
             let mut settings = Settings::load(&settings_path, &default_dl);
             let db = Db::open(&data_dir.join("clearclip.db")).map_err(|e| e.to_string())?;
-            let log_dir = app.path().app_log_dir().unwrap_or_else(|_| data_dir.join("logs"));
+            let log_dir = if portable_dir().is_some() { data_dir.join("logs") } else { app.path().app_log_dir().unwrap_or_else(|_| data_dir.join("logs")) };
             log::info!("ClearClip {} starting on {}", app.package_info().version, std::env::consts::OS);
 
             let key = secret::load_or_create_key(&data_dir);
@@ -173,13 +190,21 @@ pub fn run() {
                 tools_dir: data_dir.join("tools"),
                 tools: tools::ToolsState::default(),
                 data_dir: data_dir.clone(),
+                phone: phone::PhoneState::default(),
+                after_all_done: Mutex::new("none".into()),
             }));
+            // 媒体库封面缓存通过 asset 协议显示
+            let covers = data_dir.join("covers");
+            let _ = std::fs::create_dir_all(&covers);
+            let _ = app.asset_protocol_scope().allow_directory(&covers, false);
             download::restore(&handle);
+            download::spawn_timer(&handle);
             spawn_account_reminders(handle.clone());
 
             tray::create(&handle)?;
             commands::apply_shortcut(&handle, &settings.shortcut);
             clipboard::start_watcher(handle.clone());
+            phone::restore(&handle);
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -218,6 +243,20 @@ pub fn run() {
             commands::import_tool,
             commands::list_extractors,
             commands::open_tools_dir,
+            commands::library_platforms,
+            commands::redownload,
+            commands::health_check,
+            commands::move_task,
+            commands::schedule_task,
+            commands::get_after_all_done,
+            commands::set_after_all_done,
+            commands::read_links_file,
+            commands::is_portable,
+            commands::phone_info,
+            commands::phone_enable,
+            commands::phone_reset_token,
+            commands::phone_revoke,
+            commands::phone_pair_respond,
             commands::list_tasks,
             commands::pause_task,
             commands::resume_task,
