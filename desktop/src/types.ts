@@ -286,6 +286,76 @@ export interface Settings {
   postScriptEnabled: boolean
   postScript: string
   preventSleep: boolean
+  subscriptionsEnabled: boolean
+  launchAtLogin: boolean
+}
+
+export interface SubSettings {
+  intervalHours: number
+  firstRun: 'new_only' | 'latest' | 'all'
+  firstN: number
+  maxAuto: number
+  include: string[]
+  exclude: string[]
+  minDurationS: number | null
+  maxDurationS: number | null
+  maxAgeDays: number | null
+  quality: QualityPreset | null
+  dir: string
+  template: string
+  notify: boolean
+}
+
+export interface Subscription {
+  id: number
+  url: string
+  title: string
+  platform: string
+  platformName: string
+  avatar: string | null
+  settings: SubSettings
+  status: 'active' | 'paused' | 'error'
+  lastCheck: number | null
+  nextCheck: number | null
+  lastError: string | null
+  failCount: number
+  newCount: number
+  createdAt: number
+  downloaded: number
+  pending: number
+  ignored: number
+  checking: boolean
+}
+
+export interface SubEntry {
+  id: string
+  title: string
+  url: string
+  thumbnail: string | null
+  publishedAt: number | null
+  durationMs: number | null
+}
+
+export interface ListResult {
+  title: string
+  platform: string
+  platformName: string
+  avatar: string | null
+  entries: SubEntry[]
+}
+
+export type SubItemStatus = 'seen' | 'pending' | 'queued' | 'downloaded' | 'ignored' | 'failed'
+
+export interface SubItem {
+  itemId: string
+  title: string
+  url: string
+  thumbnail: string | null
+  publishedAt: number | null
+  durationMs: number | null
+  status: SubItemStatus
+  reason: string | null
+  createdAt: number
 }
 
 export type QualityPreset = 'best' | 'max1080' | 'small' | 'audio'

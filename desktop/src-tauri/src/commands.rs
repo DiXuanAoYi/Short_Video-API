@@ -15,7 +15,7 @@ use crate::download::{self, EnqueueResult, OrphanPart, PostOptions, TaskSnapshot
 use crate::model::{AppError, AppResult, MediaInfo, MediaKind, PlaylistEntry, SeriesInfo};
 use crate::providers::{self, DetectedLink};
 use crate::settings::Settings;
-use crate::{clipboard, diagnostics, phone, quality, tools, tray, AppState};
+use crate::{clipboard, diagnostics, phone, quality, subs, tools, tray, AppState};
 
 const REPO: &str = "DiXuanAoYi/Short_Video-API";
 
@@ -86,6 +86,13 @@ pub async fn save_settings(app: AppHandle, state: St<'_>, settings: Settings) ->
     tray::sync_watch_item(&app);
     if !s.prevent_sleep {
         crate::power::keep_awake(false);
+    }
+    if old.launch_at_login != s.launch_at_login {
+        use tauri_plugin_autostart::ManagerExt;
+        let r = if s.launch_at_login { app.autolaunch().enable() } else { app.autolaunch().disable() };
+        if let Err(e) = r {
+            log::warn!("autostart change failed: {e}");
+        }
     }
     if old.concurrency != s.concurrency || old.per_site_concurrency != s.per_site_concurrency {
         download::schedule(&app);
@@ -220,6 +227,74 @@ pub fn phone_revoke(app: AppHandle, device_id: String) -> AppResult<phone::Phone
 #[tauri::command]
 pub fn phone_pair_respond(app: AppHandle, device_id: String, accept: bool) -> AppResult<phone::PhoneInfo> {
     phone::respond_pair(&app, &device_id, accept)
+}
+
+// ---------- 订阅 ----------
+
+#[tauri::command]
+pub fn subs_list(app: AppHandle) -> AppResult<Vec<subs::Subscription>> {
+    subs::list(&app)
+}
+
+#[tauri::command]
+pub async fn subs_preview(app: AppHandle, url: String) -> AppResult<providers::listing::ListResult> {
+    let url = providers::extract_urls(&url).into_iter().next().ok_or_else(|| AppError::invalid("没有找到链接。"))?;
+    subs::preview(&app, &url).await
+}
+
+#[tauri::command]
+pub async fn subs_add(app: AppHandle, url: String, title: Option<String>, settings: subs::SubSettings) -> AppResult<subs::Subscription> {
+    let url = providers::extract_urls(&url).into_iter().next().ok_or_else(|| AppError::invalid("没有找到链接。"))?;
+    subs::add(&app, &url, title, settings).await
+}
+
+#[tauri::command]
+pub fn subs_update(app: AppHandle, state: St<'_>, id: i64, title: String, settings: subs::SubSettings) -> AppResult<()> {
+    let mut settings = settings;
+    settings.normalize();
+    state.db.sub_update(id, title.trim(), &settings)?;
+    let _ = app.emit(subs::EVT_SUBS, ());
+    Ok(())
+}
+
+#[tauri::command]
+pub fn subs_set_paused(app: AppHandle, state: St<'_>, id: i64, paused: bool) -> AppResult<()> {
+    state.db.sub_set_status(id, if paused { "paused" } else { "active" })?;
+    let _ = app.emit(subs::EVT_SUBS, ());
+    Ok(())
+}
+
+#[tauri::command]
+pub fn subs_delete(app: AppHandle, state: St<'_>, id: i64) -> AppResult<()> {
+    state.db.sub_delete(id)?;
+    let _ = app.emit(subs::EVT_SUBS, ());
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn subs_check(app: AppHandle, id: i64) -> AppResult<usize> {
+    subs::check(&app, id).await
+}
+
+#[tauri::command]
+pub fn subs_items(state: St<'_>, id: i64, statuses: Vec<String>) -> AppResult<Vec<subs::SubItem>> {
+    let refs: Vec<&str> = statuses.iter().map(String::as_str).collect();
+    state.db.sub_items(id, &refs)
+}
+
+#[tauri::command]
+pub async fn subs_download_items(app: AppHandle, id: i64, item_ids: Vec<String>) -> AppResult<usize> {
+    subs::download_items(&app, id, &item_ids).await
+}
+
+#[tauri::command]
+pub fn subs_ignore_items(app: AppHandle, id: i64, item_ids: Vec<String>) -> AppResult<()> {
+    subs::ignore_items(&app, id, &item_ids)
+}
+
+#[tauri::command]
+pub fn subs_clear_new(state: St<'_>, id: i64) -> AppResult<()> {
+    state.db.sub_clear_new(id)
 }
 
 // ---------- 组件（yt-dlp / ffmpeg） ----------

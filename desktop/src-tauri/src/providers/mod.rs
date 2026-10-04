@@ -4,6 +4,7 @@ pub mod bilibili;
 pub mod douyin;
 pub mod generic;
 pub mod kuaishou;
+pub mod listing;
 pub mod pixiv;
 pub mod remote;
 pub mod weibo;

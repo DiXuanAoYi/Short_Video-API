@@ -45,6 +45,7 @@ aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 md-5 = "0.10"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+tauri-plugin-autostart = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }

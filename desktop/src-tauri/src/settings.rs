@@ -264,6 +264,10 @@ pub struct Settings {
     pub post_script: String,
     /// 有下载任务时阻止系统休眠
     pub prevent_sleep: bool,
+    /// 订阅与追更（默认关闭，首次开启时说明用途和风险）
+    pub subscriptions_enabled: bool,
+    /// 开机自动启动（在托盘运行，用于订阅检查）
+    pub launch_at_login: bool,
 }
 
 /// 已配对的手机。
@@ -345,6 +349,8 @@ impl Default for Settings {
             post_script_enabled: false,
             post_script: String::new(),
             prevent_sleep: true,
+            subscriptions_enabled: false,
+            launch_at_login: false,
         }
     }
 }

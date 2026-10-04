@@ -3,7 +3,7 @@ import { computed, ref } from 'vue'
 import { api, errorKind, errorText, events } from '../api'
 import type { AppInfo, ErrorKind, HistoryItem, MediaInfo, Settings, TaskSnapshot } from '../types'
 
-export type ViewName = 'parse' | 'queue' | 'library' | 'settings'
+export type ViewName = 'parse' | 'queue' | 'subs' | 'library' | 'settings'
 export type SettingsTab = 'download' | 'parse' | 'network' | 'accounts' | 'phone' | 'components' | 'diagnostics' | 'general'
 
 /** 设置、主题与当前页面。 */

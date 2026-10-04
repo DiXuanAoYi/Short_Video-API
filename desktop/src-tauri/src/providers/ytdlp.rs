@@ -362,7 +362,8 @@ pub fn from_json(v: &Value, source_url: &str) -> AppResult<MediaInfo> {
                 // 去掉 yt-dlp 内部传参用的片段
                 let url = url.split("#__youtubedl_smuggle").next().unwrap_or(&url).to_string();
                 Some(PlaylistEntry {
-                    id: s(e, "id").unwrap_or_else(|| format!("{}", i + 1)),
+                    // 没有 ID 时用链接（序号会随新内容插入而变化，不能用来去重）
+                    id: s(e, "id").unwrap_or_else(|| url.clone()),
                     title: s(e, "title").unwrap_or_else(|| format!("第 {} 条", i + 1)),
                     url,
                     duration_ms: f(e, "duration").map(|d| (d * 1000.0) as u64),

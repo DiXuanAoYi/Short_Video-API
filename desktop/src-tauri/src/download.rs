@@ -89,6 +89,9 @@ pub struct JobSpec {
     /// 来源：manual（默认）/ subscription / live
     #[serde(default)]
     pub origin: Option<String>,
+    /// 来自订阅时对应的条目（订阅 ID，条目 ID），完成后更新条目状态
+    #[serde(default)]
+    pub sub_item: Option<(i64, String)>,
 }
 
 impl JobSpec {
@@ -230,7 +233,14 @@ pub fn input_part_path(settings: &Settings, job_id: i64, final_path: &Path, i: u
 
 fn parse_spec(json: &str) -> Option<JobSpec> {
     serde_json::from_str::<JobSpec>(json).ok().filter(|s| !s.inputs.is_empty()).or_else(|| {
-        serde_json::from_str::<Asset>(json).ok().map(|a| JobSpec { inputs: vec![a], post: PostOptions::default(), priority: 0, start_at: None, origin: None })
+        serde_json::from_str::<Asset>(json).ok().map(|a| JobSpec {
+            inputs: vec![a],
+            post: PostOptions::default(),
+            priority: 0,
+            start_at: None,
+            origin: None,
+            sub_item: None,
+        })
     })
 }
 
@@ -342,7 +352,7 @@ pub fn build_specs(media: &MediaInfo, asset_ids: &[String]) -> Vec<JobSpec> {
                     inputs.push(audio.clone());
                 }
             }
-            JobSpec { inputs, post: PostOptions::default(), priority: 0, start_at: None, origin: None }
+            JobSpec { inputs, post: PostOptions::default(), priority: 0, start_at: None, origin: None, sub_item: None }
         })
         .collect()
 }
@@ -353,16 +363,34 @@ pub fn enqueue(app: &AppHandle, media: MediaInfo, asset_ids: &[String]) -> AppRe
 }
 
 pub fn enqueue_with(app: &AppHandle, media: MediaInfo, asset_ids: &[String], post: PostOptions) -> AppResult<EnqueueResult> {
+    enqueue_ext(app, media, asset_ids, post, EnqueueExtra::default())
+}
+
+/// 订阅等来源的额外选项。
+#[derive(Debug, Clone, Default)]
+pub struct EnqueueExtra {
+    /// 保存目录（替代下载目录）
+    pub dir: Option<PathBuf>,
+    /// 文件命名模板（替代设置里的模板）
+    pub template: Option<String>,
+    pub origin: Option<String>,
+    /// 对应的订阅条目（订阅 ID，条目 ID）
+    pub sub_item: Option<(i64, String)>,
+}
+
+pub fn enqueue_ext(app: &AppHandle, media: MediaInfo, asset_ids: &[String], post: PostOptions, extra: EnqueueExtra) -> AppResult<EnqueueResult> {
     let st = state(app);
     let settings = st.settings();
     let media = Arc::new(media);
-    let mut dir = naming::target_dir(&settings.download_root(), &media, settings.subfolder_by_platform);
-    let base = match naming::render_series(&settings.series_template, &media) {
-        Some((dirs, base)) => {
+    let root = extra.dir.clone().unwrap_or_else(|| settings.download_root());
+    let mut dir = if extra.dir.is_some() { root } else { naming::target_dir(&root, &media, settings.subfolder_by_platform) };
+    let base = match (&extra.template, naming::render_series(&settings.series_template, &media)) {
+        (Some(t), _) if !t.trim().is_empty() => naming::render_base(t, &media),
+        (_, Some((dirs, base))) => {
             dir.extend(dirs);
             base
         }
-        None => naming::render_base(&settings.filename_template, &media),
+        _ => naming::render_base(&settings.filename_template, &media),
     };
     let media_json = serde_json::to_string(&*media)?;
 
@@ -371,6 +399,8 @@ pub fn enqueue_with(app: &AppHandle, media: MediaInfo, asset_ids: &[String], pos
         let mut list = st.downloads.lock();
         for mut spec in build_specs(&media, asset_ids) {
             spec.post = post.clone();
+            spec.origin = extra.origin.clone();
+            spec.sub_item = extra.sub_item.clone();
             let primary = spec.primary().clone();
             let in_queue = list.iter().any(|e| {
                 e.snap.platform == media.platform
@@ -955,6 +985,7 @@ fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
 fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>, part: &Path, final_path: &Path, inputs: &[PathBuf], settings: &Settings) {
     let mut notify: Option<(String, String)> = None;
     let mut done_file: Option<(PathBuf, Arc<MediaInfo>)> = None;
+    let mut sub_touched = false;
     let leftovers: Vec<PathBuf> = inputs.iter().cloned().chain(std::iter::once(part.to_path_buf())).collect();
     let found = with_entry(st, id, |e| {
         e.snap.speed = 0;
@@ -1026,7 +1057,22 @@ fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>
             }
         }
         persist(st, e);
+        // 订阅条目跟随任务结果更新
+        if let Some((sub_id, item_id)) = &e.spec.sub_item {
+            let status = match e.snap.status {
+                TaskStatus::Done => Some("downloaded"),
+                TaskStatus::Failed => Some("failed"),
+                _ => None,
+            };
+            if let Some(s) = status {
+                crate::subs::mark_item(st, *sub_id, item_id, s, Some(&e.snap.title));
+                sub_touched = true;
+            }
+        }
     });
+    if sub_touched {
+        let _ = app.emit(crate::subs::EVT_SUBS, ());
+    }
     if found.is_none() {
         // 任务已被移除：清理残留
         for p in &leftovers {

@@ -168,7 +168,7 @@ fn key_from_url(u: &str) -> &str {
     name.split('.').next().unwrap_or(name)
 }
 
-async fn wbi_keys(ctx: &Ctx<'_>, cookie: Option<&str>) -> AppResult<String> {
+pub(crate) async fn wbi_keys(ctx: &Ctx<'_>, cookie: Option<&str>) -> AppResult<String> {
     let now = chrono::Utc::now().timestamp();
     if let Some((k, t)) = WBI_CACHE.lock().unwrap_or_else(|e| e.into_inner()).clone() {
         if now - t < 6 * 3600 {
@@ -341,7 +341,7 @@ fn parse_view_meta(data: &Value, index: usize, source_url: &str) -> AppResult<Me
     Ok(info)
 }
 
-async fn get_json(ctx: &Ctx<'_>, api: &str, cookie: Option<&str>) -> AppResult<Value> {
+pub(crate) async fn get_json(ctx: &Ctx<'_>, api: &str, cookie: Option<&str>) -> AppResult<Value> {
     let mut req = ctx.get(api).header("User-Agent", DESKTOP_UA).header("Referer", REFERER);
     if let Some(c) = cookie {
         req = req.header("Cookie", c);

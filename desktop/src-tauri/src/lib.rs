@@ -17,6 +17,7 @@ pub mod providers;
 pub mod quality;
 pub mod secret;
 pub mod settings;
+pub mod subs;
 pub mod tools;
 mod tray;
 
@@ -58,6 +59,7 @@ pub struct AppState {
     pub phone: phone::PhoneState,
     /// 全部下载完成后的动作：none / sleep / shutdown（不保存，每次启动为 none）
     pub after_all_done: Mutex<String>,
+    pub subs: subs::SubsState,
 }
 
 impl AppState {
@@ -129,6 +131,7 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec!["--autostart"])))
         .plugin(
             tauri_plugin_log::Builder::new()
                 .targets([tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout), tauri_plugin_log::Target::new(log_target)])
@@ -192,6 +195,7 @@ pub fn run() {
                 data_dir: data_dir.clone(),
                 phone: phone::PhoneState::default(),
                 after_all_done: Mutex::new("none".into()),
+                subs: subs::SubsState::default(),
             }));
             // 媒体库封面缓存通过 asset 协议显示
             let covers = data_dir.join("covers");
@@ -205,6 +209,13 @@ pub fn run() {
             commands::apply_shortcut(&handle, &settings.shortcut);
             clipboard::start_watcher(handle.clone());
             phone::restore(&handle);
+            subs::spawn_scheduler(&handle);
+            // 开机自启时只在托盘运行
+            if std::env::args().any(|a| a == "--autostart") {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.hide();
+                }
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -243,6 +254,17 @@ pub fn run() {
             commands::import_tool,
             commands::list_extractors,
             commands::open_tools_dir,
+            commands::subs_list,
+            commands::subs_preview,
+            commands::subs_add,
+            commands::subs_update,
+            commands::subs_set_paused,
+            commands::subs_delete,
+            commands::subs_check,
+            commands::subs_items,
+            commands::subs_download_items,
+            commands::subs_ignore_items,
+            commands::subs_clear_new,
             commands::library_platforms,
             commands::redownload,
             commands::health_check,

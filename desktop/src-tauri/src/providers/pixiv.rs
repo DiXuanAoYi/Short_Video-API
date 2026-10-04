@@ -62,7 +62,7 @@ impl Provider for Pixiv {
     }
 }
 
-async fn get_body(ctx: &Ctx<'_>, api: &str) -> AppResult<Value> {
+pub(crate) async fn get_body(ctx: &Ctx<'_>, api: &str) -> AppResult<Value> {
     let mut req = ctx.get(api).header("User-Agent", DESKTOP_UA).header("Referer", REFERER).header("Accept", "application/json");
     if let Some(c) = ctx.cookie(api) {
         req = req.header("Cookie", c);

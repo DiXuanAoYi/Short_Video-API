@@ -386,6 +386,8 @@ function insertVar(v: string) {
               </el-radio-group>
             </div>
             <div class="kv"><span>关闭窗口时最小化到托盘</span><el-switch v-model="form.closeToTray" /></div>
+            <div class="kv"><span>开机自动启动<small class="mute block">在托盘运行，用于订阅的定期检查</small></span><el-switch v-model="form.launchAtLogin" /></div>
+            <div class="kv"><span>订阅与追更<small class="mute block">在“订阅”页面管理</small></span><el-switch v-model="form.subscriptionsEnabled" /></div>
             <div class="kv"><span>启动时检查更新</span><el-switch v-model="form.checkUpdate" /></div>
             <small v-if="portable" class="mute">便携模式：设置、数据库和日志保存在程序目录下的 data 文件夹。</small>
           </section>

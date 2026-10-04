@@ -156,6 +156,7 @@ impl Db {
                 conn.execute_batch(&format!("ALTER TABLE downloads ADD COLUMN {name} {def}"))?;
             }
         }
+        conn.execute_batch(crate::subs::SCHEMA)?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_downloads_platform ON downloads(platform);
              CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);",
@@ -163,7 +164,7 @@ impl Db {
         Ok(Db { conn: Mutex::new(conn) })
     }
 
-    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+    pub(crate) fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
