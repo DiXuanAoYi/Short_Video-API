@@ -8,6 +8,12 @@
 
 ![image-20220820091544258](https://oss-lxcdn.senlucloud.cn/2022/08/20/9463f481e945c.png)
 
+## 桌面版：清影 ClearClip
+
+`desktop/` 目录是基于本接口做的桌面程序（Tauri 2 + Vue 3 + Rust），支持 Windows / macOS / Linux，可解析抖音、快手、小红书、B站、微博：粘贴即解析、下载队列、剪贴板监听、托盘迷你窗、媒体库。不依赖 PHP 服务器，也可以继续调用已部署的 `jxindex.php`。说明见 [desktop/README.md](desktop/README.md)，规划见 [docs/desktop-plan.md](docs/desktop-plan.md)。
+
+![清影](docs/screenshots/parse.png)
+
 目前支持2个平台去水印下载，欢迎各位Star，**提交issues时请附带视频链接**。
 
 演示源码请移步：自行搭建
