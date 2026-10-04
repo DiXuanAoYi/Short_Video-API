@@ -81,7 +81,7 @@ onMounted(async () => {
   // 手机发送：新设备请求配对
   await events.onPairRequest(async (p) => {
     try {
-      await ElMessageBox.confirm(`“${p.name}”（${p.ip}）想要向清影发送链接。允许后这台设备以后可以直接发送，可在“设置 → 手机发送”中撤销。`, '新设备请求配对', {
+      await ElMessageBox.confirm(`“${p.name}”（${p.ip}）想要向清影发送链接。允许后这台设备以后可以直接发送，可在“设置 → 手机与浏览器扩展”中撤销。`, '新设备请求配对', {
         confirmButtonText: '允许',
         cancelButtonText: '拒绝',
         type: 'info',
@@ -95,7 +95,7 @@ onMounted(async () => {
   })
   await events.onPhoneReceived((text) => {
     const url = text.match(/https?:\/\/\S+/)?.[0] ?? text
-    ElNotification({ title: '收到手机发送的链接', message: url.slice(0, 80), type: 'info', duration: 3000 })
+    ElNotification({ title: '收到发送到清影的链接', message: url.slice(0, 80), type: 'info', duration: 3000 })
   })
   // 全部完成后睡眠 / 关机的倒计时
   await events.onPowerCountdown((p) => {

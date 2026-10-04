@@ -61,7 +61,7 @@ async function redownload(f: LibraryItem) {
 
 const platformName = computed<Record<string, string>>(() => Object.fromEntries((app.info?.providers ?? []).map((p) => [p.id, p.name])))
 
-const KIND_NAME: Record<string, string> = { video: '视频', image: '图片', audio: '音频', cover: '封面' }
+const KIND_NAME: Record<string, string> = { video: '视频', image: '图片', audio: '音频', cover: '封面', subtitle: '字幕' }
 
 function assetName(f: LibraryItem) {
   const id = f.assetId
@@ -170,6 +170,7 @@ async function clearHistory() {
         <el-option value="image" label="图片" />
         <el-option value="audio" label="音频" />
         <el-option value="cover" label="封面" />
+        <el-option value="subtitle" label="字幕 / 弹幕" />
       </el-select>
       <el-select v-model="fSince" size="small" clearable placeholder="全部时间" class="fsel">
         <el-option value="today" label="今天" />

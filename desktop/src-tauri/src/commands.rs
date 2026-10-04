@@ -229,6 +229,82 @@ pub fn phone_pair_respond(app: AppHandle, device_id: String, accept: bool) -> Ap
     phone::respond_pair(&app, &device_id, accept)
 }
 
+// ---------- 图集合成视频 ----------
+
+/// 下载图集图片（和背景音乐），合成为一个视频，保存在下载目录并记入媒体库。返回文件路径。
+#[tauri::command]
+pub async fn make_slideshow(state: St<'_>, media: MediaInfo, image_ids: Vec<String>, music_id: Option<String>, seconds: f64) -> AppResult<String> {
+    let settings = state.settings();
+    let secs = seconds.clamp(0.5, 30.0);
+    let images: Vec<&crate::model::Asset> = media.assets.iter().filter(|a| image_ids.contains(&a.id) && a.kind == crate::model::AssetKind::Image).collect();
+    if images.is_empty() {
+        return Err(AppError::invalid("请至少选择一张图片。"));
+    }
+    let dir = crate::naming::target_dir(&settings.download_root(), &media, settings.subfolder_by_platform);
+    std::fs::create_dir_all(&dir)?;
+    let base = crate::naming::render_base(&settings.filename_template, &media);
+    let work = dir.join(format!(".clearclip-slides-{}", crate::db::now()));
+    std::fs::create_dir_all(&work)?;
+    let fetch = |url: String, headers: Vec<(String, String)>, path: std::path::PathBuf| {
+        let state = state.inner().clone();
+        let settings = settings.clone();
+        let referer = providers::referer_for(&media.platform).to_string();
+        async move {
+            let client = state.net.clients_for(&settings.network, &url)?.download;
+            let mut req = client.get(&url);
+            if !referer.is_empty() && !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("referer")) {
+                req = req.header("Referer", referer);
+            }
+            if let Some(c) = state.cookies.header_for(&url) {
+                req = req.header("Cookie", c);
+            }
+            for (k, v) in headers {
+                req = req.header(k, v);
+            }
+            let resp = req.send().await?;
+            if !resp.status().is_success() {
+                return Err(AppError::from_status(resp.status().as_u16(), "图片"));
+            }
+            std::fs::write(&path, resp.bytes().await?)?;
+            Ok::<_, AppError>(path)
+        }
+    };
+    let result = async {
+        let mut files = vec![];
+        for (i, a) in images.iter().enumerate() {
+            let p = fetch(a.url.clone(), a.headers.clone(), work.join(format!("{i:03}.{}", a.ext))).await?;
+            files.push((p, a.width.unwrap_or(1080), a.height.unwrap_or(1920)));
+        }
+        let music = match music_id.as_deref().and_then(|id| media.asset(id)) {
+            Some(a) => Some(fetch(a.url.clone(), a.headers.clone(), work.join(format!("music.{}", a.ext))).await?),
+            None => None,
+        };
+        let out = crate::naming::unique_path(dir.join(format!("{base}_图集视频.mp4")), &|p: &std::path::Path| p.exists());
+        crate::postprocess::slideshow(&state, &files, music.as_deref(), secs, &out).await?;
+        Ok::<_, AppError>(out)
+    }
+    .await;
+    let _ = std::fs::remove_dir_all(&work);
+    let out = result?;
+    let path = out.to_string_lossy().into_owned();
+    let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+    let _ = state.db.record_download(&crate::db::NewDownload {
+        platform: &media.platform,
+        media_id: &media.id,
+        asset_id: "slideshow",
+        title: &media.title,
+        author: &media.author,
+        cover: media.cover.as_deref(),
+        path: &path,
+        size: size as i64,
+        kind: "video",
+        source: "manual",
+        source_url: &media.source_url,
+        platform_name: &media.platform_name,
+    });
+    Ok(path)
+}
+
 // ---------- 直播录制 ----------
 
 #[tauri::command]
@@ -857,12 +933,52 @@ pub struct UpdateInfo {
     latest: Option<String>,
     has_update: bool,
     url: String,
+    /// 可在程序内下载安装（签名更新已配置）
+    can_install: bool,
+}
+
+/// 签名更新的公钥在构建时传入（CLEARCLIP_UPDATER_PUBKEY），没有时只提示前往发布页下载。
+pub const UPDATER_PUBKEY: Option<&str> = option_env!("CLEARCLIP_UPDATER_PUBKEY");
+
+fn updater_endpoints(state: &AppState) -> Vec<Url> {
+    let latest = format!("https://github.com/{REPO}/releases/latest/download/latest.json");
+    crate::tools::candidates(&latest, &state.settings().component_mirrors).into_iter().filter_map(|u| Url::parse(&u).ok()).collect()
+}
+
+async fn signed_update(app: &AppHandle, state: &AppState) -> AppResult<Option<tauri_plugin_updater::Update>> {
+    use tauri_plugin_updater::UpdaterExt;
+    let updater = app
+        .updater_builder()
+        .endpoints(updater_endpoints(state))
+        .map_err(|e| AppError::msg(e.to_string()))?
+        .build()
+        .map_err(|e| AppError::msg(e.to_string()))?;
+    updater.check().await.map_err(|e| AppError::new(crate::error::ErrorKind::Network, format!("检查更新失败：{e}")))
+}
+
+/// 下载并安装签名更新，完成后重启。
+#[tauri::command]
+pub async fn install_update(app: AppHandle, state: St<'_>) -> AppResult<()> {
+    if UPDATER_PUBKEY.filter(|k| !k.is_empty()).is_none() {
+        return Err(AppError::invalid("这个版本不支持程序内更新，请前往发布页下载。"));
+    }
+    let update = signed_update(&app, &state).await?.ok_or_else(|| AppError::invalid("已是最新版本"))?;
+    update.download_and_install(|_, _| {}, || {}).await.map_err(|e| AppError::msg(format!("安装更新失败：{e}")))?;
+    app.restart();
 }
 
 /// 通过 GitHub Releases 检查新版本（不自动安装，只提示并打开下载页）。
 #[tauri::command]
 pub async fn check_update(app: AppHandle, state: St<'_>) -> AppResult<UpdateInfo> {
     let current = app.package_info().version.to_string();
+    let releases_page = format!("https://github.com/{REPO}/releases");
+    if UPDATER_PUBKEY.is_some_and(|k| !k.is_empty()) {
+        match signed_update(&app, &state).await {
+            Ok(Some(u)) => return Ok(UpdateInfo { current, latest: Some(u.version.clone()), has_update: true, url: releases_page, can_install: true }),
+            Ok(None) => return Ok(UpdateInfo { latest: Some(current.clone()), current, has_update: false, url: releases_page, can_install: true }),
+            Err(e) => log::info!("signed update check failed, falling back to GitHub API: {e}"),
+        }
+    }
     let resp = state
         .client
         .get(format!("https://api.github.com/repos/{REPO}/releases/latest"))
@@ -870,9 +986,8 @@ pub async fn check_update(app: AppHandle, state: St<'_>) -> AppResult<UpdateInfo
         .header("Accept", "application/vnd.github+json")
         .send()
         .await?;
-    let releases_page = format!("https://github.com/{REPO}/releases");
     if resp.status().as_u16() == 404 {
-        return Ok(UpdateInfo { current, latest: None, has_update: false, url: releases_page });
+        return Ok(UpdateInfo { current, latest: None, has_update: false, url: releases_page, can_install: false });
     }
     if !resp.status().is_success() {
         return Err(AppError::from_status(resp.status().as_u16(), "GitHub "));
@@ -882,7 +997,7 @@ pub async fn check_update(app: AppHandle, state: St<'_>) -> AppResult<UpdateInfo
     let tag = tag.trim_start_matches("desktop-").trim_start_matches(['v', 'V']).to_string();
     let url = data.get("html_url").and_then(|v| v.as_str()).unwrap_or(&releases_page).to_string();
     let has_update = is_newer(&tag, &current);
-    Ok(UpdateInfo { current, latest: Some(tag).filter(|t| !t.is_empty()), has_update, url })
+    Ok(UpdateInfo { current, latest: Some(tag).filter(|t| !t.is_empty()), has_update, url, can_install: false })
 }
 
 fn is_newer(latest: &str, current: &str) -> bool {

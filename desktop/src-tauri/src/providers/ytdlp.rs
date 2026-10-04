@@ -402,6 +402,7 @@ pub fn from_json(v: &Value, source_url: &str) -> AppResult<MediaInfo> {
     if !assets.iter().any(|a| a.kind == AssetKind::Video) {
         info.kind = MediaKind::Audio;
     }
+    assets.extend(subtitle_assets(v));
     if let Some(c) = cover {
         let mut cv = Asset::cover(c);
         if !["jpg", "png", "webp", "gif"].contains(&cv.ext.as_str()) {
@@ -411,6 +412,23 @@ pub fn from_json(v: &Value, source_url: &str) -> AppResult<MediaInfo> {
     }
     info.assets = assets;
     Ok(info)
+}
+
+/// 字幕轨：每种语言一个，优先 SRT，其次 VTT、ASS（不含直播聊天记录等非字幕内容）。
+fn subtitle_assets(v: &Value) -> Vec<Asset> {
+    let Some(subs) = v.get("subtitles").and_then(|x| x.as_object()) else { return vec![] };
+    let mut out = vec![];
+    for (lang, tracks) in subs.iter().filter(|(l, _)| !l.contains("live_chat") && l.as_str() != "danmaku").take(30) {
+        let Some(list) = tracks.as_array() else { continue };
+        let pick = ["srt", "vtt", "ass"].iter().find_map(|ext| list.iter().find(|t| s(t, "ext").as_deref() == Some(*ext)));
+        let Some(t) = pick else { continue };
+        let (Some(url), Some(ext)) = (s(t, "url"), s(t, "ext")) else { continue };
+        let name = s(t, "name").unwrap_or_else(|| lang.clone());
+        let mut a = Asset::subtitle(lang, &name, url, &ext);
+        a.protocol = Protocol::Http;
+        out.push(a);
+    }
+    out
 }
 
 /// yt-dlp 下载进度（来自 `--progress-template`）。
@@ -526,6 +544,7 @@ mod tests {
             "id": "abc", "title": "Test video", "uploader": "Someone", "extractor_key": "Youtube",
             "duration": 61.5, "timestamp": 1700000000, "thumbnail": "https://i.ytimg.com/vi/abc/maxresdefault.webp",
             "series": "Show", "season_number": 1, "episode_number": 3,
+            "subtitles": {"en": [{"ext": "json3", "url": "https://s/en.json3"}, {"ext": "vtt", "url": "https://s/en.vtt", "name": "English"}], "live_chat": [{"ext": "json", "url": "https://s/c"}]},
             "formats": [
                 {"format_id": "sb0", "ext": "mhtml", "format_note": "storyboard", "url": "https://x/sb"},
                 {"format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "mp4a.40.2", "abr": 129.5, "url": "https://r/140", "protocol": "https"},
@@ -561,6 +580,9 @@ mod tests {
         assert_eq!(info.asset("f-18").unwrap().protocol, Protocol::Http);
         assert_eq!(info.asset("f-140").unwrap().kind, AssetKind::Audio);
         assert_eq!(info.assets.last().unwrap().kind, AssetKind::Cover);
+        let sub = info.asset("sub-en").unwrap();
+        assert_eq!((sub.ext.as_str(), sub.kind), ("vtt", AssetKind::Subtitle));
+        assert!(info.asset("sub-live_chat").is_none());
         assert_eq!(info.default_asset_ids(), vec!["f-137"]);
     }
 

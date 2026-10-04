@@ -1106,6 +1106,7 @@ fn kind_str(k: AssetKind) -> &'static str {
         AssetKind::Image => "image",
         AssetKind::Audio => "audio",
         AssetKind::Cover => "cover",
+        AssetKind::Subtitle => "subtitle",
     }
 }
 

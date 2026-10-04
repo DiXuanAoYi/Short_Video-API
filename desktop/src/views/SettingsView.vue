@@ -82,6 +82,18 @@ async function pickTempDir() {
   if (typeof dir === 'string') form.value.tempDir = dir
 }
 
+const installing = ref(false)
+async function installUpdate() {
+  installing.value = true
+  try {
+    await api.installUpdate()
+  } catch (e) {
+    ElMessage.error(errorText(e))
+  } finally {
+    installing.value = false
+  }
+}
+
 async function checkUpdate() {
   checking.value = true
   try {
@@ -330,7 +342,7 @@ function insertVar(v: string) {
         <AccountsPanel />
       </el-tab-pane>
 
-      <el-tab-pane label="手机发送" name="phone">
+      <el-tab-pane label="手机与浏览器扩展" name="phone">
         <PhonePanel />
       </el-tab-pane>
 
@@ -399,7 +411,8 @@ function insertVar(v: string) {
             </div>
             <div v-if="update?.hasUpdate" class="kv">
               <span>新版本 v{{ update.latest }} 可用</span>
-              <el-button size="small" type="primary" @click="api.openUrl(update.url)">前往下载</el-button>
+              <el-button v-if="update.canInstall" size="small" type="primary" :loading="installing" @click="installUpdate">立即更新并重启</el-button>
+              <el-button v-else size="small" type="primary" @click="api.openUrl(update.url)">前往下载</el-button>
             </div>
             <p class="mute small">
               仅用于下载你有权保存的内容。项目地址：<a href="#" @click.prevent="api.openUrl(`https://github.com/${app.info?.repo}`)">github.com/{{ app.info?.repo }}</a>

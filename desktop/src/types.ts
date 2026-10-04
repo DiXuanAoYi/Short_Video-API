@@ -2,7 +2,7 @@
 
 export type MediaKind = 'video' | 'images' | 'audio' | 'playlist'
 export type Protocol = 'http' | 'hls' | 'ytdlp'
-export type AssetKind = 'video' | 'image' | 'audio' | 'cover'
+export type AssetKind = 'video' | 'image' | 'audio' | 'cover' | 'subtitle'
 
 export interface Asset {
   id: string
@@ -512,6 +512,7 @@ export interface UpdateInfo {
   latest: string | null
   hasUpdate: boolean
   url: string
+  canInstall: boolean
 }
 
 export interface ClipboardLink {

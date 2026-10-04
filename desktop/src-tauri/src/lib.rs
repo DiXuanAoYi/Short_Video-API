@@ -243,6 +243,11 @@ pub fn run() {
                 }
             }
         })
+        // 构建时提供了签名公钥才启用程序内更新；否则注册一个空插件占位（读取同名配置，但不做任何事）
+        .plugin(match commands::UPDATER_PUBKEY.filter(|k| !k.is_empty()) {
+            Some(key) => tauri_plugin_updater::Builder::new().pubkey(key).build(),
+            None => tauri::plugin::Builder::<tauri::Wry, tauri_plugin_updater::Config>::new("updater").build(),
+        })
         .invoke_handler(tauri::generate_handler![
             commands::get_app_info,
             commands::get_settings,
@@ -258,6 +263,7 @@ pub fn run() {
             commands::import_tool,
             commands::list_extractors,
             commands::open_tools_dir,
+            commands::make_slideshow,
             commands::live_rooms,
             commands::live_check,
             commands::live_add,
@@ -327,6 +333,7 @@ pub fn run() {
             commands::open_login,
             commands::save_login_cookies,
             commands::check_update,
+            commands::install_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ClearClip");

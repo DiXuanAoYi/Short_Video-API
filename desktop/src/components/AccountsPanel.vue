@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { open } from '@tauri-apps/plugin-dialog'
 import { api, errorText } from '../api'
@@ -51,7 +52,13 @@ function expiryClass(a: AccountSummary) {
 async function load() {
   accounts.value = await api.listAccounts()
 }
-onMounted(load)
+let unlistenAccounts: UnlistenFn | undefined
+onMounted(async () => {
+  await load()
+  // 浏览器扩展同步 Cookie 后刷新
+  unlistenAccounts = await listen('accounts://updated', load)
+})
+onUnmounted(() => unlistenAccounts?.())
 
 async function run(fn: () => Promise<AccountSummary[] | void>, ok?: string) {
   busy.value = true
@@ -216,6 +223,11 @@ async function remove(a: AccountSummary) {
           <b>粘贴 Cookie</b>
           <small class="mute">粘贴 cookies.txt 内容，或请求头里的 Cookie 字符串。</small>
           <div class="row"><el-button size="small" @click="pasteVisible = true">粘贴…</el-button></div>
+        </div>
+        <div class="method">
+          <b>浏览器扩展同步</b>
+          <small class="mute">安装“发送到清影”扩展，在已登录的网站上点“同步此网站的登录 Cookie”，适合 YouTube 等拦截内置登录窗口的网站。</small>
+          <div class="row"><el-button size="small" @click="app.goSettings('phone')">设置扩展</el-button></div>
         </div>
       </div>
       <small class="mute">Cookie 加密保存在本机，只会发送给它所属的网站。使用登录账号大量下载有被平台限制的风险。</small>

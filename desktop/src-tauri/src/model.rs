@@ -32,6 +32,8 @@ pub enum AssetKind {
     Image,
     Audio,
     Cover,
+    /// 字幕或弹幕（quality 字段为语言代码，弹幕为 danmaku）
+    Subtitle,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -149,6 +151,13 @@ impl Asset {
     pub fn audio(url: String) -> Self {
         let ext = if url.contains(".m4a") { "m4a" } else { "mp3" };
         Asset::base("music", AssetKind::Audio, url, "背景音乐", ext)
+    }
+
+    /// 字幕：`lang` 用于文件名（如 `视频.zh-Hans.srt`，播放器会自动加载）。
+    pub fn subtitle(lang: &str, name: &str, url: String, ext: &str) -> Self {
+        let mut a = Asset::base(format!("sub-{lang}"), AssetKind::Subtitle, url, format!("字幕 · {name}"), ext);
+        a.quality = Some(lang.to_string());
+        a
     }
 
     pub fn cover(url: String) -> Self {

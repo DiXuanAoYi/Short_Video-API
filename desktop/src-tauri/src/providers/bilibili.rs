@@ -120,6 +120,7 @@ impl Provider for Bilibili {
             let cover = info.assets.pop().filter(|a| a.kind == AssetKind::Cover);
             info.assets = assets;
             info.assets.extend(cover);
+            info.assets.push(danmaku(cid));
             return Ok(info);
         }
 
@@ -128,7 +129,9 @@ impl Provider for Bilibili {
             format!("https://api.bilibili.com/x/player/playurl?{}&cid={cid}&qn={qn}&fnval=1&fnver=0&fourk=0&platform=html5&high_quality=1", vid.query());
         let play = get_json(ctx, &play_api, cookie.as_deref()).await?;
         let play_data = api_data(&play)?;
-        parse_view(data, play_data, index, url)
+        let mut info = parse_view(data, play_data, index, url)?;
+        info.assets.push(danmaku(cid));
+        Ok(info)
     }
 }
 
@@ -146,6 +149,13 @@ impl VideoId {
             VideoId::Av(a) => a.to_string(),
         }
     }
+}
+
+/// 弹幕 XML（可用弹幕播放器或转换工具转为 ASS 字幕）。
+fn danmaku(cid: u64) -> Asset {
+    let mut a = Asset::base("danmaku", AssetKind::Subtitle, format!("https://comment.bilibili.com/{cid}.xml"), "弹幕 XML", "xml");
+    a.quality = Some("danmaku".into());
+    a
 }
 
 // ---------- wbi 签名 ----------

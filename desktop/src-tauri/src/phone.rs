@@ -414,7 +414,7 @@ async fn handle(app: AppHandle, mut sock: TcpStream, peer: SocketAddr) {
             if authorized {
                 respond(&mut sock, "200 OK", "text/html; charset=utf-8", page(&token).as_bytes()).await;
             } else {
-                respond(&mut sock, "403 Forbidden", "text/html; charset=utf-8", "<meta name=viewport content='width=device-width'><p style='font:16px sans-serif;padding:24px'>二维码已失效，请在电脑上的清影“设置 → 手机发送”重新扫码。</p>".as_bytes()).await;
+                respond(&mut sock, "403 Forbidden", "text/html; charset=utf-8", "<meta name=viewport content='width=device-width'><p style='font:16px sans-serif;padding:24px'>二维码已失效，请在电脑上的清影“设置 → 手机与浏览器扩展”重新扫码。</p>".as_bytes()).await;
             }
         }
         ("GET", "/favicon.ico") => respond(&mut sock, "404 Not Found", "text/plain", b"").await,
@@ -440,6 +440,29 @@ async fn handle(app: AppHandle, mut sock: TcpStream, peer: SocketAddr) {
             let device = clean_device(req.query.get("device").map(String::as_str).unwrap_or(""));
             let list = statuses(&app, &device);
             json(&mut sock, "200 OK", serde_json::json!({"items": list})).await;
+        }
+        ("GET", "/api/ping") => {
+            let version = app.package_info().version.to_string();
+            json(&mut sock, "200 OK", serde_json::json!({"app": "ClearClip", "version": version})).await;
+        }
+        // 浏览器扩展同步 Cookie：只接受本机、已配对设备的请求
+        ("POST", "/api/cookies") => {
+            if !peer.ip().is_loopback() {
+                json(&mut sock, "403 Forbidden", serde_json::json!({"error": "只能从本机同步 Cookie"})).await;
+                return;
+            }
+            let device = clean_device(req.headers.get("x-device").map(String::as_str).unwrap_or(""));
+            if !state.settings().phone.devices.iter().any(|d| d.id == device) {
+                json(&mut sock, "403 Forbidden", serde_json::json!({"error": "请先从扩展发送一次链接，在电脑上确认配对后再同步 Cookie"})).await;
+                return;
+            }
+            match import_cookies(&state.cookies, &req.body) {
+                Ok((site, n)) => {
+                    let _ = app.emit("accounts://updated", ());
+                    json(&mut sock, "200 OK", serde_json::json!({"site": site, "count": n})).await
+                }
+                Err(e) => json(&mut sock, "400 Bad Request", serde_json::json!({"error": e.message})).await,
+            }
         }
         _ => respond(&mut sock, "404 Not Found", "text/plain", b"not found").await,
     }
@@ -488,6 +511,63 @@ fn receive(app: &AppHandle, device: &str, name: &str, peer: &SocketAddr, text: S
         }
     }
     (id, initial.into())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtCookie {
+    name: String,
+    value: String,
+    domain: String,
+    #[serde(default = "root")]
+    path: String,
+    #[serde(default)]
+    expiration_date: Option<f64>,
+    #[serde(default)]
+    secure: bool,
+    #[serde(default)]
+    http_only: bool,
+    #[serde(default)]
+    host_only: bool,
+}
+
+fn root() -> String {
+    "/".into()
+}
+
+#[derive(Deserialize)]
+struct CookieSync {
+    /// 当前网页的地址（决定保存到哪个网站）
+    url: String,
+    cookies: Vec<ExtCookie>,
+    #[serde(default)]
+    label: String,
+}
+
+/// 浏览器扩展同步过来的 Cookie（chrome.cookies 格式）保存为该网站的账号。
+fn import_cookies(store: &crate::cookies::CookieStore, body: &[u8]) -> AppResult<(String, usize)> {
+    let sync: CookieSync = serde_json::from_slice(body).map_err(|e| AppError::invalid(format!("数据格式不正确：{e}")))?;
+    let url = url::Url::parse(&sync.url).map_err(|_| AppError::invalid("网页地址无效"))?;
+    let site = crate::cookies::site_for_url(&url).ok_or_else(|| AppError::invalid("无法识别网站"))?;
+    let list: Vec<crate::cookies::StoredCookie> = sync
+        .cookies
+        .into_iter()
+        .take(500)
+        .map(|c| crate::cookies::StoredCookie {
+            name: c.name,
+            value: c.value,
+            domain: c.domain.trim_start_matches('.').to_ascii_lowercase(),
+            host_only: c.host_only,
+            path: c.path,
+            expires: c.expiration_date.map(|t| t as i64),
+            secure: c.secure,
+            http_only: c.http_only,
+        })
+        .collect();
+    let n = list.len();
+    let label = if sync.label.trim().is_empty() { "浏览器扩展".to_string() } else { sync.label.trim().chars().take(40).collect() };
+    store.upsert(&site, &label, list)?;
+    Ok((site, n))
 }
 
 fn set_sent(app: &AppHandle, id: u64, f: impl FnOnce(&mut Sent)) {
@@ -622,6 +702,17 @@ mod tests {
         assert_eq!(r.headers.get("x-token").map(String::as_str), Some("tok"));
         assert_eq!(len, 12);
         assert_eq!(url_decode("%E4%B8%AD+a%2"), "中 a%2");
+    }
+
+    #[test]
+    fn cookie_sync_import() {
+        let store = crate::cookies::CookieStore::in_memory();
+        let body = serde_json::json!({"url": "https://www.youtube.com/watch?v=1", "cookies": [
+            {"name": "SID", "value": "1", "domain": ".youtube.com", "path": "/", "expirationDate": 1900000000.5, "secure": true, "httpOnly": true, "hostOnly": false}]});
+        let (site, n) = import_cookies(&store, body.to_string().as_bytes()).unwrap();
+        assert_eq!((site.as_str(), n), ("youtube.com", 1));
+        assert_eq!(store.header_for("https://www.youtube.com/").as_deref(), Some("SID=1"));
+        assert!(import_cookies(&store, b"{}").is_err());
     }
 
     #[test]

@@ -42,6 +42,9 @@
 - 设置里可一键检查各平台解析是否正常（健康检查）
 - 订阅与追更（默认关闭）：订阅 YouTube 频道 / 播放列表、B站 UP 主、Pixiv 画师、抖音用户主页或任意 yt-dlp 能列出条目的列表，定期检查并自动下载新内容；每个订阅可设检查间隔、首次订阅策略、关键词 / 时长 / 发布时间过滤、清晰度、保存位置和命名；连续失败自动暂停；可开机自启在托盘运行
 - 直播录制：添加直播间后自动监控开播并录制（B站、抖音、快手、虎牙原生；斗鱼、YouTube、Twitch 等走 yt-dlp；也可直接填直播流地址）；FLV / TS 不转码、自动分段、断流重连、磁盘保护，录完可转 MP4 并合并分段
+- 浏览器扩展“发送到清影”（[`extension/`](./extension/)）：网页右键发送链接，一键同步当前网站的登录 Cookie
+- 字幕与弹幕：下载 yt-dlp 提供的各语言字幕（与视频同名，播放器自动加载）、B站弹幕 XML
+- 图集合成视频：选中的图片按设定时长合成 MP4，可配背景音乐
 - 全局快捷键（默认 `Ctrl+Shift+D`）解析剪贴板；关闭窗口后驻留系统托盘
 - 媒体库：已下载文件和解析历史；本地封面缓存、列表 / 网格视图，按平台、类型、时间筛选；文件被移动或删除时可一键重新下载；上千条记录也不卡；已下载过的内容自动跳过
 - 文件命名模板：`{author}` `{title}` `{date}` `{id}` `{platform}`
@@ -76,10 +79,20 @@ cargo test                                      # 解析器、下载器、数据
 
 macOS 签名和公证需要在仓库 Secrets 中配置 `APPLE_CERTIFICATE`、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_SIGNING_IDENTITY`、`APPLE_ID`、`APPLE_PASSWORD`、`APPLE_TEAM_ID`。不配置时生成未签名的安装包。
 
+### 程序内更新
+
+在仓库 Secrets 中配置 `TAURI_SIGNING_PRIVATE_KEY`（可选 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`）和对应公钥 `TAURI_UPDATER_PUBKEY`（用 `npx tauri signer generate` 生成）后，发布流程会生成签名更新包和 `latest.json`，程序里“检查更新”可直接下载安装并重启。未配置时只提示前往发布页下载。
+
+### 包管理器
+
+[`packaging/`](./packaging/) 里有 winget、Scoop、Homebrew 的清单模板，发布后运行 `python3 packaging/update-manifests.py <版本>` 生成带校验值的清单。
+
 ## 目录结构
 
 ```
 desktop/
+├── extension/                 # 浏览器扩展“发送到清影”
+├── packaging/                 # winget / Scoop / Homebrew 清单
 ├── src/                       # Vue 3 前端
 │   ├── App.vue                # 主窗口：侧边导航 + 四个页面
 │   ├── MiniApp.vue            # 托盘迷你窗（index.html#mini）

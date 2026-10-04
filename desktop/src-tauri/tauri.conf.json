@@ -69,5 +69,13 @@
     "macOS": {
       "minimumSystemVersion": "10.15"
     }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "",
+      "endpoints": [
+        "https://github.com/DiXuanAoYi/Short_Video-API/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

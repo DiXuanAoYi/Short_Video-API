@@ -18,6 +18,31 @@ const batchDone = ref(0)
 const preview = ref(false)
 const enqueuing = ref(false)
 const audioOnly = ref(false)
+const slideOpen = ref(false)
+const slideSecs = ref(3)
+const slideMusic = ref(true)
+const sliding = ref(false)
+const musicAsset = computed(() => result.value?.assets.find((a) => a.kind === 'audio') ?? null)
+
+async function makeSlideshow() {
+  if (!result.value) return
+  const ids = images.value.filter((a) => selected.value.has(a.id)).map((a) => a.id)
+  if (!ids.length) {
+    ElMessage.warning('请至少选择一张图片。')
+    return
+  }
+  sliding.value = true
+  try {
+    const path = await api.makeSlideshow(result.value, ids, slideMusic.value && musicAsset.value ? musicAsset.value.id : null, slideSecs.value)
+    slideOpen.value = false
+    ElMessage.success({ message: `已生成：${path}`, duration: 5000 })
+    api.revealFile(path).catch(() => {})
+  } catch (e) {
+    ElMessage.error(errorText(e))
+  } finally {
+    sliding.value = false
+  }
+}
 const entrySel = ref<Set<string>>(new Set())
 const batchInfo = ref<BatchProgress | null>(null)
 let unlistenBatch: UnlistenFn | undefined
@@ -397,6 +422,7 @@ function sizeText(a: Asset) {
         <div v-if="!isPlaylist" class="row">
           <el-button type="primary" :loading="enqueuing" @click="download">下载所选</el-button>
           <el-button @click="copyLinks">复制直链</el-button>
+          <el-button v-if="images.length > 1" @click="slideOpen = true">合成视频</el-button>
           <el-button @click="preview = true">预览</el-button>
         </div>
       </div>
@@ -421,6 +447,16 @@ function sizeText(a: Asset) {
       </ol>
     </section>
 
+    <el-dialog v-model="slideOpen" title="图集合成视频" width="400px" append-to-body>
+      <p class="mute">把选中的 {{ selectedImages }} 张图片合成一个视频（需要 ffmpeg），保存在下载目录。</p>
+      <div class="slide-row"><span>每张显示</span><el-input-number v-model="slideSecs" :min="0.5" :max="30" :step="0.5" size="small" /><span>秒</span></div>
+      <el-checkbox v-if="musicAsset" v-model="slideMusic">配上背景音乐</el-checkbox>
+      <template #footer>
+        <el-button @click="slideOpen = false">取消</el-button>
+        <el-button type="primary" :loading="sliding" @click="makeSlideshow">生成</el-button>
+      </template>
+    </el-dialog>
+
     <el-dialog v-model="preview" :title="result?.title" width="720px" align-center destroy-on-close>
       <div v-if="result" class="preview">
         <video v-if="videoAsset" :src="videoAsset.url" controls autoplay referrerpolicy="no-referrer" />
@@ -435,6 +471,12 @@ function sizeText(a: Asset) {
 </template>
 
 <style scoped>
+.slide-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
 .entries {
   max-height: 320px;
   overflow: auto;

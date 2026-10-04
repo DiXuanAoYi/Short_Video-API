@@ -171,6 +171,58 @@ pub fn ffconcat(frames: &[(String, u64)]) -> String {
     s
 }
 
+/// 图集合成视频：每张图片显示 `secs` 秒，统一缩放到同一画布（多数为竖图时用竖屏），可配背景音乐。
+/// 依次尝试 H.264（x264 / OpenH264）和 MPEG-4，LGPL 版 ffmpeg 也能生成。
+pub async fn slideshow(st: &AppState, images: &[(PathBuf, u32, u32)], music: Option<&Path>, secs: f64, output: &Path) -> AppResult<()> {
+    let ffmpeg = find_ffmpeg(st).ok_or_else(|| AppError::new(ErrorKind::NeedUpdate, "需要 ffmpeg 才能把图集合成视频。请在“设置 → 组件”中安装 ffmpeg。"))?;
+    if images.is_empty() {
+        return Err(AppError::invalid("没有图片"));
+    }
+    let portrait = images.iter().filter(|(_, w, h)| h > w).count() * 2 >= images.len();
+    let (w, h) = if portrait { (1080, 1920) } else { (1920, 1080) };
+    let total = secs * images.len() as f64;
+    // 每张图片单独输入再用 concat 滤镜拼接（图片格式可以不同，concat 分离器要求格式一致）
+    let mut graph = String::new();
+    for i in 0..images.len() {
+        graph.push_str(&format!(
+            "[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30,format=yuv420p[v{i}];"
+        ));
+    }
+    for i in 0..images.len() {
+        graph.push_str(&format!("[v{i}]"));
+    }
+    graph.push_str(&format!("concat=n={}:v=1:a=0[v]", images.len()));
+    let n = images.len();
+    let make = |codec: &[&str]| {
+        let mut a = base_args();
+        for (p, _, _) in images {
+            a.extend(["-loop".into(), "1".into(), "-t".into(), format!("{secs:.3}"), "-i".into(), p.to_string_lossy().into_owned()]);
+        }
+        if let Some(m) = music {
+            a.extend(["-stream_loop".into(), "-1".into(), "-i".into(), m.to_string_lossy().into_owned()]);
+        }
+        a.extend(["-filter_complex".into(), graph.clone(), "-map".into(), "[v]".into()]);
+        if music.is_some() {
+            a.extend(["-map".into(), format!("{n}:a")]);
+            a.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "160k".into(), "-af".into(), format!("afade=t=out:st={:.2}:d=1.5", (total - 1.5).max(0.0))]);
+        }
+        a.extend(["-t".into(), format!("{total:.3}")]);
+        a.extend(codec.iter().map(|s| s.to_string()));
+        a.extend(["-movflags".into(), "+faststart".into(), "-f".into(), "mp4".into(), output.to_string_lossy().into_owned()]);
+        a
+    };
+    let attempts: [&[&str]; 3] =
+        [&["-c:v", "libx264", "-preset", "medium", "-crf", "20"], &["-c:v", "libopenh264", "-b:v", "6M"], &["-c:v", "mpeg4", "-q:v", "3"]];
+    let mut last = AppError::msg("合成失败");
+    for codec in attempts {
+        match run_ffmpeg(&ffmpeg, &make(codec)).await {
+            Ok(()) => return Ok(()),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
 pub async fn run_ffmpeg(ffmpeg: &Path, args: &[String]) -> AppResult<()> {
     let mut cmd = tokio::process::Command::new(ffmpeg);
     cmd.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());

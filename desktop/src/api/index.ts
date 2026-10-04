@@ -80,6 +80,7 @@ export const api = {
   setAfterAllDone: (action: string) => invoke<void>('set_after_all_done', { action }),
   readLinksFile: (path: string) => invoke<string>('read_links_file', { path }),
   isPortable: () => invoke<boolean>('is_portable'),
+  makeSlideshow: (media: MediaInfo, imageIds: string[], musicId: string | null, seconds: number) => invoke<string>('make_slideshow', { media, imageIds, musicId, seconds }),
   liveRooms: () => invoke<LiveRoom[]>('live_rooms'),
   liveCheck: (url: string) => invoke<LiveStatus>('live_check', { url }),
   liveAdd: (url: string, settings: LiveSettings) => invoke<LiveRoom>('live_add', { url, settings }),
@@ -127,6 +128,7 @@ export const api = {
   openLogDir: () => invoke<void>('open_log_dir'),
   openSamplesDir: () => invoke<void>('open_samples_dir'),
   checkUpdate: () => invoke<UpdateInfo>('check_update'),
+  installUpdate: () => invoke<void>('install_update'),
 }
 
 export const events = {
