@@ -6,6 +6,7 @@ pub mod diagnostics;
 pub mod download;
 pub mod engine;
 pub mod error;
+pub mod live;
 pub mod model;
 pub mod naming;
 pub mod net;
@@ -60,6 +61,7 @@ pub struct AppState {
     /// 全部下载完成后的动作：none / sleep / shutdown（不保存，每次启动为 none）
     pub after_all_done: Mutex<String>,
     pub subs: subs::SubsState,
+    pub live: live::LiveState,
 }
 
 impl AppState {
@@ -196,6 +198,7 @@ pub fn run() {
                 phone: phone::PhoneState::default(),
                 after_all_done: Mutex::new("none".into()),
                 subs: subs::SubsState::default(),
+                live: live::LiveState::default(),
             }));
             // 媒体库封面缓存通过 asset 协议显示
             let covers = data_dir.join("covers");
@@ -210,6 +213,7 @@ pub fn run() {
             clipboard::start_watcher(handle.clone());
             phone::restore(&handle);
             subs::spawn_scheduler(&handle);
+            live::spawn_monitor(&handle);
             // 开机自启时只在托盘运行
             if std::env::args().any(|a| a == "--autostart") {
                 if let Some(w) = app.get_webview_window("main") {
@@ -254,6 +258,15 @@ pub fn run() {
             commands::import_tool,
             commands::list_extractors,
             commands::open_tools_dir,
+            commands::live_rooms,
+            commands::live_check,
+            commands::live_add,
+            commands::live_update,
+            commands::live_set_monitoring,
+            commands::live_delete,
+            commands::live_start,
+            commands::live_stop,
+            commands::live_recordings,
             commands::subs_list,
             commands::subs_preview,
             commands::subs_add,

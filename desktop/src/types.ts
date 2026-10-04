@@ -288,6 +288,73 @@ export interface Settings {
   preventSleep: boolean
   subscriptionsEnabled: boolean
   launchAtLogin: boolean
+  liveMaxRecordings: number
+  liveCleanupDays: number
+}
+
+export interface LiveSettings {
+  autoRecord: boolean
+  quality: string
+  checkIntervalS: number
+  segmentMinutes: number
+  segmentMb: number
+  convertMp4: boolean
+  mergeSegments: boolean
+  dir: string
+  notify: boolean
+}
+
+export interface LiveStream {
+  quality: string
+  rank: number
+  url: string
+  format: 'flv' | 'hls'
+}
+
+export interface LiveStatus {
+  platform: string
+  platformName: string
+  roomId: string
+  streamer: string
+  title: string
+  cover: string | null
+  avatar: string | null
+  live: boolean
+  streams: LiveStream[]
+}
+
+export interface LiveRoom {
+  id: number
+  url: string
+  platform: string
+  platformName: string
+  streamer: string
+  title: string
+  avatar: string | null
+  cover: string | null
+  settings: LiveSettings
+  monitoring: boolean
+  createdAt: number
+  state: 'offline' | 'live' | 'recording' | 'error' | 'checking'
+  lastCheck: number | null
+  error: string | null
+  recStarted: number | null
+  recBytes: number
+  recFile: string | null
+  recSegments: number
+  qualities: string[]
+}
+
+export interface Recording {
+  id: number
+  liveId: number
+  streamer: string
+  title: string
+  startedAt: number
+  endedAt: number | null
+  files: string[]
+  size: number
+  status: string
 }
 
 export interface SubSettings {

@@ -157,6 +157,7 @@ impl Db {
             }
         }
         conn.execute_batch(crate::subs::SCHEMA)?;
+        conn.execute_batch(crate::live::SCHEMA)?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_downloads_platform ON downloads(platform);
              CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);",

@@ -268,6 +268,10 @@ pub struct Settings {
     pub subscriptions_enabled: bool,
     /// 开机自动启动（在托盘运行，用于订阅检查）
     pub launch_at_login: bool,
+    /// 同时录制的直播间数量上限
+    pub live_max_recordings: usize,
+    /// 自动删除多少天前的直播录像（0 表示不删除）
+    pub live_cleanup_days: u32,
 }
 
 /// 已配对的手机。
@@ -351,6 +355,8 @@ impl Default for Settings {
             prevent_sleep: true,
             subscriptions_enabled: false,
             launch_at_login: false,
+            live_max_recordings: 3,
+            live_cleanup_days: 0,
         }
     }
 }

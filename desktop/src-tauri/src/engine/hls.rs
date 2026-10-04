@@ -48,6 +48,8 @@ pub struct MediaPlaylist {
     pub segments: Vec<HlsSegment>,
     pub init: Option<String>,
     pub end_list: bool,
+    /// #EXT-X-TARGETDURATION（秒），直播轮询间隔参考
+    pub target_duration: f64,
 }
 
 impl MediaPlaylist {
@@ -126,6 +128,8 @@ pub fn parse_media(text: &str, base: &str) -> Result<MediaPlaylist, DlError> {
     for l in text.lines().map(str::trim) {
         if let Some(v) = l.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
             seq = v.trim().parse().unwrap_or(0);
+        } else if let Some(v) = l.strip_prefix("#EXT-X-TARGETDURATION:") {
+            pl.target_duration = v.trim().parse().unwrap_or(0.0);
         } else if let Some(v) = l.strip_prefix("#EXTINF:") {
             duration = v.split(',').next().and_then(|d| d.trim().parse().ok()).unwrap_or(0.0);
         } else if let Some(v) = l.strip_prefix("#EXT-X-KEY:") {

@@ -15,7 +15,7 @@ use crate::download::{self, EnqueueResult, OrphanPart, PostOptions, TaskSnapshot
 use crate::model::{AppError, AppResult, MediaInfo, MediaKind, PlaylistEntry, SeriesInfo};
 use crate::providers::{self, DetectedLink};
 use crate::settings::Settings;
-use crate::{clipboard, diagnostics, phone, quality, subs, tools, tray, AppState};
+use crate::{clipboard, diagnostics, live, phone, quality, subs, tools, tray, AppState};
 
 const REPO: &str = "DiXuanAoYi/Short_Video-API";
 
@@ -227,6 +227,60 @@ pub fn phone_revoke(app: AppHandle, device_id: String) -> AppResult<phone::Phone
 #[tauri::command]
 pub fn phone_pair_respond(app: AppHandle, device_id: String, accept: bool) -> AppResult<phone::PhoneInfo> {
     phone::respond_pair(&app, &device_id, accept)
+}
+
+// ---------- 直播录制 ----------
+
+#[tauri::command]
+pub fn live_rooms(app: AppHandle) -> AppResult<Vec<live::LiveRoom>> {
+    live::rooms(&app)
+}
+
+#[tauri::command]
+pub async fn live_check(app: AppHandle, url: String) -> AppResult<providers::live::LiveStatus> {
+    let url = providers::extract_urls(&url).into_iter().next().ok_or_else(|| AppError::invalid("没有找到链接。"))?;
+    live::check_status(&app, &url).await
+}
+
+#[tauri::command]
+pub async fn live_add(app: AppHandle, url: String, settings: live::LiveSettings) -> AppResult<live::LiveRoom> {
+    let url = providers::extract_urls(&url).into_iter().next().ok_or_else(|| AppError::invalid("没有找到链接。"))?;
+    live::add(&app, &url, settings).await
+}
+
+#[tauri::command]
+pub fn live_update(app: AppHandle, state: St<'_>, id: i64, streamer: String, settings: live::LiveSettings) -> AppResult<()> {
+    let room = state.db.live_room(id)?.ok_or_else(|| AppError::not_found("直播间不存在"))?;
+    let mut settings = settings;
+    settings.normalize(&room.platform);
+    state.db.live_update_settings(id, streamer.trim(), &settings)?;
+    let _ = app.emit(live::EVT_LIVE, ());
+    Ok(())
+}
+
+#[tauri::command]
+pub fn live_set_monitoring(app: AppHandle, id: i64, on: bool) -> AppResult<()> {
+    live::set_monitoring(&app, id, on)
+}
+
+#[tauri::command]
+pub fn live_delete(app: AppHandle, id: i64) -> AppResult<()> {
+    live::delete(&app, id)
+}
+
+#[tauri::command]
+pub fn live_start(app: AppHandle, id: i64) {
+    live::start_recording(&app, id, None)
+}
+
+#[tauri::command]
+pub fn live_stop(app: AppHandle, id: i64) {
+    live::stop_recording(&app, id)
+}
+
+#[tauri::command]
+pub fn live_recordings(state: St<'_>, id: Option<i64>) -> AppResult<Vec<live::Recording>> {
+    state.db.recordings(id)
 }
 
 // ---------- 订阅 ----------
