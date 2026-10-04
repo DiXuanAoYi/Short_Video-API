@@ -28,6 +28,26 @@ pub fn render_base(template: &str, info: &MediaInfo) -> String {
     avoid_reserved(name)
 }
 
+/// 剧集命名：模板如 `{series}/第{episode}集`，`/` 分隔子文件夹。返回（子文件夹列表，文件名主体）；
+/// 不是剧集或模板为空时返回 None。额外变量：{series} {season} {episode}。
+pub fn render_series(template: &str, info: &MediaInfo) -> Option<(Vec<String>, String)> {
+    let series = info.series.as_ref()?;
+    if template.trim().is_empty() || series.name.trim().is_empty() {
+        return None;
+    }
+    let ep = series.episode.map(|e| e.to_string()).unwrap_or_else(|| info.id.clone());
+    let season = series.season.map(|s| s.to_string()).unwrap_or_default();
+    let name: String = clean_title(&series.name).chars().take(MAX_TITLE_CHARS).collect();
+    let mut parts: Vec<String> = template
+        .split(['/', '\\'])
+        .map(|p| p.replace("{series}", &name).replace("{season}", &season).replace("{episode}", &ep))
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| render_base(&p, info))
+        .collect();
+    let base = parts.pop()?;
+    Some((parts, base))
+}
+
 /// Windows 不允许 CON、NUL、COM1 等作为文件名（不论扩展名），在后面加下划线。
 pub fn avoid_reserved(name: String) -> String {
     let stem = name.split('.').next().unwrap_or("").trim().to_ascii_uppercase();
@@ -190,5 +210,16 @@ mod tests {
     fn unique_path_appends_counter() {
         let taken = |p: &Path| p.ends_with("a.mp4") || p.ends_with("a (1).mp4");
         assert_eq!(unique_path(PathBuf::from("/x/a.mp4"), &taken), PathBuf::from("/x/a (2).mp4"));
+    }
+
+    #[test]
+    fn series_template() {
+        let mut i = info();
+        assert!(render_series("{series}/第{episode}集", &i).is_none());
+        i.series = Some(crate::model::SeriesInfo { name: "山野/日常".into(), season: Some(2), episode: Some(7) });
+        let (dirs, base) = render_series("{series}/S{season}/第{episode}集 {title}", &i).unwrap();
+        assert_eq!(dirs, vec!["山野_日常", "S2"]);
+        assert!(base.starts_with("第7集 秋天第一锅"), "{base}");
+        assert!(render_series("", &i).is_none());
     }
 }

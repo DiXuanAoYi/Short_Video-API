@@ -187,7 +187,6 @@ async function remove(a: AccountSummary) {
           <el-option v-for="p in providers" :key="p.id" :value="p.id" :label="p.name" />
           <el-option value="youtube.com" label="YouTube" />
           <el-option value="pornhub.com" label="Pornhub" />
-          <el-option value="pixiv.net" label="Pixiv" />
           <el-option value="other" label="其他网站…" />
         </el-select>
         <el-input v-if="site === 'other'" v-model="customDomain" size="small" placeholder="网站域名，例如 x.com" class="domain" />

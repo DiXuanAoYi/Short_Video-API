@@ -27,7 +27,7 @@ const hint = computed(() => {
     case 'unsupported':
       return { tip: '暂不支持这个网站或链接类型。', action: null, run: null }
     case 'need_update':
-      return { tip: '需要安装或更新组件后才能继续。', action: '前往设置', run: () => app.goSettings('general') }
+      return { tip: '需要安装或更新组件（yt-dlp / ffmpeg）后才能继续。', action: '管理组件', run: () => app.goSettings('components') }
     case 'disk':
       return { tip: '磁盘空间不足或没有写入权限。请检查下载目录。', action: '下载设置', run: () => app.goSettings('download') }
     default:

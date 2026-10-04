@@ -8,6 +8,7 @@ import type { Settings, UpdateInfo } from '../types'
 import { previewFilename } from '../utils/format'
 import AccountsPanel from '../components/AccountsPanel.vue'
 import NetworkPanel from '../components/NetworkPanel.vue'
+import ComponentsPanel from '../components/ComponentsPanel.vue'
 import { copyDiagnostics } from '../composables/diagnostics'
 
 const app = useAppStore()
@@ -201,6 +202,55 @@ function insertVar(v: string) {
               <small class="mute">填写已部署的旧版 PHP 接口（本仓库的 jxindex.php），只用于抖音、快手；其他平台始终本地解析。留空则不使用。</small>
             </div>
           </section>
+          <section class="group card">
+            <h3>清晰度与格式</h3>
+            <div class="kv">
+              <span>默认清晰度<small class="mute block">解析后默认选中，剪贴板自动下载和批量下载也按这里选择</small></span>
+              <el-select v-model="form.qualityPreset" size="small" class="sel">
+                <el-option value="best" label="最高画质" />
+                <el-option value="max1080" label="不超过 1080P" />
+                <el-option value="small" label="省空间（≤720P）" />
+                <el-option value="audio" label="只要音频" />
+              </el-select>
+            </div>
+            <div class="kv">
+              <span>同等清晰度优先 H.264<small class="mute block">兼容性最好；AV1、H.265 体积更小，但老设备可能播不了</small></span>
+              <el-switch v-model="form.preferH264" />
+            </div>
+            <div class="kv">
+              <span>只要音频时的格式</span>
+              <el-select v-model="form.audioFormat" size="small" class="sel">
+                <el-option value="mp3" label="MP3" />
+                <el-option value="m4a" label="M4A（AAC，不转码）" />
+                <el-option value="opus" label="Opus" />
+                <el-option value="flac" label="FLAC" />
+              </el-select>
+            </div>
+            <div class="field">
+              <label>剧集 / 合集命名</label>
+              <el-input v-model="form.seriesTemplate" size="small" class="mono" placeholder="{series}/第{episode}集" />
+              <small class="mute">变量：{series} 剧名或列表名、{season} 季、{episode} 集数，以及 {title} {author} 等；“/” 表示子文件夹。留空则使用普通文件命名。</small>
+            </div>
+          </section>
+          <section class="group card">
+            <h3>其他网站</h3>
+            <div class="kv">
+              <span>使用 yt-dlp 解析其他网站<small class="mute block">支持 YouTube、Pornhub、Twitter/X 等上千个网站；内置解析失效时也会用它重试</small></span>
+              <el-switch v-model="form.useYtdlp" />
+            </div>
+            <div class="kv">
+              <span>在网页中查找视频地址<small class="mute block">yt-dlp 也不支持时，尝试从网页里找 mp4 / m3u8 地址</small></span>
+              <el-switch v-model="form.genericSniffer" />
+            </div>
+            <div class="kv">
+              <span>m3u8 分片并发数</span>
+              <el-input-number v-model="form.hlsConcurrency" :min="1" :max="32" size="small" />
+            </div>
+            <div class="kv">
+              <span>跳过 m3u8 里的插播广告<small class="mute block">按分片来源判断，极少数情况下可能误删正片片段</small></span>
+              <el-switch v-model="form.hlsSkipAds" />
+            </div>
+          </section>
         </div>
       </el-tab-pane>
 
@@ -210,6 +260,10 @@ function insertVar(v: string) {
 
       <el-tab-pane label="账号与 Cookie" name="accounts">
         <AccountsPanel />
+      </el-tab-pane>
+
+      <el-tab-pane label="组件" name="components">
+        <ComponentsPanel v-model="form.componentMirrors" />
       </el-tab-pane>
 
       <el-tab-pane label="诊断" name="diagnostics">

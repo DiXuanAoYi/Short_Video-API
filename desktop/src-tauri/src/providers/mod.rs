@@ -2,10 +2,13 @@
 
 pub mod bilibili;
 pub mod douyin;
+pub mod generic;
 pub mod kuaishou;
+pub mod pixiv;
 pub mod remote;
 pub mod weibo;
 pub mod xiaohongshu;
+pub mod ytdlp;
 
 use std::path::PathBuf;
 use std::sync::LazyLock;
@@ -17,7 +20,7 @@ use serde::Serialize;
 use url::Url;
 
 use crate::cookies::CookieStore;
-use crate::model::{AppError, AppResult, MediaInfo};
+use crate::model::{AppError, AppResult, ErrorKind, MediaInfo};
 use crate::net::NetManager;
 use crate::settings::{ParseMode, Settings};
 
@@ -37,11 +40,14 @@ pub struct Ctx<'a> {
     pub samples: Option<PathBuf>,
     /// 指定使用某个账号的 Cookie（检查账号状态时），否则用网站的默认账号
     pub account: Option<String>,
+    /// yt-dlp 位置；为 None 时不使用 yt-dlp（未安装或已在设置中关闭）
+    pub ytdlp: Option<PathBuf>,
+    pub ffmpeg: Option<PathBuf>,
 }
 
 impl<'a> Ctx<'a> {
     pub fn new(client: &'a reqwest::Client, settings: &'a Settings, cookies: &'a CookieStore) -> Self {
-        Ctx { client, settings, cookies, net: None, samples: None, account: None }
+        Ctx { client, settings, cookies, net: None, samples: None, account: None, ytdlp: None, ffmpeg: None }
     }
 
     /// 按网络分流规则选择访问 `url` 的客户端。
@@ -103,7 +109,7 @@ pub struct AccountStatus {
 }
 
 pub fn all() -> &'static [&'static dyn Provider] {
-    static ALL: [&dyn Provider; 5] = [&douyin::Douyin, &kuaishou::Kuaishou, &xiaohongshu::Xiaohongshu, &bilibili::Bilibili, &weibo::Weibo];
+    static ALL: [&dyn Provider; 6] = [&douyin::Douyin, &kuaishou::Kuaishou, &xiaohongshu::Xiaohongshu, &bilibili::Bilibili, &weibo::Weibo, &pixiv::Pixiv];
     &ALL
 }
 
@@ -188,17 +194,59 @@ pub async fn resolve_url(ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo> {
         net.wait_turn(p.id(), std::time::Duration::from_millis(settings.site_request_interval_ms)).await;
     }
     let local = match provider {
-        Some(p) => p.resolve(ctx, url).await,
-        None => Err(AppError::unsupported("暂不支持这个平台。目前支持抖音、快手、小红书、B站、微博。")),
+        Some(p) => match p.resolve(ctx, url).await {
+            // 内置解析器失效时让 yt-dlp 试一次（它也支持 B站、微博等大部分平台）
+            Err(e) if e.kind == ErrorKind::ParserBroken && ctx.ytdlp.is_some() => {
+                ytdlp::resolve(ctx, url).await.map_err(|ye| AppError::new(e.kind, format!("{e}；yt-dlp 也失败：{ye}")))
+            }
+            other => other,
+        },
+        None => resolve_generic(ctx, url).await,
     };
 
     match local {
-        Ok(info) => Ok(info),
+        Ok(mut info) => {
+            crate::quality::sort_videos(&mut info, settings);
+            Ok(info)
+        }
         Err(e) if settings.parse_mode != ParseMode::Local && has_remote && remote_ok && provider.is_some() => {
             remote::resolve(ctx, url).await.map_err(|re| AppError::new(e.kind, format!("本地解析失败：{e}；远程解析也失败：{re}")))
         }
         Err(e) => Err(e),
     }
+}
+
+/// 没有内置解析器的网站：先交给 yt-dlp，再尝试网页嗅探。
+async fn resolve_generic(ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo> {
+    let mut first_err: Option<AppError> = None;
+    if ctx.ytdlp.is_some() {
+        if let Some(net) = ctx.net {
+            let host = Url::parse(url).ok().and_then(|u| u.host_str().map(crate::cookies::registrable_domain)).unwrap_or_default();
+            net.wait_turn(&host, Duration::from_millis(ctx.settings.site_request_interval_ms)).await;
+        }
+        match ytdlp::resolve(ctx, url).await {
+            Ok(info) => return Ok(info),
+            // 需要登录、地区限制等明确的错误直接返回，嗅探也不会成功
+            Err(e) if !matches!(e.kind, ErrorKind::Unsupported | ErrorKind::NotFound | ErrorKind::Other) => return Err(e),
+            Err(e) => first_err = Some(e),
+        }
+    }
+    if ctx.settings.generic_sniffer {
+        match generic::resolve(ctx, url).await {
+            Ok(info) => return Ok(info),
+            Err(e) if first_err.is_none() => first_err = Some(e),
+            Err(_) => {}
+        }
+    }
+    Err(match first_err {
+        Some(e) if ctx.ytdlp.is_some() => e,
+        _ if ctx.ytdlp.is_none() => AppError::new(
+            ErrorKind::NeedUpdate,
+            "内置解析器不支持这个网站。在“设置 → 组件”中安装 yt-dlp 后可支持上千个视频网站（YouTube、Pornhub、Twitter/X、TikTok 等）。",
+        ),
+        Some(e) => e,
+        None => AppError::unsupported("暂不支持这个网站。"),
+    })
 }
 
 /// 下载某个平台资源时使用的 Referer。

@@ -23,7 +23,7 @@ tauri-plugin-opener = "2"
 tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "system-proxy", "socks"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "rustls-tls-native-roots", "gzip", "system-proxy", "socks"] }
 tokio = { version = "1", features = ["sync", "time", "fs", "io-util", "macros", "rt-multi-thread", "process", "net"] }
 futures-util = "0.3"
 async-trait = "0.1"
@@ -38,6 +38,12 @@ aes-gcm = { version = "0.10", features = ["std"] }
 sha2 = "0.10"
 hex = "0.4"
 fs4 = { version = "0.13", features = ["sync"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+lzma-rs = "0.3"
+tar = "0.4"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+md-5 = "0.10"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }

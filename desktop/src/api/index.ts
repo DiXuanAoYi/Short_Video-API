@@ -11,6 +11,10 @@ import type {
   OrphanPart,
   SaveSettingsResult,
   AutoResult,
+  BatchProgress,
+  PostOptions,
+  ToolProgress,
+  ToolStatus,
   ClipboardLink,
   DetectedLink,
   HistoryItem,
@@ -29,7 +33,15 @@ export const api = {
   detectLinks: (text: string) => invoke<DetectedLink[]>('detect_links', { text }),
   resolve: (text: string) => invoke<MediaInfo>('resolve_link', { text }),
   resolveAndEnqueue: (text: string) => invoke<string>('resolve_and_enqueue', { text }),
-  enqueue: (media: MediaInfo, assetIds: string[]) => invoke<EnqueueResult>('enqueue', { media, assetIds }),
+  enqueue: (media: MediaInfo, assetIds: string[], post?: PostOptions) => invoke<EnqueueResult>('enqueue', { media, assetIds, post }),
+  enqueueEntries: (playlist: MediaInfo, entryIds: string[]) => invoke<number>('enqueue_entries', { playlist, entryIds }),
+
+  toolsStatus: () => invoke<ToolStatus[]>('tools_status'),
+  installTool: (tool: string) => invoke<ToolStatus>('install_tool', { tool }),
+  rollbackTool: (tool: string) => invoke<ToolStatus>('rollback_tool', { tool }),
+  importTool: (tool: string, path: string) => invoke<ToolStatus>('import_tool', { tool, path }),
+  listExtractors: () => invoke<string[]>('list_extractors'),
+  openToolsDir: () => invoke<void>('open_tools_dir'),
 
   listTasks: () => invoke<TaskSnapshot[]>('list_tasks'),
   pauseTask: (id: number) => invoke<void>('pause_task', { id }),
@@ -75,6 +87,8 @@ export const events = {
   onProgress: (cb: (task: TaskSnapshot) => void): Promise<UnlistenFn> => listen<TaskSnapshot>('tasks://progress', (e) => cb(e.payload)),
   onClipboardLink: (cb: (p: ClipboardLink) => void): Promise<UnlistenFn> => listen<ClipboardLink>('clipboard://link', (e) => cb(e.payload)),
   onAutoResult: (cb: (p: AutoResult) => void): Promise<UnlistenFn> => listen<AutoResult>('clipboard://auto-result', (e) => cb(e.payload)),
+  onToolProgress: (cb: (p: ToolProgress) => void): Promise<UnlistenFn> => listen<ToolProgress>('tools://progress', (e) => cb(e.payload)),
+  onBatch: (cb: (p: BatchProgress) => void): Promise<UnlistenFn> => listen<BatchProgress>('batch://progress', (e) => cb(e.payload)),
   onParseRequest: (cb: (text: string) => void): Promise<UnlistenFn> => listen<string>('app://parse-request', (e) => cb(e.payload)),
 }
 

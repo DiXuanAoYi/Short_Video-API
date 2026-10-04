@@ -1,6 +1,6 @@
 # 清影 ClearClip（桌面版）
 
-把本仓库的短视频去水印解析做成的桌面程序，支持抖音、快手、小红书、B站、微博。基于 Tauri 2 + Vue 3 + Rust，支持 Windows、macOS、Linux。
+把本仓库的短视频去水印解析做成的桌面程序：内置抖音、快手、小红书、B站、微博、Pixiv 解析，其他网站通过 yt-dlp（上千个视频网站）和网页嗅探支持。基于 Tauri 2 + Vue 3 + Rust，支持 Windows、macOS、Linux。
 
 规划与设计参考见 [`docs/desktop-plan.md`](../docs/desktop-plan.md)。
 
@@ -20,16 +20,25 @@
   | 抖音 | 视频、图集、背景音乐 | 分享页 `window._ROUTER_DATA` |
   | 快手 | 视频、图集、背景音乐 | 分享页 `window.INIT_STATE`，回退 `rest/wd/photo/info` |
   | 小红书 | 视频笔记、图文笔记（无水印原图） | 笔记页 `window.__INITIAL_STATE__` |
-  | B站 | 视频（含多 P，按链接 `?p=` 选择） | `x/web-interface/view` + `x/player/playurl`（html5 MP4） |
+  | B站 | 视频（含多 P，按链接 `?p=` 选择），全部清晰度与编码、杜比 / Hi-Res 音轨 | `x/web-interface/view` + wbi 签名的 `x/player/wbi/playurl`（DASH 分轨，下载后合并）；失败时退回 html5 MP4 |
   | 微博 | 视频、图片（转发微博取原微博媒体） | `m.weibo.cn/statuses/show` |
+  | Pixiv | 插画 / 漫画多页原图、动图（合成为 MP4 / WebM / GIF） | `ajax/illust`、`pages`、`ugoira_meta`；R-18 需要登录 |
+  | 其他网站 | YouTube、Pornhub、Twitter/X、TikTok 等 | yt-dlp（在“设置 → 组件”中一键安装）；还不行时在网页里查找 mp4 / m3u8 地址 |
+
+- 内置解析器失效时自动用 yt-dlp 重试；番剧、用户主页等内置解析器不支持的链接也交给 yt-dlp
+- 播放列表 / 合集：勾选条目后逐条解析并下载，按“列表名 / 第 N 集”归档（模板可改）
+- 清晰度预设（最高、不超过 1080P、省空间、只要音频），同等清晰度优先 H.264；可只保留音频（MP3 / M4A / Opus / FLAC）
+- m3u8：AES-128 解密、分片并发与续传、插播广告过滤，下载后无损转为 MP4；DRM 和直播流会明确提示
+- 组件管理：yt-dlp、ffmpeg 首次使用时从 GitHub 官方发布页下载并校验 SHA-256，可填 GitHub 镜像、回退上一版本或导入本地文件
 
 - 可单独下载背景音乐、封面
-- 下载队列：并发数可调、暂停 / 继续（断点续传）、网络错误自动重试、直链过期自动重新解析
+- 下载队列：并发数可调、按网站限制并发、大文件分段并行、暂停 / 继续（断点续传，重启程序后也能继续）、网络错误自动重试、直链过期自动重新解析、全局限速
+- 网络分流：按网站选择直连、系统代理或自定义 HTTP / SOCKS 代理（国内平台默认直连，海外网站默认走系统代理）
 - 剪贴板监听：复制链接后自动识别；主窗口不在前台时，右下角弹出迷你窗
 - 全局快捷键（默认 `Ctrl+Shift+D`）解析剪贴板；关闭窗口后驻留系统托盘
 - 媒体库：已下载文件和解析历史，支持搜索；已下载过的内容自动跳过
 - 文件命名模板：`{author}` `{title}` `{date}` `{id}` `{platform}`
-- 内置登录窗口获取 Cookie，也可手动填写
+- 账号与 Cookie：内置登录窗口、导入 cookies.txt 或粘贴；同一网站可保存多个账号；Cookie 加密保存，只发给对应网站
 - 远程 API 模式：可继续使用已部署的旧版 `jxindex.php`（仅抖音、快手），也可作为本地解析失败时的备用
 - 首次启动免责声明；通过 GitHub Releases 检查新版本
 
@@ -71,8 +80,15 @@ desktop/
 │   ├── stores/app.ts          # Pinia：设置、队列、解析状态
 │   └── api/index.ts           # Tauri 命令与事件封装
 └── src-tauri/src/
-    ├── providers/             # 解析器：douyin kuaishou xiaohongshu bilibili weibo remote
-    ├── download.rs            # 下载队列
+    ├── providers/             # 解析器：douyin kuaishou xiaohongshu bilibili weibo pixiv remote，
+    │                          #   ytdlp（通用）、generic（网页嗅探）
+    ├── engine/                # 下载引擎：http（分段并行、续传）、hls（m3u8）
+    ├── download.rs            # 下载队列、合并与后处理调度
+    ├── postprocess.rs         # ffmpeg：合并、转封装、提取音频、动图合成
+    ├── tools.rs               # yt-dlp / ffmpeg 组件管理
+    ├── quality.rs             # 清晰度预设
+    ├── cookies.rs secret.rs   # 加密 Cookie 存储
+    ├── net.rs                 # 按网站分流、限速
     ├── db.rs                  # SQLite：历史与媒体库
     ├── naming.rs              # 文件命名
     ├── settings.rs            # 设置（JSON）
@@ -95,11 +111,12 @@ desktop/
 
 ## 已知限制
 
-- 各平台解析依赖公开页面或接口，平台调整后需要更新对应解析器（抖音、快手可先切换到远程 API 模式）。
+- 各平台解析依赖公开页面或接口，平台调整后需要更新对应解析器（抖音、快手可先切换到远程 API 模式；其他平台失效时会自动用 yt-dlp 重试）。
 - 小红书网页链接通常需要带 `xsec_token`，部分笔记、微博需要先在设置中登录。
-- B站使用 html5 平台的合一 MP4：未登录一般为 480P / 720P，登录后请求 1080P；只有 DASH 分轨的视频、番剧和付费内容暂不支持。
+- B站未登录一般最高 480P / 720P，登录后 1080P，大会员清晰度需要大会员账号；付费内容不支持。
+- yt-dlp 和 ffmpeg 需要在“设置 → 组件”中安装（或使用系统已安装的版本）。macOS 不提供 ffmpeg 自动下载，请用 Homebrew 安装后导入。自动下载的 ffmpeg 为 LGPL 版本，不含 x264，Pixiv 动图会合成为 WebM。
+- DRM 加密内容、直播流（直播录制在后续阶段）不支持下载。
 - 单元测试使用按页面结构编写的样本数据（`src-tauri/tests/fixtures/`），不访问线上。
-- 尚未实现：图集合成视频、解析规则远程下发、B站 DASH 音视频合并、小红书实况照片。
 
 ## 免责声明
 

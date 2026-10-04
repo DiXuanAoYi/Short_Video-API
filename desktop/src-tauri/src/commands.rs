@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use serde::Serialize;
-use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 use tauri_plugin_opener::OpenerExt;
@@ -11,11 +11,11 @@ use url::Url;
 
 use crate::cookies::{self, AccountSummary};
 use crate::db::{HistoryItem, LibraryItem};
-use crate::download::{self, EnqueueResult, OrphanPart, TaskSnapshot};
-use crate::model::{AppError, AppResult, MediaInfo};
+use crate::download::{self, EnqueueResult, OrphanPart, PostOptions, TaskSnapshot};
+use crate::model::{AppError, AppResult, MediaInfo, MediaKind, PlaylistEntry, SeriesInfo};
 use crate::providers::{self, DetectedLink};
 use crate::settings::Settings;
-use crate::{clipboard, diagnostics, tray, AppState};
+use crate::{clipboard, diagnostics, quality, tools, tray, AppState};
 
 const REPO: &str = "DiXuanAoYi/Short_Video-API";
 
@@ -126,11 +126,109 @@ pub async fn resolve_and_enqueue(app: AppHandle, text: String) -> AppResult<Stri
 }
 
 #[tauri::command]
-pub async fn enqueue(app: AppHandle, media: MediaInfo, asset_ids: Vec<String>) -> AppResult<EnqueueResult> {
+pub async fn enqueue(app: AppHandle, media: MediaInfo, asset_ids: Vec<String>, post: Option<PostOptions>) -> AppResult<EnqueueResult> {
     if asset_ids.is_empty() {
         return Err(AppError::invalid("请至少选择一项要下载的内容。"));
     }
-    download::enqueue(&app, media, &asset_ids)
+    download::enqueue_with(&app, media, &asset_ids, post.unwrap_or_default())
+}
+
+pub const EVT_BATCH: &str = "batch://progress";
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchProgress {
+    pub title: String,
+    pub done: usize,
+    pub total: usize,
+    pub queued: usize,
+    /// 之前已下载或已在队列中而跳过的数量
+    pub skipped: usize,
+    pub failed: Vec<String>,
+    pub finished: bool,
+}
+
+/// 把播放列表 / 合集中选中的条目逐个解析并加入队列（后台进行，进度通过事件通知）。
+#[tauri::command]
+pub async fn enqueue_entries(app: AppHandle, state: St<'_>, playlist: MediaInfo, entry_ids: Vec<String>) -> AppResult<usize> {
+    let entries: Vec<PlaylistEntry> = playlist.entries.iter().filter(|e| entry_ids.contains(&e.id)).cloned().collect();
+    if entries.is_empty() {
+        return Err(AppError::invalid("请至少选择一个条目。"));
+    }
+    let n = entries.len();
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn(async move {
+        let settings = st.settings();
+        let mut p = BatchProgress { title: playlist.title.clone(), done: 0, total: n, queued: 0, skipped: 0, failed: vec![], finished: false };
+        let _ = app.emit(EVT_BATCH, p.clone());
+        for e in entries {
+            let ctx = st.parse_ctx(&settings);
+            match providers::resolve_url(&ctx, &e.url).await {
+                Ok(mut info) if info.kind != MediaKind::Playlist => {
+                    // 列表里的条目按“列表名 / 第 N 集”归档
+                    if info.series.is_none() {
+                        info.series = Some(SeriesInfo { name: playlist.title.clone(), season: None, episode: Some(e.index) });
+                    }
+                    let (ids, post) = quality::auto_selection(&info, &settings);
+                    match download::enqueue_with(&app, info, &ids, post) {
+                        Ok(r) => {
+                            p.queued += r.tasks.len();
+                            p.skipped += r.already_downloaded + r.already_queued;
+                        }
+                        Err(err) => p.failed.push(format!("{}：{err}", e.title)),
+                    }
+                }
+                Ok(_) => p.failed.push(format!("{}：嵌套的列表请单独打开", e.title)),
+                Err(err) => p.failed.push(format!("{}：{err}", e.title)),
+            }
+            p.done += 1;
+            let _ = app.emit(EVT_BATCH, p.clone());
+        }
+        p.finished = true;
+        let _ = app.emit(EVT_BATCH, p);
+    });
+    Ok(n)
+}
+
+// ---------- 组件（yt-dlp / ffmpeg） ----------
+
+fn tool_of(id: &str) -> AppResult<tools::Tool> {
+    tools::Tool::parse(id).ok_or_else(|| AppError::invalid("未知组件"))
+}
+
+#[tauri::command]
+pub async fn tools_status(state: St<'_>) -> AppResult<Vec<tools::ToolStatus>> {
+    let mut out = vec![];
+    for t in tools::Tool::all() {
+        out.push(tools::status(&state, t).await);
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+pub async fn install_tool(app: AppHandle, tool: String) -> AppResult<tools::ToolStatus> {
+    tools::install(&app, tool_of(&tool)?).await
+}
+
+#[tauri::command]
+pub async fn rollback_tool(state: St<'_>, tool: String) -> AppResult<tools::ToolStatus> {
+    tools::rollback(&state, tool_of(&tool)?).await
+}
+
+#[tauri::command]
+pub async fn import_tool(state: St<'_>, tool: String, path: String) -> AppResult<tools::ToolStatus> {
+    tools::import(&state, tool_of(&tool)?, std::path::Path::new(&path)).await
+}
+
+#[tauri::command]
+pub async fn list_extractors(state: St<'_>) -> AppResult<Vec<String>> {
+    tools::list_extractors(&state).await
+}
+
+#[tauri::command]
+pub async fn open_tools_dir(app: AppHandle, state: St<'_>) -> AppResult<()> {
+    std::fs::create_dir_all(&state.tools_dir)?;
+    app.opener().open_path(state.tools_dir.to_string_lossy(), None::<&str>).map_err(|e| AppError::msg(e.to_string()))
 }
 
 #[tauri::command]

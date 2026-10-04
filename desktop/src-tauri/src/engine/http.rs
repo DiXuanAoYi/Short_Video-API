@@ -33,6 +33,10 @@ impl HttpRequest {
         self
     }
 
+    pub fn build_get(&self, client: &reqwest::Client) -> reqwest::RequestBuilder {
+        self.build(client)
+    }
+
     fn build(&self, client: &reqwest::Client) -> reqwest::RequestBuilder {
         let mut req = client.get(&self.url);
         for (k, v) in &self.headers {

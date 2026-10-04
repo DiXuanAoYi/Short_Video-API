@@ -147,6 +147,21 @@ impl NetworkSettings {
     }
 }
 
+/// 默认选择哪种清晰度。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum QualityPreset {
+    /// 最高画质
+    #[default]
+    Best,
+    /// 不超过 1080P 的最高画质
+    Max1080,
+    /// 省空间：不超过 720P、码率最低
+    Small,
+    /// 只要音频
+    Audio,
+}
+
 /// 目标文件已存在时的处理方式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -211,6 +226,25 @@ pub struct Settings {
     pub conflict_policy: ConflictPolicy,
     /// 下载前要求保留的剩余磁盘空间（MB）
     pub disk_reserve_mb: u64,
+    pub quality_preset: QualityPreset,
+    /// 同等清晰度下优先 H.264（兼容性最好，AV1 / VP9 很多设备播不了）
+    pub prefer_h264: bool,
+    /// 合并音视频时的封装格式：mp4 / mkv
+    pub merge_container: String,
+    /// 只下载音频时的格式：mp3 / m4a
+    pub audio_format: String,
+    /// m3u8 分片并发数
+    pub hls_concurrency: usize,
+    /// 跳过与正片来源明显不同的 m3u8 分片（常见于插播广告）
+    pub hls_skip_ads: bool,
+    /// 剧集的命名模板；变量：{series} {episode} {season} {index} {title}
+    pub series_template: String,
+    /// 内置平台解析失败或不支持时使用 yt-dlp
+    pub use_ytdlp: bool,
+    /// yt-dlp 也不支持时，尝试在网页里查找视频地址
+    pub generic_sniffer: bool,
+    /// 下载组件时使用的 GitHub 镜像前缀，如 `https://ghfast.top/`
+    pub component_mirrors: Vec<String>,
 }
 
 impl Default for Settings {
@@ -247,6 +281,16 @@ impl Default for Settings {
             temp_dir: String::new(),
             conflict_policy: ConflictPolicy::Rename,
             disk_reserve_mb: 200,
+            quality_preset: QualityPreset::Best,
+            prefer_h264: true,
+            merge_container: "mp4".into(),
+            audio_format: "mp3".into(),
+            hls_concurrency: 6,
+            hls_skip_ads: false,
+            series_template: "{series}/第{episode}集".into(),
+            use_ytdlp: true,
+            generic_sniffer: true,
+            component_mirrors: vec![],
         }
     }
 }
@@ -283,6 +327,23 @@ impl Settings {
             r.pattern = r.pattern.trim().trim_start_matches('.').to_ascii_lowercase();
         }
         self.network.rules.retain(|r| !r.pattern.is_empty());
+        self.hls_concurrency = self.hls_concurrency.clamp(1, 16);
+        if !matches!(self.merge_container.as_str(), "mp4" | "mkv") {
+            self.merge_container = "mp4".into();
+        }
+        if !matches!(self.audio_format.as_str(), "mp3" | "m4a") {
+            self.audio_format = "mp3".into();
+        }
+        if self.series_template.trim().is_empty() {
+            self.series_template = Settings::default().series_template;
+        }
+        self.component_mirrors = self
+            .component_mirrors
+            .iter()
+            .map(|m| m.trim().to_string())
+            .filter(|m| m.starts_with("https://"))
+            .map(|m| if m.ends_with('/') { m } else { format!("{m}/") })
+            .collect();
         if self.filename_template.trim().is_empty() {
             self.filename_template = Settings::default().filename_template;
         }

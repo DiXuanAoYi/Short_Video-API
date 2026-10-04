@@ -10,6 +10,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::watch;
 
 use crate::db::{self, JobRow, NewDownload};
+use crate::engine::hls::{self as hls_engine, HlsOptions};
 use crate::engine::http::{self as http_engine, HttpOptions, HttpRequest};
 use crate::engine::{wait_ctrl, DlError, ResumeMeta, CTRL_CANCEL, CTRL_PAUSE, CTRL_RUN};
 use crate::error::ErrorKind;
@@ -228,12 +229,8 @@ fn parse_meta(json: &str) -> JobMeta {
 
 /// 已下载的字节数：分段下载的文件是预分配的，按各段记录的进度计算；单线程下载按临时文件大小计算。
 fn received_on_disk(settings: &Settings, id: i64, path: &str, inputs: usize, meta: &JobMeta) -> u64 {
-    (0..inputs)
-        .map(|i| match meta.inputs.get(i).filter(|m| !m.segments.is_empty()) {
-            Some(m) => m.segmented_received(),
-            None => file_len(&input_part_path(settings, id, Path::new(path), i, inputs)),
-        })
-        .sum()
+    let empty = ResumeMeta::default();
+    (0..inputs).map(|i| input_received(&input_part_path(settings, id, Path::new(path), i, inputs), meta.inputs.get(i).unwrap_or(&empty))).sum()
 }
 
 /// 启动时从数据库恢复任务：未完成的任务恢复为“已暂停”（或按设置自动继续），进度以临时文件实际大小为准。
@@ -342,8 +339,14 @@ pub fn enqueue_with(app: &AppHandle, media: MediaInfo, asset_ids: &[String], pos
     let st = state(app);
     let settings = st.settings();
     let media = Arc::new(media);
-    let dir = naming::target_dir(&settings.download_root(), &media, settings.subfolder_by_platform);
-    let base = naming::render_base(&settings.filename_template, &media);
+    let mut dir = naming::target_dir(&settings.download_root(), &media, settings.subfolder_by_platform);
+    let base = match naming::render_series(&settings.series_template, &media) {
+        Some((dirs, base)) => {
+            dir.extend(dirs);
+            base
+        }
+        None => naming::render_base(&settings.filename_template, &media),
+    };
     let media_json = serde_json::to_string(&*media)?;
 
     let mut result = EnqueueResult { tasks: vec![], already_downloaded: 0, already_queued: 0 };
@@ -475,7 +478,7 @@ fn build_request(st: &AppState, media: &MediaInfo, asset: &Asset) -> HttpRequest
 
 async fn run_task(app: AppHandle, id: i64) {
     let st = state(&app);
-    let Some((mut spec, media, mut rx, final_path, mut meta)) =
+    let Some((mut spec, media, mut rx, mut final_path, mut meta)) =
         with_entry(&st, id, |e| (e.spec.clone(), e.media.clone(), e.ctrl.subscribe(), PathBuf::from(&e.snap.file_path), e.meta.clone()))
     else {
         return;
@@ -491,17 +494,14 @@ async fn run_task(app: AppHandle, id: i64) {
         disk_reserve: settings.disk_reserve_mb * 1024 * 1024,
         net: Some(st.net.clone()),
     };
-    let start_len: u64 = (0..count).map(|i| if meta.inputs[i].segments.is_empty() { file_len(&parts[i]) } else { meta.inputs[i].segmented_received() }).sum();
+    let start_len: u64 = (0..count).map(|i| input_received(&parts[i], &meta.inputs[i])).sum();
     if start_len > 0 {
         set_note(&app, id, Some(&format!("从 {} 处继续下载", human_bytes(start_len))));
     }
 
     let mut outcome: Result<u64, DlError> = Ok(0);
+    let mut fmp4 = false;
     for i in 0..count {
-        if spec.inputs[i].protocol != Protocol::Http {
-            outcome = Err(DlError::Other("这种格式需要外部组件下载（yt-dlp / m3u8）".into()));
-            break;
-        }
         // 已完成的输入（合并前中断）直接跳过
         if let Some(t) = meta.inputs[i].total {
             if meta.inputs[i].segments.is_empty() && file_len(&parts[i]) == t {
@@ -510,30 +510,150 @@ async fn run_task(app: AppHandle, id: i64) {
         }
         set_step(&st, id, "download");
         let done_before: u64 = (0..i).map(|k| meta.inputs[k].total.unwrap_or_else(|| file_len(&parts[k]))).sum();
-        outcome = download_input(&app, &st, &settings, id, &media, &mut spec, i, &parts[i], &mut meta, &mut rx, &opts, done_before).await;
+        outcome = download_input(&app, &st, &settings, id, &media, &mut spec, i, &parts[i], &mut meta, &mut rx, &opts, done_before, &mut fmp4).await;
         if outcome.is_err() {
             break;
         }
     }
 
     let final_part = if count > 1 { part_path(&final_path) } else { parts[0].clone() };
-    let outcome = match outcome {
+    // 合并 / 转封装使用源格式的容器；需要提取音频时最终文件才是音频格式
+    let container = match &spec.post.extract_audio {
+        Some(_) => final_path.with_extension(if spec.primary().ext.is_empty() { "mp4" } else { spec.primary().ext.as_str() }),
+        None => final_path.clone(),
+    };
+    let mut outcome = match outcome {
         Ok(_) if count > 1 => {
             set_step(&st, id, "merge");
             set_note(&app, id, Some("正在合并音视频…"));
-            match postprocess::merge(&st, &parts, &final_part, &final_path).await {
+            let aac_fix = spec.inputs.iter().any(|a| a.protocol == Protocol::Hls) && !fmp4;
+            match postprocess::merge(&st, &parts, &final_part, &container, aac_fix).await {
                 Ok(()) => {
                     for p in &parts {
-                        let _ = std::fs::remove_file(p);
+                        remove_part(p);
                     }
                     Ok(file_len(&final_part))
                 }
                 Err(e) => Err(DlError::Other(e.message)),
             }
         }
+        // Pixiv 动图：帧压缩包合成为视频
+        Ok(_) if providers::pixiv::ugoira_frames(spec.primary()).is_some() => {
+            set_step(&st, id, "post");
+            set_note(&app, id, Some("正在把动图合成为视频…"));
+            let frames = providers::pixiv::ugoira_frames(spec.primary()).unwrap_or_default();
+            let out = suffixed(&final_part, ".remux");
+            match postprocess::ugoira(&st, &final_part, &frames, &out).await {
+                Ok(ext) => {
+                    let _ = std::fs::remove_file(&final_part);
+                    let _ = std::fs::rename(&out, &final_part);
+                    final_path = final_path.with_extension(ext);
+                    Ok(file_len(&final_part))
+                }
+                Err(e) => {
+                    remove_part(&out);
+                    Err(DlError::Other(e.message))
+                }
+            }
+        }
+        // m3u8 拼接出的是 TS 流：有 ffmpeg 时无损转封装为 MP4，否则保存为 .ts
+        Ok(size) if spec.primary().protocol == Protocol::Hls => {
+            if postprocess::find_ffmpeg(&st).is_some() {
+                set_step(&st, id, "post");
+                set_note(&app, id, Some("正在转换为 MP4…"));
+                let out = suffixed(&final_part, ".remux");
+                match postprocess::remux(&st, &final_part, &out, &container, !fmp4).await {
+                    Ok(()) => {
+                        let _ = std::fs::rename(&out, &final_part);
+                        Ok(file_len(&final_part))
+                    }
+                    Err(e) => {
+                        remove_part(&out);
+                        Err(DlError::Other(e.message))
+                    }
+                }
+            } else {
+                if !fmp4 && spec.post.extract_audio.is_none() {
+                    final_path = final_path.with_extension("ts");
+                }
+                Ok(size)
+            }
+        }
         other => other,
     };
+
+    // 提取音频
+    if let (Ok(_), Some(fmt)) = (&outcome, spec.post.extract_audio.clone()) {
+        if spec.primary().ext != fmt {
+            set_step(&st, id, "post");
+            set_note(&app, id, Some(&format!("正在提取音频（{}）…", fmt.to_uppercase())));
+            let out = suffixed(&final_part, ".audio");
+            outcome = match postprocess::extract_audio(&st, &final_part, &out, &fmt).await {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&final_part);
+                    let _ = std::fs::rename(&out, &final_part);
+                    final_path = final_path.with_extension(&fmt);
+                    Ok(file_len(&final_part))
+                }
+                Err(e) => {
+                    remove_part(&out);
+                    Err(DlError::Other(e.message))
+                }
+            };
+        }
+    }
     finish(&app, &st, id, outcome, &final_part, &final_path, &parts, &settings);
+}
+
+/// 进度上报：限制频率、计算速度、定期写入数据库。
+struct Reporter {
+    app: AppHandle,
+    st: Arc<AppState>,
+    id: i64,
+    i: usize,
+    done_before: u64,
+    baseline: Option<(Instant, u64)>,
+    last_persist: Instant,
+}
+
+impl Reporter {
+    fn new(app: &AppHandle, st: &Arc<AppState>, id: i64, i: usize, done_before: u64) -> Self {
+        Reporter { app: app.clone(), st: st.clone(), id, i, done_before, baseline: None, last_persist: Instant::now() }
+    }
+
+    fn update(&mut self, received: u64, total: Option<u64>, speed: Option<u64>, meta_now: Option<&ResumeMeta>) {
+        let now = Instant::now();
+        let (t0, b0) = *self.baseline.get_or_insert((now, received));
+        let elapsed = now.duration_since(t0);
+        if elapsed < Duration::from_millis(250) && Some(received) != total {
+            return;
+        }
+        let speed = speed.unwrap_or_else(|| (received.saturating_sub(b0) as f64 / elapsed.as_secs_f64().max(0.001)) as u64);
+        self.baseline = Some((now, received));
+        let save = self.last_persist.elapsed() >= PERSIST_EVERY;
+        if save {
+            self.last_persist = now;
+        }
+        let (i, done_before, st) = (self.i, self.done_before, &self.st);
+        let snap = with_entry(st, self.id, |e| {
+            e.snap.received = done_before + received;
+            e.snap.total = total.map(|t| done_before + t);
+            e.snap.speed = speed;
+            if let Some(m) = meta_now {
+                e.snap.resumable = m.resumable;
+                if e.meta.inputs.len() > i {
+                    e.meta.inputs[i] = m.clone();
+                }
+            }
+            if save {
+                persist(st, e);
+            }
+            e.snap.clone()
+        });
+        if let Some(s) = snap {
+            let _ = self.app.emit(EVT_PROGRESS, s);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -550,6 +670,7 @@ async fn download_input(
     rx: &mut watch::Receiver<u8>,
     opts: &HttpOptions,
     done_before: u64,
+    fmp4: &mut bool,
 ) -> Result<u64, DlError> {
     let mut re_resolved = false;
     let mut net_attempts = 0u32;
@@ -560,51 +681,53 @@ async fn download_input(
             }
         }
         let asset = spec.inputs[i].clone();
-        let req = build_request(st, media, &asset);
-        let client = match st.net.clients_for(&settings.network, &asset.url) {
-            Ok(c) => c.download,
-            Err(e) => return Err(DlError::Other(e.message)),
+        let mut reporter = Reporter::new(app, st, id, i, done_before);
+        let res = match asset.protocol {
+            Protocol::Http => {
+                let req = build_request(st, media, &asset);
+                let client = st.net.clients_for(&settings.network, &asset.url).map_err(|e| DlError::Other(e.message))?.download;
+                http_engine::download(&client, &req, part, &mut meta.inputs[i], rx, opts, |received, total, meta_now| {
+                    reporter.update(received, total, None, Some(meta_now))
+                })
+                .await
+            }
+            Protocol::Hls => {
+                let req = build_request(st, media, &asset);
+                let client = st.net.clients_for(&settings.network, &asset.url).map_err(|e| DlError::Other(e.message))?.download;
+                let hopts = HlsOptions {
+                    concurrency: settings.hls_concurrency,
+                    skip_ads: settings.hls_skip_ads,
+                    speed_limit_kbps: settings.speed_limit_kbps,
+                    disk_reserve: opts.disk_reserve,
+                    net: opts.net.clone(),
+                };
+                hls_engine::download(&client, &req, part, rx, &hopts, |received, total| reporter.update(received, total, None, None)).await.map(|r| {
+                    *fmp4 = r.fmp4;
+                    if r.skipped_ads > 0 {
+                        log::info!("job {id}: skipped {} ad segments", r.skipped_ads);
+                    }
+                    meta.inputs[i] = ResumeMeta { total: Some(r.size), ..Default::default() };
+                    r.size
+                })
+            }
+            Protocol::Ytdlp => {
+                let ctx = st.parse_ctx(settings);
+                let format_id = asset.format_id.clone().unwrap_or_else(|| "best".into());
+                let page = if media.source_url.is_empty() { asset.url.clone() } else { media.source_url.clone() };
+                providers::ytdlp::download(&ctx, &page, &format_id, &asset.ext, part, rx, settings.speed_limit_kbps, |p| {
+                    reporter.update(p.downloaded, p.total, p.speed, None)
+                })
+                .await
+                .inspect(|size| meta.inputs[i] = ResumeMeta { total: Some(*size), ..Default::default() })
+            }
         };
-        let mut baseline: Option<(Instant, u64)> = None;
-        let mut last_persist = Instant::now();
-        let st2 = st.clone();
-        let app2 = app.clone();
-        let res = http_engine::download(&client, &req, part, &mut meta.inputs[i], rx, opts, |received, total, meta_now| {
-            let now = Instant::now();
-            let (t0, b0) = *baseline.get_or_insert((now, received));
-            let elapsed = now.duration_since(t0);
-            if elapsed < Duration::from_millis(250) && Some(received) != total {
-                return;
-            }
-            let speed = (received.saturating_sub(b0) as f64 / elapsed.as_secs_f64().max(0.001)) as u64;
-            baseline = Some((now, received));
-            let save = last_persist.elapsed() >= PERSIST_EVERY;
-            if save {
-                last_persist = now;
-            }
-            let snap = with_entry(&st2, id, |e| {
-                e.snap.received = done_before + received;
-                e.snap.total = total.map(|t| done_before + t);
-                e.snap.speed = speed;
-                e.snap.resumable = meta_now.resumable;
-                if e.meta.inputs.len() > i {
-                    e.meta.inputs[i] = meta_now.clone();
-                }
-                if save {
-                    persist(&st2, e);
-                }
-                e.snap.clone()
-            });
-            if let Some(s) = snap {
-                let _ = app2.emit(EVT_PROGRESS, s);
-            }
-        })
-        .await;
         let m = meta.clone();
         with_entry(st, id, |e| e.meta = m);
 
         match res {
-            Err(DlError::Status(code)) if matches!(code, 403 | 404 | 410) && !re_resolved && !media.source_url.is_empty() => {
+            Err(DlError::Status(code))
+                if matches!(code, 403 | 404 | 410) && !re_resolved && !media.source_url.is_empty() && asset.protocol != Protocol::Ytdlp =>
+            {
                 re_resolved = true;
                 set_note(app, id, Some("下载地址已过期，正在重新解析…"));
                 let ctx = st.parse_ctx(settings);
@@ -616,8 +739,9 @@ async fn download_input(
                         return Err(DlError::Other("重新解析后找不到这个资源".into()));
                     }
                 }
-                let kept = keep_part_after_refresh(st, settings, media, &spec.inputs[i], part, &mut meta.inputs[i]).await;
-                let note = if kept {
+                let note = if asset.protocol == Protocol::Hls {
+                    "已获取新地址，继续下载剩余分片".to_string()
+                } else if keep_part_after_refresh(st, settings, media, &spec.inputs[i], part, &mut meta.inputs[i]).await {
                     format!("已获取新地址，从 {} 处继续", human_bytes(file_len(part)))
                 } else {
                     "已获取新地址，文件已变化，从头下载".to_string()
@@ -644,6 +768,49 @@ async fn download_input(
             other => return other,
         }
     }
+}
+
+/// `p` 后面加上后缀（不替换扩展名）。
+fn suffixed(p: &Path, suffix: &str) -> PathBuf {
+    let mut s = p.as_os_str().to_owned();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// yt-dlp 下载时可能留下的临时文件（输出名为“临时文件名.扩展名”，下载中再加 .part / .ytdl）。
+fn ytdlp_leftovers(p: &Path) -> Vec<PathBuf> {
+    ["mp4", "m4a", "webm", "mkv", "mp3", "flv", "ts", "mov", "opus", "ogg", "flac", "aac"]
+        .iter()
+        .flat_map(|ext| {
+            let out = providers::ytdlp::output_path(p, ext);
+            [suffixed(&out, ".part"), suffixed(&out, ".ytdl"), out]
+        })
+        .collect()
+}
+
+/// 删除一个输入的临时文件，连同 m3u8 分片目录和 yt-dlp 的临时文件。
+fn remove_part(p: &Path) {
+    let _ = std::fs::remove_file(p);
+    for f in ytdlp_leftovers(p) {
+        let _ = std::fs::remove_file(f);
+    }
+    let _ = std::fs::remove_dir_all(hls_engine::segment_dir(p));
+}
+
+fn dir_size(dir: &Path) -> u64 {
+    std::fs::read_dir(dir).map(|rd| rd.flatten().filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum()).unwrap_or(0)
+}
+
+/// 某个输入已下载的字节数：分段下载按各段进度，m3u8 按已下载的分片，yt-dlp 按它的 .part 文件。
+fn input_received(part: &Path, meta: &ResumeMeta) -> u64 {
+    if !meta.segments.is_empty() {
+        return meta.segmented_received();
+    }
+    let done = file_len(part);
+    if done > 0 {
+        return done;
+    }
+    ytdlp_leftovers(part).iter().map(|f| file_len(f)).sum::<u64>() + dir_size(&hls_engine::segment_dir(part))
 }
 
 /// 移动到最终位置；跨磁盘时改为复制后删除。
@@ -710,7 +877,7 @@ fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>
                 if !settings.keep_part_on_cancel {
                     e.snap.received = 0;
                     for p in &leftovers {
-                        let _ = std::fs::remove_file(p);
+                        remove_part(p);
                     }
                     e.meta = JobMeta { inputs: vec![ResumeMeta::default(); e.spec.inputs.len()] };
                 }
@@ -727,7 +894,7 @@ fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>
     if found.is_none() {
         // 任务已被移除：清理残留
         for p in &leftovers {
-            let _ = std::fs::remove_file(p);
+            remove_part(p);
         }
     }
     if let Some((title, label)) = notify {
@@ -801,6 +968,9 @@ fn all_parts(settings: &Settings, e: &Entry) -> Vec<PathBuf> {
     let fp = Path::new(&e.snap.file_path);
     let mut v: Vec<PathBuf> = (0..n).map(|i| input_part_path(settings, e.snap.id, fp, i, n)).collect();
     v.push(part_path(fp));
+    // yt-dlp 下载时自己的临时文件，以及后处理的中间文件
+    let extra: Vec<PathBuf> = v.iter().flat_map(|p| [suffixed(p, ".remux"), suffixed(p, ".audio")].into_iter().chain(ytdlp_leftovers(p))).collect();
+    v.extend(extra);
     v
 }
 
@@ -816,7 +986,7 @@ pub fn cancel(app: &AppHandle, id: i64) {
             if !settings.keep_part_on_cancel {
                 e.snap.received = 0;
                 for p in all_parts(&settings, e) {
-                    let _ = std::fs::remove_file(p);
+                    remove_part(&p);
                 }
                 e.meta = JobMeta { inputs: vec![ResumeMeta::default(); e.spec.inputs.len()] };
             }
@@ -838,7 +1008,7 @@ pub fn remove(app: &AppHandle, id: i64) {
                 let _ = e.ctrl.send(CTRL_CANCEL);
             } else if e.snap.status != TaskStatus::Done {
                 for p in all_parts(&settings, &e) {
-                    let _ = std::fs::remove_file(p);
+                    remove_part(&p);
                 }
             }
             let _ = st.db.delete_job(id);

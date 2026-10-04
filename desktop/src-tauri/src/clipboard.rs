@@ -88,9 +88,12 @@ pub async fn resolve_and_enqueue(app: &AppHandle, text: &str) -> crate::model::A
     let settings = st.settings();
     let info = providers::resolve_text(&st.parse_ctx(&settings), text).await?;
     let _ = st.db.upsert_history(&info);
-    let ids = info.default_asset_ids();
+    let (ids, post) = crate::quality::auto_selection(&info, &settings);
     let title = info.title.clone();
-    let r = download::enqueue(app, info, &ids)?;
+    if info.kind == crate::model::MediaKind::Playlist {
+        return Err(crate::model::AppError::invalid(format!("“{title}”是一个列表（{} 条），请在主窗口选择要下载的条目。", info.entries.len())));
+    }
+    let r = download::enqueue_with(app, info, &ids, post)?;
     if r.tasks.is_empty() && r.already_downloaded > 0 {
         return Ok(format!("{title}（之前已下载）"));
     }

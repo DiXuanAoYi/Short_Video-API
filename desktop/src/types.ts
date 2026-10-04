@@ -24,6 +24,7 @@ export interface Asset {
   hasAudio: boolean | null
   pairAudio: string | null
   formatId: string | null
+  extra: Record<string, unknown> | null
 }
 
 export interface PlaylistEntry {
@@ -200,6 +201,54 @@ export interface Settings {
   tempDir: string
   conflictPolicy: ConflictPolicy
   diskReserveMb: number
+  qualityPreset: QualityPreset
+  preferH264: boolean
+  mergeContainer: string
+  audioFormat: string
+  hlsConcurrency: number
+  hlsSkipAds: boolean
+  seriesTemplate: string
+  useYtdlp: boolean
+  genericSniffer: boolean
+  componentMirrors: string[]
+}
+
+export type QualityPreset = 'best' | 'max1080' | 'small' | 'audio'
+
+export interface PostOptions {
+  extractAudio: string | null
+  embedMetadata: boolean
+}
+
+export type ToolId = 'yt-dlp' | 'ffmpeg'
+
+export interface ToolStatus {
+  id: ToolId
+  installed: boolean
+  managed: boolean
+  path: string | null
+  version: string | null
+  hasPrevious: boolean
+  autoInstall: boolean
+  note: string | null
+  busy: boolean
+}
+
+export interface ToolProgress {
+  tool: ToolId
+  stage: 'prepare' | 'download' | 'verify' | 'extract' | 'done'
+  received: number
+  total: number | null
+}
+
+export interface BatchProgress {
+  title: string
+  done: number
+  total: number
+  queued: number
+  skipped: number
+  failed: string[]
+  finished: boolean
 }
 
 export interface SaveSettingsResult {

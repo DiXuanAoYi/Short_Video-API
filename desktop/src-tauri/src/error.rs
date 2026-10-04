@@ -147,6 +147,50 @@ impl Serialize for AppError {
     }
 }
 
+/// reqwest 的顶层错误只有“error sending request”，沿着错误链找出真正原因并给出说明。
+pub fn describe_reqwest(e: &reqwest::Error) -> String {
+    let mut chain: Vec<String> = vec![];
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    while let Some(err) = cur {
+        chain.push(err.to_string());
+        cur = err.source();
+    }
+    let all = chain.join(" | ").to_lowercase();
+    if all.contains("certificate") || all.contains("unknownissuer") {
+        return "HTTPS 证书校验失败。可能是代理软件、公司网络或防火墙拦截了加密连接；请检查代理设置，或把代理的根证书安装到系统中。".into();
+    }
+    if e.is_timeout() || all.contains("timed out") {
+        return "连接超时".into();
+    }
+    if all.contains("dns") || all.contains("failed to lookup") || all.contains("name or service not known") {
+        return "无法解析域名，请检查网络连接或 DNS".into();
+    }
+    if all.contains("connection refused") {
+        return "连接被拒绝（如果设置了代理，请确认代理软件正在运行）".into();
+    }
+    if all.contains("proxy") {
+        return format!("代理连接失败：{}", chain.last().cloned().unwrap_or_default());
+    }
+    match chain.last() {
+        Some(root) => format!("{}（{root}）", e.without_url_ref()),
+        None => e.without_url_ref().to_string(),
+    }
+}
+
+trait WithoutUrlRef {
+    fn without_url_ref(&self) -> String;
+}
+
+impl WithoutUrlRef for reqwest::Error {
+    fn without_url_ref(&self) -> String {
+        let s = self.to_string();
+        match self.url() {
+            Some(u) => s.replace(&format!(" ({u})"), "").replace(u.as_str(), ""),
+            None => s,
+        }
+    }
+}
+
 impl From<reqwest::Error> for AppError {
     fn from(e: reqwest::Error) -> Self {
         if let Some(status) = e.status() {
@@ -154,7 +198,7 @@ impl From<reqwest::Error> for AppError {
         }
         let kind = if e.is_decode() { ErrorKind::ParserBroken } else { ErrorKind::Network };
         // 不带 URL，避免把带签名参数的地址写进界面和日志
-        AppError::new(kind, format!("网络请求失败：{}", e.without_url()))
+        AppError::new(kind, format!("网络请求失败：{}", describe_reqwest(&e)))
     }
 }
 

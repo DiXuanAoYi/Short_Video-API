@@ -4,7 +4,7 @@ import { api, errorKind, errorText, events } from '../api'
 import type { AppInfo, ErrorKind, HistoryItem, MediaInfo, Settings, TaskSnapshot } from '../types'
 
 export type ViewName = 'parse' | 'queue' | 'library' | 'settings'
-export type SettingsTab = 'download' | 'parse' | 'network' | 'accounts' | 'diagnostics' | 'general'
+export type SettingsTab = 'download' | 'parse' | 'network' | 'accounts' | 'components' | 'diagnostics' | 'general'
 
 /** 设置、主题与当前页面。 */
 export const useAppStore = defineStore('app', () => {

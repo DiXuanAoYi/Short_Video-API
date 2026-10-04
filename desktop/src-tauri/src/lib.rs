@@ -11,6 +11,7 @@ pub mod naming;
 pub mod net;
 pub mod postprocess;
 pub mod providers;
+pub mod quality;
 pub mod secret;
 pub mod settings;
 pub mod tools;
@@ -49,6 +50,7 @@ pub struct AppState {
     pub net: Arc<net::NetManager>,
     /// 程序管理的外部组件目录（yt-dlp、ffmpeg）
     pub tools_dir: PathBuf,
+    pub tools: tools::ToolsState,
     pub data_dir: PathBuf,
 }
 
@@ -64,6 +66,10 @@ impl AppState {
         if settings.record_samples {
             ctx.samples = Some(self.samples_dir.clone());
         }
+        if settings.use_ytdlp {
+            ctx.ytdlp = tools::resolve(self, tools::Tool::YtDlp);
+        }
+        ctx.ffmpeg = tools::resolve(self, tools::Tool::Ffmpeg);
         ctx
     }
 }
@@ -165,6 +171,7 @@ pub fn run() {
                 shortcut_error: Mutex::new(None),
                 net: Arc::new(net::NetManager::default()),
                 tools_dir: data_dir.join("tools"),
+                tools: tools::ToolsState::default(),
                 data_dir: data_dir.clone(),
             }));
             download::restore(&handle);
@@ -204,6 +211,13 @@ pub fn run() {
             commands::resolve_link,
             commands::resolve_and_enqueue,
             commands::enqueue,
+            commands::enqueue_entries,
+            commands::tools_status,
+            commands::install_tool,
+            commands::rollback_tool,
+            commands::import_tool,
+            commands::list_extractors,
+            commands::open_tools_dir,
             commands::list_tasks,
             commands::pause_task,
             commands::resume_task,

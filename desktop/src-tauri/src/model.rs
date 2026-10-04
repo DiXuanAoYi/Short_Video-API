@@ -76,6 +76,9 @@ pub struct Asset {
     /// yt-dlp 的格式 ID（protocol = ytdlp 时使用）
     #[serde(default)]
     pub format_id: Option<String>,
+    /// 平台特有的附加数据（如 Pixiv 动图的帧时长）
+    #[serde(default)]
+    pub extra: Option<serde_json::Value>,
 }
 
 /// 合集 / 播放列表里的一个条目。
@@ -122,6 +125,7 @@ impl Asset {
             has_audio: None,
             pair_audio: None,
             format_id: None,
+            extra: None,
         }
     }
 

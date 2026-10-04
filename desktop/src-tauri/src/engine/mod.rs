@@ -1,5 +1,6 @@
 //! 下载引擎：HTTP（单线程 / 分段并行）、m3u8 等具体传输实现。任务调度在 `download.rs`。
 
+pub mod hls;
 pub mod http;
 
 use serde::{Deserialize, Serialize};
@@ -68,6 +69,8 @@ pub enum DlError {
     #[error("{0}")]
     Disk(String),
     #[error("{0}")]
+    Encrypted(String),
+    #[error("{0}")]
     Other(String),
 }
 
@@ -78,6 +81,7 @@ impl DlError {
             DlError::Status(code) => crate::error::AppError::from_status(*code, "").kind,
             DlError::Net(_) => ErrorKind::Network,
             DlError::Io(_) | DlError::Disk(_) => ErrorKind::Disk,
+            DlError::Encrypted(_) => ErrorKind::Encrypted,
             _ => ErrorKind::Other,
         }
     }
