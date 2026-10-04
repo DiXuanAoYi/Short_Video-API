@@ -84,7 +84,7 @@ export const useParseStore = defineStore('parse', () => {
     if (input !== undefined) text.value = input
     const t = text.value.trim()
     if (!t) {
-      error.value = '请先粘贴抖音或快手的分享链接。'
+      error.value = '请先粘贴作品的分享链接。'
       return
     }
     loading.value = true

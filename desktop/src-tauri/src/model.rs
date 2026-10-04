@@ -55,11 +55,16 @@ impl Asset {
 }
 
 fn guess_image_ext(url: &str) -> String {
-    let path = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
-    if path.contains(".webp") {
+    let lower = url.to_ascii_lowercase();
+    let path = lower.split('?').next().unwrap_or(&lower);
+    if lower.contains("format/png") {
+        "png".into()
+    } else if lower.contains("format/webp") || path.contains(".webp") {
         "webp".into()
     } else if path.contains(".png") {
         "png".into()
+    } else if path.contains(".gif") {
+        "gif".into()
     } else if path.contains(".heic") {
         "heic".into()
     } else {

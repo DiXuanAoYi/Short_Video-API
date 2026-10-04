@@ -80,7 +80,7 @@ async function downloadNow() {
           <small class="ellipsis">{{ first.url }}</small>
         </div>
       </div>
-      <div v-else class="mute">复制抖音或快手链接后会出现在这里。</div>
+      <div v-else class="mute">复制支持平台的分享链接后会出现在这里。</div>
       <div v-if="message" class="msg ellipsis" :class="{ err: failed }" :title="message">{{ message }}</div>
       <div class="row">
         <el-button v-if="first && !app.settings?.autoDownload" type="primary" size="small" :loading="busy" @click="downloadNow">立即下载</el-button>

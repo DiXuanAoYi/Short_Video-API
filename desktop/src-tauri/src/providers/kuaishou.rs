@@ -40,6 +40,10 @@ impl Provider for Kuaishou {
         "https://www.kuaishou.com/"
     }
 
+    fn login_url(&self) -> &'static str {
+        "https://www.kuaishou.com/"
+    }
+
     async fn resolve(&self, ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo> {
         let cookie = ctx.settings.cookie("kuaishou").map(String::from).unwrap_or_else(random_did_cookie);
 

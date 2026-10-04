@@ -221,11 +221,7 @@ pub fn hide_mini(app: AppHandle) {
 }
 
 fn login_url(platform: &str) -> AppResult<&'static str> {
-    match platform {
-        "douyin" => Ok("https://www.douyin.com/"),
-        "kuaishou" => Ok("https://www.kuaishou.com/"),
-        _ => Err(AppError::msg("这个平台不支持登录。")),
-    }
+    providers::by_id(platform).map(|p| p.login_url()).ok_or_else(|| AppError::msg("这个平台不支持登录。"))
 }
 
 /// 打开平台登录窗口。窗口内是平台官网，不能调用本程序的任何命令。

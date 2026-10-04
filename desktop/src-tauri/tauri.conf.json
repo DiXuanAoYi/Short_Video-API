@@ -44,8 +44,8 @@
     "active": true,
     "targets": "all",
     "category": "Video",
-    "shortDescription": "抖音 / 快手短视频解析与下载",
-    "longDescription": "清影 ClearClip：粘贴抖音、快手分享链接，解析无水印视频与图集并下载到本地。仅用于下载你有权保存的内容。",
+    "shortDescription": "抖音、快手、小红书、B站、微博作品解析与下载",
+    "longDescription": "清影 ClearClip：粘贴抖音、快手、小红书、B站、微博的分享链接，解析无水印视频与图集并下载到本地。仅用于下载你有权保存的内容。",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

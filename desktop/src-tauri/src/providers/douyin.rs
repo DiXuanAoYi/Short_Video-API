@@ -35,6 +35,10 @@ impl Provider for Douyin {
         "https://www.douyin.com/"
     }
 
+    fn login_url(&self) -> &'static str {
+        "https://www.douyin.com/"
+    }
+
     async fn resolve(&self, ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo> {
         let id = match aweme_id_from_url(url) {
             Some(id) => id,

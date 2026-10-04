@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api, errorText } from '../api'
 import { useAppStore, useParseStore, useQueueStore } from '../stores/app'
@@ -16,7 +16,7 @@ const files = ref<LibraryItem[]>([])
 const history = ref<HistoryItem[]>([])
 const loading = ref(false)
 
-const platformName: Record<string, string> = { douyin: '抖音', kuaishou: '快手' }
+const platformName = computed<Record<string, string>>(() => Object.fromEntries((app.info?.providers ?? []).map((p) => [p.id, p.name])))
 
 function assetName(id: string) {
   if (id.startsWith('image-')) return `图片 ${Number(id.slice(6)) + 1}`

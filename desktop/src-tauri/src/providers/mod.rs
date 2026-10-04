@@ -1,8 +1,11 @@
 //! 各平台解析器。每个平台实现 [`Provider`]，新增平台时只需加一个文件并在 [`all`] 里注册。
 
+pub mod bilibili;
 pub mod douyin;
 pub mod kuaishou;
 pub mod remote;
+pub mod weibo;
+pub mod xiaohongshu;
 
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -15,6 +18,7 @@ use url::Url;
 use crate::model::{AppError, AppResult, MediaInfo};
 use crate::settings::{ParseMode, Settings};
 
+pub const DESKTOP_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36";
 pub const MOBILE_UA: &str =
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1";
 
@@ -32,11 +36,13 @@ pub trait Provider: Send + Sync {
     fn matches(&self, url: &Url) -> bool;
     /// 下载该平台资源时使用的 Referer。
     fn referer(&self) -> &'static str;
+    /// 内置登录窗口打开的地址，也用于读取登录后的 Cookie。
+    fn login_url(&self) -> &'static str;
     async fn resolve(&self, ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo>;
 }
 
 pub fn all() -> &'static [&'static dyn Provider] {
-    static ALL: [&dyn Provider; 2] = [&douyin::Douyin, &kuaishou::Kuaishou];
+    static ALL: [&dyn Provider; 5] = [&douyin::Douyin, &kuaishou::Kuaishou, &xiaohongshu::Xiaohongshu, &bilibili::Bilibili, &weibo::Weibo];
     &ALL
 }
 
@@ -88,33 +94,43 @@ pub fn detect_links(text: &str) -> Vec<DetectedLink> {
 pub async fn resolve_text(client: &reqwest::Client, settings: &Settings, text: &str) -> AppResult<MediaInfo> {
     let urls = extract_urls(text);
     let Some(first) = urls.first() else {
-        return Err(AppError::msg("没有找到链接。请粘贴抖音或快手的分享文案或链接。"));
+        return Err(AppError::msg("没有找到链接。请粘贴分享文案或链接。"));
     };
     // 优先选受支持平台的链接，避免文案中混有其他网址。
     let url = urls.iter().find(|u| Url::parse(u).map(|p| all().iter().any(|pr| pr.matches(&p))).unwrap_or(false)).unwrap_or(first).clone();
     resolve_url(client, settings, &url).await
 }
 
+/// 旧版 PHP 接口（远程 API）只支持这些平台。
+pub const REMOTE_PLATFORMS: &[&str] = &["douyin", "kuaishou"];
+
+/// 远程 API 不支持的平台始终走本地解析；无法识别平台的链接交给远程接口判断。
+pub fn remote_allowed(provider: Option<&dyn Provider>) -> bool {
+    provider.map_or(true, |p| REMOTE_PLATFORMS.contains(&p.id()))
+}
+
 pub async fn resolve_url(client: &reqwest::Client, settings: &Settings, url: &str) -> AppResult<MediaInfo> {
     let ctx = Ctx { client, settings };
     let has_remote = !settings.remote_endpoint.is_empty();
+    let parsed = Url::parse(url).map_err(|_| AppError::msg("链接格式不正确。"))?;
+    let provider = all().iter().find(|p| p.matches(&parsed));
+    let remote_ok = remote_allowed(provider.copied());
 
-    if settings.parse_mode == ParseMode::Remote {
+    if settings.parse_mode == ParseMode::Remote && remote_ok {
         if !has_remote {
             return Err(AppError::msg("当前为远程解析模式，但没有填写远程 API 地址。请在设置中填写，或改为本地解析。"));
         }
         return remote::resolve(&ctx, url).await;
     }
 
-    let parsed = Url::parse(url).map_err(|_| AppError::msg("链接格式不正确。"))?;
-    let local = match all().iter().find(|p| p.matches(&parsed)) {
+    let local = match provider {
         Some(p) => p.resolve(&ctx, url).await,
-        None => Err(AppError::msg("暂不支持这个平台。目前支持抖音、快手的视频和图集。")),
+        None => Err(AppError::msg("暂不支持这个平台。目前支持抖音、快手、小红书、B站、微博。")),
     };
 
     match local {
         Ok(info) => Ok(info),
-        Err(e) if settings.parse_mode == ParseMode::LocalThenRemote && has_remote => {
+        Err(e) if settings.parse_mode != ParseMode::Local && has_remote && remote_ok && provider.is_some() => {
             remote::resolve(&ctx, url).await.map_err(|re| AppError::msg(format!("本地解析失败：{e}；远程解析也失败：{re}")))
         }
         Err(e) => Err(e),
@@ -213,6 +229,16 @@ mod tests {
         let s = Settings { parse_mode: ParseMode::Remote, ..Settings::default() };
         let err = resolve_text(&build_client(), &s, "https://v.douyin.com/x/").await.unwrap_err();
         assert!(err.to_string().contains("远程 API"));
+    }
+
+    #[test]
+    fn remote_api_only_for_legacy_platforms() {
+        assert!(remote_allowed(by_id("douyin")));
+        assert!(remote_allowed(by_id("kuaishou")));
+        assert!(!remote_allowed(by_id("bilibili")));
+        assert!(!remote_allowed(by_id("xiaohongshu")));
+        assert!(!remote_allowed(by_id("weibo")));
+        assert!(remote_allowed(None));
     }
 
     #[tokio::test]

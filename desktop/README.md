@@ -1,6 +1,6 @@
 # 清影 ClearClip（桌面版）
 
-把本仓库的抖音 / 快手去水印解析做成的桌面程序。基于 Tauri 2 + Vue 3 + Rust，支持 Windows、macOS、Linux。
+把本仓库的短视频去水印解析做成的桌面程序，支持抖音、快手、小红书、B站、微博。基于 Tauri 2 + Vue 3 + Rust，支持 Windows、macOS、Linux。
 
 规划与设计参考见 [`docs/desktop-plan.md`](../docs/desktop-plan.md)。
 
@@ -13,14 +13,24 @@
 ## 功能
 
 - 粘贴整段分享文案即可解析，自动提取链接；一次粘贴多条链接可批量下载
-- 抖音、快手的视频和图集；可单独下载背景音乐、封面
+- 支持平台：
+
+  | 平台 | 内容 | 解析方式 |
+  | --- | --- | --- |
+  | 抖音 | 视频、图集、背景音乐 | 分享页 `window._ROUTER_DATA` |
+  | 快手 | 视频、图集、背景音乐 | 分享页 `window.INIT_STATE`，回退 `rest/wd/photo/info` |
+  | 小红书 | 视频笔记、图文笔记（无水印原图） | 笔记页 `window.__INITIAL_STATE__` |
+  | B站 | 视频（含多 P，按链接 `?p=` 选择） | `x/web-interface/view` + `x/player/playurl`（html5 MP4） |
+  | 微博 | 视频、图片（转发微博取原微博媒体） | `m.weibo.cn/statuses/show` |
+
+- 可单独下载背景音乐、封面
 - 下载队列：并发数可调、暂停 / 继续（断点续传）、网络错误自动重试、直链过期自动重新解析
 - 剪贴板监听：复制链接后自动识别；主窗口不在前台时，右下角弹出迷你窗
 - 全局快捷键（默认 `Ctrl+Shift+D`）解析剪贴板；关闭窗口后驻留系统托盘
 - 媒体库：已下载文件和解析历史，支持搜索；已下载过的内容自动跳过
 - 文件命名模板：`{author}` `{title}` `{date}` `{id}` `{platform}`
 - 内置登录窗口获取 Cookie，也可手动填写
-- 远程 API 模式：可继续使用已部署的旧版 `jxindex.php`，也可作为本地解析失败时的备用
+- 远程 API 模式：可继续使用已部署的旧版 `jxindex.php`（仅抖音、快手），也可作为本地解析失败时的备用
 - 首次启动免责声明；通过 GitHub Releases 检查新版本
 
 ## 开发
@@ -61,7 +71,7 @@ desktop/
 │   ├── stores/app.ts          # Pinia：设置、队列、解析状态
 │   └── api/index.ts           # Tauri 命令与事件封装
 └── src-tauri/src/
-    ├── providers/             # 解析器：douyin.rs kuaishou.rs remote.rs
+    ├── providers/             # 解析器：douyin kuaishou xiaohongshu bilibili weibo remote
     ├── download.rs            # 下载队列
     ├── db.rs                  # SQLite：历史与媒体库
     ├── naming.rs              # 文件命名
@@ -85,9 +95,11 @@ desktop/
 
 ## 已知限制
 
-- 抖音解析读取移动端分享页里的 `window._ROUTER_DATA`，快手读取 `window.INIT_STATE`，并回退到旧版使用的 `rest/wd/photo/info` 接口。平台调整页面结构后需要更新对应解析器；可以先切换到远程 API 模式。
+- 各平台解析依赖公开页面或接口，平台调整后需要更新对应解析器（抖音、快手可先切换到远程 API 模式）。
+- 小红书网页链接通常需要带 `xsec_token`，部分笔记、微博需要先在设置中登录。
+- B站使用 html5 平台的合一 MP4：未登录一般为 480P / 720P，登录后请求 1080P；只有 DASH 分轨的视频、番剧和付费内容暂不支持。
 - 单元测试使用按页面结构编写的样本数据（`src-tauri/tests/fixtures/`），不访问线上。
-- 尚未实现：图集合成视频、解析规则远程下发、小红书 / B站等更多平台。
+- 尚未实现：图集合成视频、解析规则远程下发、B站 DASH 音视频合并、小红书实况照片。
 
 ## 免责声明
 

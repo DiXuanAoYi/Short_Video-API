@@ -142,7 +142,7 @@ function sizeText(a: Asset) {
         type="textarea"
         :autosize="{ minRows: 1, maxRows: 4 }"
         resize="none"
-        placeholder="粘贴抖音或快手的分享文案 / 链接，按 Enter 解析"
+        placeholder="粘贴抖音、快手、小红书、B站、微博的分享文案或链接，按 Enter 解析"
         class="paste-input"
         @keydown="onKey"
       />
@@ -152,7 +152,7 @@ function sizeText(a: Asset) {
     <div class="hint">
       <span v-if="app.settings?.watchClipboard" class="ok">● 剪贴板监听已开启</span>
       <span v-else>剪贴板监听已关闭</span>
-      <span>支持：{{ supported }}（视频 / 图集）</span>
+      <span>支持：{{ supported }}</span>
       <span>Enter 解析 · Shift+Enter 换行</span>
       <span v-if="app.settings?.shortcut">全局快捷键 {{ app.settings.shortcut.replace('CommandOrControl', 'Ctrl') }}</span>
     </div>
@@ -248,7 +248,7 @@ function sizeText(a: Asset) {
     <section v-if="!result && !parse.loading && !parse.recent.length && !parse.error" class="empty">
       <h3>复制分享链接，就能保存无水印作品</h3>
       <ol>
-        <li>在抖音或快手里点“分享 → 复制链接”。</li>
+        <li>在 App 里点“分享 → 复制链接”。</li>
         <li>回到这里粘贴（开启剪贴板监听后会自动识别）。</li>
         <li>选择视频、图片或背景音乐，点击“下载所选”。</li>
       </ol>
