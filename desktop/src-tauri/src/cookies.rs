@@ -156,6 +156,21 @@ impl CookieStore {
         (!pairs.is_empty()).then(|| pairs.join("; "))
     }
 
+    /// 指定账号的 Cookie 头（按域名、路径过滤）。
+    pub fn header_for_account(&self, id: &str, url: &str) -> Option<String> {
+        let url = Url::parse(url).ok()?;
+        let data = self.data.read().unwrap_or_else(|e| e.into_inner());
+        let account = data.accounts.iter().find(|a| a.id == id)?;
+        let now = crate::db::now();
+        let pairs: Vec<String> = account.cookies.iter().filter(|c| c.matches(&url, now)).map(|c| format!("{}={}", c.name, c.value)).collect();
+        (!pairs.is_empty()).then(|| pairs.join("; "))
+    }
+
+    pub fn account_site(&self, id: &str) -> Option<String> {
+        let data = self.data.read().unwrap_or_else(|e| e.into_inner());
+        data.accounts.iter().find(|a| a.id == id).map(|a| a.site.clone())
+    }
+
     pub fn has_account(&self, site: &str) -> bool {
         let data = self.data.read().unwrap_or_else(|e| e.into_inner());
         data.accounts.iter().any(|a| a.site == site)

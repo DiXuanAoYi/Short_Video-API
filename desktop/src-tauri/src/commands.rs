@@ -78,8 +78,11 @@ pub async fn save_settings(app: AppHandle, state: St<'_>, settings: Settings) ->
     if old.shortcut != s.shortcut {
         apply_shortcut(&app, &s.shortcut);
     }
+    if old.network != s.network {
+        state.net.invalidate();
+    }
     tray::sync_watch_item(&app);
-    if old.concurrency != s.concurrency {
+    if old.concurrency != s.concurrency || old.per_site_concurrency != s.per_site_concurrency {
         download::schedule(&app);
     }
     let shortcut_error = state.shortcut_error.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -364,6 +367,30 @@ pub async fn set_default_account(state: St<'_>, id: String) -> AppResult<Vec<Acc
 pub async fn delete_account(state: St<'_>, id: String) -> AppResult<Vec<AccountSummary>> {
     state.cookies.delete(&id)?;
     Ok(state.cookies.summaries())
+}
+
+/// 检查账号是否仍处于登录状态（目前支持 B站、微博），并记录用户名。
+#[tauri::command]
+pub async fn check_account(state: St<'_>, id: String) -> AppResult<providers::AccountStatus> {
+    let site = state.cookies.account_site(&id).ok_or_else(|| AppError::not_found("账号不存在。"))?;
+    let provider = providers::by_id(&site).ok_or_else(|| AppError::unsupported("暂不支持检查这个网站的登录状态。"))?;
+    let settings = state.settings();
+    let mut ctx = state.parse_ctx(&settings);
+    ctx.account = Some(id.clone());
+    let status = provider.account_status(&ctx).await?.ok_or_else(|| AppError::unsupported(format!("暂不支持检查{}的登录状态。", provider.name())))?;
+    let name = match (&status.user_name, &status.vip) {
+        (Some(n), Some(v)) => Some(format!("{n}（{v}）")),
+        (n, _) => n.clone(),
+    };
+    state.cookies.set_user_name(&id, if status.logged_in { name } else { None })?;
+    Ok(status)
+}
+
+/// 测试某个地址在当前网络规则下能否访问。
+#[tauri::command]
+pub async fn test_route(state: St<'_>, url: String) -> AppResult<crate::net::RouteTest> {
+    let url = if url.starts_with("http") { url } else { format!("https://{url}/") };
+    state.net.test(&state.settings().network, &url).await
 }
 
 // ---------- 诊断 ----------

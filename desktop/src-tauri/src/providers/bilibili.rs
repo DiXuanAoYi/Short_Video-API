@@ -59,13 +59,19 @@ impl Provider for Bilibili {
         "https://www.bilibili.com/"
     }
 
+    async fn account_status(&self, ctx: &Ctx<'_>) -> AppResult<Option<super::AccountStatus>> {
+        let api = "https://api.bilibili.com/x/web-interface/nav";
+        let v = get_json(ctx, api, ctx.cookie(api).as_deref()).await?;
+        Ok(Some(parse_nav(&v)))
+    }
+
     async fn resolve(&self, ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo> {
         let cookie = ctx.cookie("https://api.bilibili.com/");
         let (vid, page) = match video_id_from_url(url) {
             Some(v) => (v, page_from_url(url)),
             None => {
                 // b23.tv 短链
-                let resp = ctx.client.get(url).header("User-Agent", DESKTOP_UA).send().await?;
+                let resp = ctx.get(url).header("User-Agent", DESKTOP_UA).send().await?;
                 let final_url = resp.url().to_string();
                 let v = video_id_from_url(&final_url).ok_or_else(|| AppError::msg("没能从链接里识别出 B站视频号（BV/av），目前只支持视频稿件。"))?;
                 (v, page_from_url(&final_url))
@@ -92,7 +98,7 @@ impl Provider for Bilibili {
 }
 
 async fn get_json(ctx: &Ctx<'_>, api: &str, cookie: Option<&str>) -> AppResult<Value> {
-    let mut req = ctx.client.get(api).header("User-Agent", DESKTOP_UA).header("Referer", REFERER);
+    let mut req = ctx.get(api).header("User-Agent", DESKTOP_UA).header("Referer", REFERER);
     if let Some(c) = cookie {
         req = req.header("Cookie", c);
     }
@@ -119,6 +125,14 @@ pub fn api_data(v: &Value) -> AppResult<&Value> {
         });
     }
     v.get("data").filter(|d| d.is_object()).ok_or_else(|| AppError::msg("B站接口没有返回数据。"))
+}
+
+/// 解析 `x/web-interface/nav`：未登录时 code 为 -101。
+pub fn parse_nav(v: &Value) -> super::AccountStatus {
+    let data = v.get("data");
+    let logged_in = data.and_then(|d| d.get("isLogin")).and_then(Value::as_bool).unwrap_or(false);
+    let vip = data.filter(|d| u64_at(d, "/vipStatus") == Some(1)).map(|d| str_at(d, "/vip_label/text").unwrap_or("大会员").to_string());
+    super::AccountStatus { logged_in, user_name: data.and_then(|d| str_at(d, "/uname")).map(String::from), vip }
 }
 
 pub fn video_id_from_url(url: &str) -> Option<VideoId> {
@@ -179,6 +193,9 @@ pub fn parse_view(data: &Value, play: &Value, index: usize, source_url: &str) ->
         height,
         published_at: u64_at(data, "/pubdate").map(|t| t as i64),
         assets,
+        entries: vec![],
+        series: None,
+        extractor: Some("native".into()),
     })
 }
 
@@ -210,6 +227,18 @@ mod tests {
         assert_eq!((info.width, info.height), (Some(1920), Some(1080)));
         assert!(info.assets[0].url.starts_with("https://upos-sz-mirrorcos.bilivideo.com/"));
         assert_eq!(info.cover.as_deref(), Some("https://i0.hdslb.com/bfs/archive/cover.jpg"));
+    }
+
+    #[test]
+    fn nav_status() {
+        let v: Value =
+            serde_json::from_str(r#"{"code":0,"data":{"isLogin":true,"uname":"编程老王","vipStatus":1,"vip_label":{"text":"年度大会员"}}}"#).unwrap();
+        let s = parse_nav(&v);
+        assert!(s.logged_in);
+        assert_eq!(s.user_name.as_deref(), Some("编程老王"));
+        assert_eq!(s.vip.as_deref(), Some("年度大会员"));
+        let v: Value = serde_json::from_str(r#"{"code":-101,"message":"账号未登录","data":{"isLogin":false}}"#).unwrap();
+        assert!(!parse_nav(&v).logged_in);
     }
 
     #[test]

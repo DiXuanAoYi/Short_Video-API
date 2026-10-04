@@ -4,12 +4,16 @@ pub mod cookies;
 pub mod db;
 pub mod diagnostics;
 pub mod download;
+pub mod engine;
 pub mod error;
 pub mod model;
 pub mod naming;
+pub mod net;
+pub mod postprocess;
 pub mod providers;
 pub mod secret;
 pub mod settings;
+pub mod tools;
 mod tray;
 
 use std::path::PathBuf;
@@ -41,6 +45,11 @@ pub struct AppState {
     pub log_dir: PathBuf,
     /// 最近一次注册全局快捷键失败的原因
     pub shortcut_error: Mutex<Option<String>>,
+    /// 按网站分流的网络客户端、限速与请求间隔
+    pub net: Arc<net::NetManager>,
+    /// 程序管理的外部组件目录（yt-dlp、ffmpeg）
+    pub tools_dir: PathBuf,
+    pub data_dir: PathBuf,
 }
 
 impl AppState {
@@ -51,11 +60,40 @@ impl AppState {
     /// 解析用的上下文；开启“录制样本”时附带样本目录。
     pub fn parse_ctx<'a>(&'a self, settings: &'a Settings) -> providers::Ctx<'a> {
         let mut ctx = providers::Ctx::new(&self.client, settings, &self.cookies);
+        ctx.net = Some(&self.net);
         if settings.record_samples {
             ctx.samples = Some(self.samples_dir.clone());
         }
         ctx
     }
+}
+
+/// 定期检查即将过期的登录 Cookie 并发送通知（每个账号每天最多提醒一次）。
+fn spawn_account_reminders(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut notified: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+        loop {
+            let st = app.state::<Arc<AppState>>().inner().clone();
+            let now = db::now();
+            for a in st.cookies.summaries() {
+                let Some(exp) = a.expires_at else { continue };
+                let left = exp - now;
+                if left > 3 * 86400 || notified.get(&a.id).is_some_and(|t| now - t < 86400) {
+                    continue;
+                }
+                let body = if left <= 0 {
+                    format!("{}账号“{}”的登录状态已过期，需要登录的内容将无法下载。", a.site_name, a.label)
+                } else {
+                    format!("{}账号“{}”的登录状态将在 {} 小时后过期。", a.site_name, a.label, left / 3600 + 1)
+                };
+                use tauri_plugin_notification::NotificationExt;
+                let _ = app.notification().builder().title("登录即将失效").body(body).show();
+                notified.insert(a.id.clone(), now);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
+        }
+    });
 }
 
 pub fn run() {
@@ -125,8 +163,12 @@ pub fn run() {
                 samples_dir: diagnostics::samples_dir(&data_dir),
                 log_dir,
                 shortcut_error: Mutex::new(None),
+                net: Arc::new(net::NetManager::default()),
+                tools_dir: data_dir.join("tools"),
+                data_dir: data_dir.clone(),
             }));
             download::restore(&handle);
+            spawn_account_reminders(handle.clone());
 
             tray::create(&handle)?;
             commands::apply_shortcut(&handle, &settings.shortcut);
@@ -183,6 +225,8 @@ pub fn run() {
             commands::rename_account,
             commands::set_default_account,
             commands::delete_account,
+            commands::check_account,
+            commands::test_route,
             commands::get_diagnostics,
             commands::open_log_dir,
             commands::open_samples_dir,

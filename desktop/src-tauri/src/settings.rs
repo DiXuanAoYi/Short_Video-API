@@ -17,6 +17,149 @@ pub enum ParseMode {
     LocalThenRemote,
 }
 
+/// 网络出口。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", content = "id", rename_all = "lowercase")]
+pub enum Route {
+    Direct,
+    /// 系统代理（Windows / macOS 系统设置，或环境变量）
+    #[default]
+    System,
+    /// 自定义代理，内容为代理 ID
+    Proxy(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteRule {
+    /// 域名后缀，如 `youtube.com`（同时匹配其子域名）
+    pub pattern: String,
+    pub route: Route,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyDef {
+    pub id: String,
+    pub name: String,
+    /// `http://127.0.0.1:7890`、`socks5://127.0.0.1:1080` 等
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct NetworkSettings {
+    pub default_route: Route,
+    pub rules: Vec<RouteRule>,
+    pub proxies: Vec<ProxyDef>,
+}
+
+/// 国内平台默认直连（走海外代理时常被拦截或返回不同内容）。
+pub const DIRECT_DOMAINS: &[&str] = &[
+    "douyin.com",
+    "iesdouyin.com",
+    "douyinvod.com",
+    "douyinpic.com",
+    "snssdk.com",
+    "amemv.com",
+    "kuaishou.com",
+    "chenzhongtech.com",
+    "gifshow.com",
+    "kwaicdn.com",
+    "yximgs.com",
+    "xiaohongshu.com",
+    "xhscdn.com",
+    "xhslink.com",
+    "bilibili.com",
+    "bilivideo.com",
+    "bilivideo.cn",
+    "hdslb.com",
+    "b23.tv",
+    "weibo.com",
+    "weibo.cn",
+    "sinaimg.cn",
+    "weibocdn.com",
+    "t.cn",
+    "douyu.com",
+    "douyucdn.cn",
+    "huya.com",
+    "iqiyi.com",
+    "youku.com",
+    "acfun.cn",
+    "ximalaya.com",
+];
+
+/// 海外网站默认走系统代理。
+pub const PROXY_DOMAINS: &[&str] = &[
+    "youtube.com",
+    "youtu.be",
+    "googlevideo.com",
+    "ytimg.com",
+    "google.com",
+    "pornhub.com",
+    "phncdn.com",
+    "pixiv.net",
+    "pximg.net",
+    "twitter.com",
+    "x.com",
+    "twimg.com",
+    "instagram.com",
+    "cdninstagram.com",
+    "facebook.com",
+    "fbcdn.net",
+    "twitch.tv",
+    "ttvnw.net",
+    "tiktok.com",
+    "vimeo.com",
+    "dailymotion.com",
+    "nicovideo.jp",
+    "soundcloud.com",
+];
+
+impl Default for NetworkSettings {
+    fn default() -> Self {
+        let rules = DIRECT_DOMAINS
+            .iter()
+            .map(|d| RouteRule { pattern: d.to_string(), route: Route::Direct })
+            .chain(PROXY_DOMAINS.iter().map(|d| RouteRule { pattern: d.to_string(), route: Route::System }))
+            .collect();
+        NetworkSettings { default_route: Route::System, rules, proxies: vec![] }
+    }
+}
+
+impl NetworkSettings {
+    /// 按最长后缀匹配找出某个主机使用的出口。
+    pub fn route_for_host(&self, host: &str) -> Route {
+        let host = host.to_ascii_lowercase();
+        self.rules
+            .iter()
+            .filter(|r| {
+                let p = r.pattern.trim().trim_start_matches('.').to_ascii_lowercase();
+                !p.is_empty() && (host == p || host.ends_with(&format!(".{p}")))
+            })
+            .max_by_key(|r| r.pattern.len())
+            .map(|r| r.route.clone())
+            .unwrap_or_else(|| self.default_route.clone())
+    }
+
+    pub fn proxy_url(&self, id: &str) -> Option<&str> {
+        self.proxies.iter().find(|p| p.id == id).map(|p| p.url.as_str())
+    }
+}
+
+/// 目标文件已存在时的处理方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ConflictPolicy {
+    /// 在文件名后加 (1)、(2)…
+    #[default]
+    Rename,
+    /// 跳过，不下载
+    Skip,
+    /// 覆盖原文件
+    Overwrite,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -52,6 +195,22 @@ pub struct Settings {
     pub keep_part_on_cancel: bool,
     /// 保存解析时的原始响应，用于排查问题
     pub record_samples: bool,
+    pub network: NetworkSettings,
+    /// 大文件分段并行下载的段数（1 表示不分段）
+    pub segments: usize,
+    /// 文件大于该值（MB）时才分段
+    pub segment_min_mb: u64,
+    /// 全局限速（KB/s），0 表示不限
+    pub speed_limit_kbps: u64,
+    /// 每个网站同时下载的任务数
+    pub per_site_concurrency: usize,
+    /// 解析时对同一网站两次请求的最小间隔（毫秒）
+    pub site_request_interval_ms: u64,
+    /// 临时文件目录，留空表示与保存位置相同
+    pub temp_dir: String,
+    pub conflict_policy: ConflictPolicy,
+    /// 下载前要求保留的剩余磁盘空间（MB）
+    pub disk_reserve_mb: u64,
 }
 
 impl Default for Settings {
@@ -79,6 +238,15 @@ impl Default for Settings {
             retry_delay_secs: 2,
             keep_part_on_cancel: false,
             record_samples: false,
+            network: NetworkSettings::default(),
+            segments: 4,
+            segment_min_mb: 8,
+            speed_limit_kbps: 0,
+            per_site_concurrency: 2,
+            site_request_interval_ms: 500,
+            temp_dir: String::new(),
+            conflict_policy: ConflictPolicy::Rename,
+            disk_reserve_mb: 200,
         }
     }
 }
@@ -107,6 +275,14 @@ impl Settings {
         self.concurrency = self.concurrency.clamp(1, 8);
         self.max_retries = self.max_retries.min(10);
         self.retry_delay_secs = self.retry_delay_secs.clamp(1, 60);
+        self.segments = self.segments.clamp(1, 16);
+        self.per_site_concurrency = self.per_site_concurrency.clamp(1, 8);
+        self.site_request_interval_ms = self.site_request_interval_ms.min(10_000);
+        self.temp_dir = self.temp_dir.trim().to_string();
+        for r in &mut self.network.rules {
+            r.pattern = r.pattern.trim().trim_start_matches('.').to_ascii_lowercase();
+        }
+        self.network.rules.retain(|r| !r.pattern.is_empty());
         if self.filename_template.trim().is_empty() {
             self.filename_template = Settings::default().filename_template;
         }
@@ -128,6 +304,23 @@ mod tests {
         assert_eq!(s.concurrency, 5);
         assert!(s.watch_clipboard);
         assert_eq!(s.parse_mode, ParseMode::LocalThenRemote);
+    }
+
+    #[test]
+    fn route_matching_prefers_longest_suffix() {
+        let mut n = NetworkSettings::default();
+        assert_eq!(n.route_for_host("www.youtube.com"), Route::System);
+        assert_eq!(n.route_for_host("upos-sz-mirrorcos.bilivideo.com"), Route::Direct);
+        assert_eq!(n.route_for_host("example.org"), Route::System);
+        n.rules.push(RouteRule { pattern: "music.youtube.com".into(), route: Route::Proxy("p1".into()) });
+        assert_eq!(n.route_for_host("music.youtube.com"), Route::Proxy("p1".into()));
+        assert_eq!(n.route_for_host("notyoutube.com"), Route::System, "suffix must match on label boundary");
+    }
+
+    #[test]
+    fn route_serde_shape() {
+        assert_eq!(serde_json::to_string(&Route::Direct).unwrap(), r#"{"kind":"direct"}"#);
+        assert_eq!(serde_json::to_string(&Route::Proxy("a".into())).unwrap(), r#"{"kind":"proxy","id":"a"}"#);
     }
 
     #[test]

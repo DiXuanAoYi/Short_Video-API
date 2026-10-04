@@ -42,18 +42,28 @@ impl Provider for Weibo {
         "https://m.weibo.cn/"
     }
 
+    async fn account_status(&self, ctx: &Ctx<'_>) -> AppResult<Option<super::AccountStatus>> {
+        let api = "https://m.weibo.cn/api/config";
+        let mut req = ctx.get(api).header("Referer", "https://m.weibo.cn/");
+        if let Some(c) = ctx.cookie(api) {
+            req = req.header("Cookie", c);
+        }
+        let v: Value = req.send().await?.json().await?;
+        let login = v.pointer("/data/login").and_then(Value::as_bool).unwrap_or(false);
+        Ok(Some(super::AccountStatus { logged_in: login, user_name: str_at(&v, "/data/uid").map(|u| format!("UID {u}")), vip: None }))
+    }
+
     async fn resolve(&self, ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo> {
         let id = match status_id_from_url(url) {
             Some(id) => id,
             None => {
                 // t.cn 等短链
-                let resp = ctx.client.get(url).send().await?;
+                let resp = ctx.get(url).send().await?;
                 status_id_from_url(resp.url().as_str())
                     .ok_or_else(|| AppError::msg("没能从链接里识别出微博 ID。目前支持单条微博链接（weibo.com/用户ID/微博ID 或 m.weibo.cn/status/…）。"))?
             }
         };
         let mut req = ctx
-            .client
             .get(format!("https://m.weibo.cn/statuses/show?id={id}"))
             .header("Referer", "https://m.weibo.cn/")
             .header("MWeibo-Pwa", "1")
@@ -138,6 +148,9 @@ pub fn parse_status(status: &Value, id: &str, source_url: &str) -> AppResult<Med
         height: assets.first().and_then(|a| a.height),
         published_at,
         assets,
+        entries: vec![],
+        series: None,
+        extractor: Some("native".into()),
     })
 }
 

@@ -4,7 +4,7 @@ import { ElMessage } from 'element-plus'
 import { api, errorText } from '../api'
 import { useAppStore, useParseStore } from '../stores/app'
 import type { Asset, DetectedLink, HistoryItem } from '../types'
-import { formatDate, formatDuration } from '../utils/format'
+import { formatBytes, formatDate, formatDuration } from '../utils/format'
 import ErrorAlert from '../components/ErrorAlert.vue'
 
 const app = useAppStore()
@@ -19,7 +19,8 @@ const enqueuing = ref(false)
 
 const result = computed(() => parse.result)
 const images = computed(() => result.value?.assets.filter((a) => a.kind === 'image') ?? [])
-const extras = computed(() => result.value?.assets.filter((a) => a.kind !== 'image') ?? [])
+const videoFormats = computed(() => result.value?.assets.filter((a) => a.kind === 'video') ?? [])
+const extras = computed(() => result.value?.assets.filter((a) => a.kind !== 'image' && a.kind !== 'video') ?? [])
 const videoAsset = computed(() => result.value?.assets.find((a) => a.kind === 'video'))
 const selectedImages = computed(() => images.value.filter((a) => selected.value.has(a.id)).length)
 const supported = computed(() => app.info?.providers.map((p) => p.name).join('、') ?? '')
@@ -52,6 +53,26 @@ function toggle(id: string) {
   if (next.has(id)) next.delete(id)
   else next.add(id)
   selected.value = next
+}
+
+/** 清晰度只能选一个；再次点击已选中的格式则取消（只下载音乐、封面等）。 */
+function pickVideo(id: string) {
+  const next = new Set(selected.value)
+  const had = next.has(id)
+  for (const v of videoFormats.value) next.delete(v.id)
+  if (!had) next.add(id)
+  selected.value = next
+}
+
+function formatMeta(a: Asset) {
+  const parts: string[] = []
+  if (a.width && a.height) parts.push(`${a.width}×${a.height}`)
+  if (a.vcodec) parts.push(a.vcodec.toUpperCase().replace('H', 'H.').replace('H..', 'H.'))
+  if (a.fps) parts.push(`${a.fps}fps`)
+  if (a.filesize) parts.push(formatBytes(a.filesize))
+  else if (a.bitrate) parts.push(`${a.bitrate} kbps`)
+  if (a.hasAudio === false) parts.push('需合并音频')
+  return parts.join(' · ') || a.ext.toUpperCase()
 }
 
 function selectAllImages(on: boolean) {
@@ -216,6 +237,23 @@ function sizeText(a: Asset) {
           </button>
         </div>
 
+        <div v-if="videoFormats.length" class="fmt-head">{{ videoFormats.length > 1 ? `清晰度（${videoFormats.length} 种）` : '视频' }}</div>
+        <div v-if="videoFormats.length" class="formats" role="radiogroup">
+          <button
+            v-for="v in videoFormats"
+            :key="v.id"
+            type="button"
+            role="radio"
+            class="opt fmt"
+            :class="{ on: selected.has(v.id) }"
+            :aria-checked="selected.has(v.id)"
+            @click="pickVideo(v.id)"
+          >
+            <span>{{ v.label }}</span>
+            <small class="mono">{{ formatMeta(v) }}</small>
+          </button>
+        </div>
+        <div v-if="extras.length" class="fmt-head">其他内容</div>
         <div class="opts">
           <button
             v-for="a in extras"
@@ -437,6 +475,16 @@ function sizeText(a: Asset) {
 }
 .ph:focus-visible {
   outline: 2px solid var(--cc-acc);
+}
+.fmt-head {
+  font-size: 11.5px;
+  color: var(--cc-mute);
+  margin-bottom: -4px;
+}
+.formats {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 8px;
 }
 .opts {
   display: grid;

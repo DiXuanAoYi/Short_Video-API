@@ -1,6 +1,7 @@
 // 与 Rust 端 model.rs / download.rs / db.rs / settings.rs 的结构一一对应。
 
-export type MediaKind = 'video' | 'images'
+export type MediaKind = 'video' | 'images' | 'audio' | 'playlist'
+export type Protocol = 'http' | 'hls' | 'ytdlp'
 export type AssetKind = 'video' | 'image' | 'audio' | 'cover'
 
 export interface Asset {
@@ -12,6 +13,32 @@ export interface Asset {
   width: number | null
   height: number | null
   index: number | null
+  protocol: Protocol
+  headers: [string, string][]
+  quality: string | null
+  vcodec: string | null
+  acodec: string | null
+  bitrate: number | null
+  filesize: number | null
+  fps: number | null
+  hasAudio: boolean | null
+  pairAudio: string | null
+  formatId: string | null
+}
+
+export interface PlaylistEntry {
+  id: string
+  title: string
+  url: string
+  durationMs: number | null
+  thumbnail: string | null
+  index: number
+}
+
+export interface SeriesInfo {
+  name: string
+  season: number | null
+  episode: number | null
 }
 
 export interface MediaInfo {
@@ -28,6 +55,9 @@ export interface MediaInfo {
   height: number | null
   publishedAt: number | null
   assets: Asset[]
+  entries: PlaylistEntry[]
+  series: SeriesInfo | null
+  extractor: string | null
 }
 
 export type TaskStatus = 'queued' | 'running' | 'paused' | 'done' | 'failed' | 'canceled'
@@ -72,6 +102,8 @@ export interface TaskSnapshot {
   errorKind: ErrorKind | null
   note: string | null
   resumable: boolean | null
+  step: 'download' | 'merge' | 'post' | null
+  inputs: number
   createdAt: number
   finishedAt: number | null
 }
@@ -105,6 +137,39 @@ export interface LibraryItem {
 
 export type ParseMode = 'local' | 'remote' | 'local_then_remote'
 
+export type Route = { kind: 'direct' } | { kind: 'system' } | { kind: 'proxy'; id: string }
+
+export interface RouteRule {
+  pattern: string
+  route: Route
+}
+
+export interface ProxyDef {
+  id: string
+  name: string
+  url: string
+}
+
+export interface NetworkSettings {
+  defaultRoute: Route
+  rules: RouteRule[]
+  proxies: ProxyDef[]
+}
+
+export type ConflictPolicy = 'rename' | 'skip' | 'overwrite'
+
+export interface RouteTest {
+  route: Route
+  status: number
+  millis: number
+}
+
+export interface AccountStatus {
+  loggedIn: boolean
+  userName: string | null
+  vip: string | null
+}
+
 export interface Settings {
   downloadDir: string
   subfolderByPlatform: boolean
@@ -126,6 +191,15 @@ export interface Settings {
   retryDelaySecs: number
   keepPartOnCancel: boolean
   recordSamples: boolean
+  network: NetworkSettings
+  segments: number
+  segmentMinMb: number
+  speedLimitKbps: number
+  perSiteConcurrency: number
+  siteRequestIntervalMs: number
+  tempDir: string
+  conflictPolicy: ConflictPolicy
+  diskReserveMb: number
 }
 
 export interface SaveSettingsResult {

@@ -7,6 +7,7 @@ import { useAppStore } from '../stores/app'
 import type { Settings, UpdateInfo } from '../types'
 import { previewFilename } from '../utils/format'
 import AccountsPanel from '../components/AccountsPanel.vue'
+import NetworkPanel from '../components/NetworkPanel.vue'
 import { copyDiagnostics } from '../composables/diagnostics'
 
 const app = useAppStore()
@@ -46,6 +47,11 @@ async function save() {
 async function pickDir() {
   const dir = await open({ directory: true, defaultPath: form.value.downloadDir || undefined, title: '选择保存位置' })
   if (typeof dir === 'string') form.value.downloadDir = dir
+}
+
+async function pickTempDir() {
+  const dir = await open({ directory: true, defaultPath: form.value.tempDir || undefined, title: '选择临时文件目录' })
+  if (typeof dir === 'string') form.value.tempDir = dir
 }
 
 async function checkUpdate() {
@@ -102,12 +108,45 @@ function insertVar(v: string) {
               <small class="mute ellipsis">示例：{{ namePreview }}</small>
             </div>
             <div class="kv"><span>跳过已下载过的内容</span><el-switch v-model="form.skipExisting" /></div>
+            <div class="kv">
+              <span>目标文件已存在时</span>
+              <el-select v-model="form.conflictPolicy" size="small" class="sel">
+                <el-option value="rename" label="自动重命名" />
+                <el-option value="skip" label="跳过" />
+                <el-option value="overwrite" label="覆盖" />
+              </el-select>
+            </div>
+            <div class="field">
+              <label>临时文件目录</label>
+              <div class="inline">
+                <el-input v-model="form.tempDir" size="small" class="grow" placeholder="留空表示与保存位置相同" />
+                <el-button size="small" @click="pickTempDir">选择…</el-button>
+              </div>
+              <small class="mute">可指定到空间更大的磁盘。合并音视频时需要约两倍的临时空间。</small>
+            </div>
+            <div class="kv">
+              <span>保留的磁盘剩余空间（MB）<small class="mute block">空间不足时暂停下载并提示</small></span>
+              <el-input-number v-model="form.diskReserveMb" :min="0" :max="102400" :step="100" size="small" />
+            </div>
             <div class="kv"><span>全部下载完成后发送通知</span><el-switch v-model="form.notifyOnComplete" /></div>
           </section>
 
           <section class="group card">
             <h3>队列与断点续传</h3>
             <div class="kv"><span>同时下载数</span><el-input-number v-model="form.concurrency" :min="1" :max="8" size="small" /></div>
+            <div class="kv">
+              <span>每个网站同时下载数<small class="mute block">使用登录账号的网站自动减半，降低被限制的风险</small></span>
+              <el-input-number v-model="form.perSiteConcurrency" :min="1" :max="8" size="small" />
+            </div>
+            <div class="kv">
+              <span>大文件分段数<small class="mute block">服务器支持时多线程并行下载，1 表示不分段</small></span>
+              <el-input-number v-model="form.segments" :min="1" :max="16" size="small" />
+            </div>
+            <div class="kv"><span>文件大于多少 MB 时分段</span><el-input-number v-model="form.segmentMinMb" :min="2" :max="1024" size="small" /></div>
+            <div class="kv">
+              <span>全局限速（KB/s）<small class="mute block">0 表示不限速</small></span>
+              <el-input-number v-model="form.speedLimitKbps" :min="0" :max="1048576" :step="256" size="small" />
+            </div>
             <div class="kv">
               <span>启动时自动继续未完成的任务<small class="mute block">关闭时恢复为“已暂停”，手动继续</small></span>
               <el-switch v-model="form.autoResume" />
@@ -152,6 +191,10 @@ function insertVar(v: string) {
                 <el-option value="remote" label="只用远程 API" />
               </el-select>
             </div>
+            <div class="kv">
+              <span>同一网站两次解析的最小间隔（毫秒）<small class="mute block">批量解析时避免请求过快被风控</small></span>
+              <el-input-number v-model="form.siteRequestIntervalMs" :min="0" :max="10000" :step="100" size="small" />
+            </div>
             <div class="field">
               <label>远程 API 地址</label>
               <el-input v-model="form.remoteEndpoint" size="small" placeholder="https://your-host/jxindex.php" class="mono" />
@@ -159,6 +202,10 @@ function insertVar(v: string) {
             </div>
           </section>
         </div>
+      </el-tab-pane>
+
+      <el-tab-pane label="网络" name="network">
+        <NetworkPanel v-model="form.network" />
       </el-tab-pane>
 
       <el-tab-pane label="账号与 Cookie" name="accounts">
@@ -301,6 +348,9 @@ h3 {
 .grow {
   flex: 1;
   min-width: 0;
+}
+.sel {
+  width: 140px;
 }
 .vars {
   display: flex;

@@ -13,9 +13,9 @@ const hint = computed(() => {
     case 'need_login':
       return { tip: '这个内容需要登录。添加该网站的 Cookie 后重试。', action: '添加 Cookie', run: () => app.goSettings('accounts') }
     case 'geo_blocked':
-      return { tip: '当前网络无法访问这个内容，可能有地区限制。请检查代理设置。', action: '复制诊断信息', run: copyDiagnostics }
+      return { tip: '当前网络无法访问这个内容，可能有地区限制。请检查这个网站的代理规则。', action: '网络设置', run: () => app.goSettings('network') }
     case 'network':
-      return { tip: '网络连接失败。请检查网络或代理后重试。', action: null, run: null }
+      return { tip: '网络连接失败。请检查网络，或在网络设置里测试这个网站能否访问。', action: '网络设置', run: () => app.goSettings('network') }
     case 'rate_limited':
       return { tip: '请求太频繁，被网站暂时限制。请过几分钟再试，或登录后重试。', action: '添加 Cookie', run: () => app.goSettings('accounts') }
     case 'encrypted':

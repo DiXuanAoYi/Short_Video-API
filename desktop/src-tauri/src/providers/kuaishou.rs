@@ -47,7 +47,7 @@ impl Provider for Kuaishou {
     async fn resolve(&self, ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo> {
         let cookie = ctx.cookie("https://www.kuaishou.com/").unwrap_or_else(random_did_cookie);
 
-        let resp = ctx.client.get(url).header("Cookie", &cookie).send().await?;
+        let resp = ctx.get(url).header("Cookie", &cookie).send().await?;
         let final_url = resp.url().to_string();
         let html = resp.text().await.unwrap_or_default();
         ctx.record("kuaishou", "share-page", &final_url, &html);
@@ -64,7 +64,6 @@ impl Provider for Kuaishou {
         let id = photo_id.ok_or_else(|| AppError::not_found("没能从链接里识别出快手作品 ID，链接可能已失效。"))?;
         let body = json!({ "photoId": id, "isLongVideo": false });
         let resp = ctx
-            .client
             .post("https://v.m.chenzhongtech.com/rest/wd/photo/info?kpn=KUAISHOU&captchaToken=")
             .header("Cookie", &cookie)
             .header("Referer", &final_url)
@@ -170,6 +169,9 @@ pub fn parse_photo(photo: &Value, atlas: Option<&Value>, id: &str, source_url: &
         height,
         published_at,
         assets,
+        entries: vec![],
+        series: None,
+        extractor: Some("native".into()),
     })
 }
 

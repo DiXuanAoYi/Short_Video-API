@@ -138,6 +138,9 @@ mod tests {
             height: None,
             published_at: Some(1_727_856_000),
             assets: vec![],
+            entries: vec![],
+            series: None,
+            extractor: None,
         }
     }
 

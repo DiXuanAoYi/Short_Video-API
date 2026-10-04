@@ -18,6 +18,7 @@ use url::Url;
 
 use crate::cookies::CookieStore;
 use crate::model::{AppError, AppResult, MediaInfo};
+use crate::net::NetManager;
 use crate::settings::{ParseMode, Settings};
 
 pub const DESKTOP_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36";
@@ -26,21 +27,44 @@ pub const MOBILE_UA: &str =
 
 /// 解析时共享的上下文。
 pub struct Ctx<'a> {
+    /// 没有网络管理器时（测试）使用的默认客户端
     pub client: &'a reqwest::Client,
     pub settings: &'a Settings,
     pub cookies: &'a CookieStore,
+    /// 按网站分流的客户端；为 None 时一律用 `client`
+    pub net: Option<&'a NetManager>,
     /// 开启“录制样本”时保存原始响应的目录
     pub samples: Option<PathBuf>,
+    /// 指定使用某个账号的 Cookie（检查账号状态时），否则用网站的默认账号
+    pub account: Option<String>,
 }
 
 impl<'a> Ctx<'a> {
     pub fn new(client: &'a reqwest::Client, settings: &'a Settings, cookies: &'a CookieStore) -> Self {
-        Ctx { client, settings, cookies, samples: None }
+        Ctx { client, settings, cookies, net: None, samples: None, account: None }
+    }
+
+    /// 按网络分流规则选择访问 `url` 的客户端。
+    pub fn http(&self, url: &str) -> reqwest::Client {
+        self.net.and_then(|n| n.clients_for(&self.settings.network, url).ok()).map(|c| c.api).unwrap_or_else(|| self.client.clone())
+    }
+
+    pub fn get(&self, url: impl AsRef<str>) -> reqwest::RequestBuilder {
+        let url = url.as_ref();
+        self.http(url).get(url)
+    }
+
+    pub fn post(&self, url: impl AsRef<str>) -> reqwest::RequestBuilder {
+        let url = url.as_ref();
+        self.http(url).post(url)
     }
 
     /// 请求 `url` 时应带的 Cookie（按域名匹配当前默认账号）。
     pub fn cookie(&self, url: &str) -> Option<String> {
-        self.cookies.header_for(url)
+        match &self.account {
+            Some(id) => self.cookies.header_for_account(id, url),
+            None => self.cookies.header_for(url),
+        }
     }
 
     /// 保存一份原始响应作为调试样本（去掉 Cookie、令牌等敏感片段）。
@@ -62,6 +86,20 @@ pub trait Provider: Send + Sync {
     /// 内置登录窗口打开的地址，也用于读取登录后的 Cookie。
     fn login_url(&self) -> &'static str;
     async fn resolve(&self, ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo>;
+
+    /// 检查当前账号的登录状态；平台不支持时返回 None。
+    async fn account_status(&self, _ctx: &Ctx<'_>) -> AppResult<Option<AccountStatus>> {
+        Ok(None)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountStatus {
+    pub logged_in: bool,
+    pub user_name: Option<String>,
+    /// 会员等级 / 状态描述，如“大会员”
+    pub vip: Option<String>,
 }
 
 pub fn all() -> &'static [&'static dyn Provider] {
@@ -146,6 +184,9 @@ pub async fn resolve_url(ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo> {
         return remote::resolve(ctx, url).await;
     }
 
+    if let (Some(net), Some(p)) = (ctx.net, provider) {
+        net.wait_turn(p.id(), std::time::Duration::from_millis(settings.site_request_interval_ms)).await;
+    }
     let local = match provider {
         Some(p) => p.resolve(ctx, url).await,
         None => Err(AppError::unsupported("暂不支持这个平台。目前支持抖音、快手、小红书、B站、微博。")),

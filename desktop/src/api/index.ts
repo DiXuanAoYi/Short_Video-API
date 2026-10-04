@@ -1,7 +1,9 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type {
+  AccountStatus,
   AccountSummary,
+  RouteTest,
   AppErrorPayload,
   AppInfo,
   EnqueueResult,
@@ -60,6 +62,8 @@ export const api = {
   renameAccount: (id: string, label: string) => invoke<AccountSummary[]>('rename_account', { id, label }),
   setDefaultAccount: (id: string) => invoke<AccountSummary[]>('set_default_account', { id }),
   deleteAccount: (id: string) => invoke<AccountSummary[]>('delete_account', { id }),
+  checkAccount: (id: string) => invoke<AccountStatus>('check_account', { id }),
+  testRoute: (url: string) => invoke<RouteTest>('test_route', { url }),
   getDiagnostics: () => invoke<string>('get_diagnostics'),
   openLogDir: () => invoke<void>('open_log_dir'),
   openSamplesDir: () => invoke<void>('open_samples_dir'),

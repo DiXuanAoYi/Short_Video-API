@@ -122,6 +122,8 @@ impl Db {
         let kind = match info.kind {
             MediaKind::Video => "video",
             MediaKind::Images => "images",
+            MediaKind::Audio => "audio",
+            MediaKind::Playlist => "playlist",
         };
         self.conn().execute(
             "INSERT INTO history (platform, media_id, title, author, cover, kind, source_url, info_json, created_at)
@@ -344,6 +346,9 @@ fn placeholder_info() -> MediaInfo {
         height: None,
         published_at: None,
         assets: vec![],
+        entries: vec![],
+        series: None,
+        extractor: None,
     }
 }
 

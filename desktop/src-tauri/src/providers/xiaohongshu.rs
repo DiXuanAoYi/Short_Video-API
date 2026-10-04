@@ -40,7 +40,7 @@ impl Provider for Xiaohongshu {
     }
 
     async fn resolve(&self, ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo> {
-        let mut req = ctx.client.get(url).header("User-Agent", DESKTOP_UA).header("Referer", "https://www.xiaohongshu.com/");
+        let mut req = ctx.get(url).header("User-Agent", DESKTOP_UA).header("Referer", "https://www.xiaohongshu.com/");
         if let Some(cookie) = ctx.cookie("https://www.xiaohongshu.com/") {
             req = req.header("Cookie", cookie);
         }
@@ -122,6 +122,9 @@ pub fn parse_note(note: &Value, id: &str, source_url: &str) -> AppResult<MediaIn
         height,
         published_at,
         assets,
+        entries: vec![],
+        series: None,
+        extractor: Some("native".into()),
     })
 }
 

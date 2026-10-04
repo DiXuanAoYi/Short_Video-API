@@ -106,6 +106,24 @@ async function importPaste() {
   pasteText.value = ''
 }
 
+/** 支持检查登录状态的平台 */
+const CHECKABLE = ['bilibili', 'weibo']
+const checking = ref<string | null>(null)
+
+async function check(a: AccountSummary) {
+  checking.value = a.id
+  try {
+    const st = await api.checkAccount(a.id)
+    if (st.loggedIn) ElMessage.success(`登录有效：${st.userName ?? ''}${st.vip ? `（${st.vip}）` : ''}`)
+    else ElMessage.warning(`${a.siteName}账号“${a.label}”未登录或已失效，请重新登录。`)
+    await load()
+  } catch (e) {
+    ElMessage.error(errorText(e))
+  } finally {
+    checking.value = null
+  }
+}
+
 async function makeDefault(a: AccountSummary) {
   await run(() => api.setDefaultAccount(a.id), '已设为默认')
 }
@@ -154,6 +172,7 @@ async function remove(a: AccountSummary) {
           </small>
         </div>
         <div class="ops">
+          <el-button v-if="CHECKABLE.includes(a.site)" link size="small" :loading="checking === a.id" @click="check(a)">检测</el-button>
           <el-button v-if="!a.isDefault" link size="small" type="primary" @click="makeDefault(a)">设为默认</el-button>
           <el-button link size="small" @click="rename(a)">重命名</el-button>
           <el-button link size="small" @click="remove(a)">删除</el-button>
