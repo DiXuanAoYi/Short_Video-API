@@ -1,0 +1,61 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ClearClip",
+  "mainBinaryName": "clearclip",
+  "version": "0.1.0",
+  "identifier": "com.dixuanaoyi.clearclip",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "清影 ClearClip",
+        "url": "index.html",
+        "width": 1080,
+        "height": 720,
+        "minWidth": 820,
+        "minHeight": 560,
+        "center": true
+      },
+      {
+        "label": "mini",
+        "title": "清影",
+        "url": "index.html#mini",
+        "width": 320,
+        "height": 196,
+        "resizable": false,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "focus": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' https: http: data: blob:; media-src 'self' https: http: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Video",
+    "shortDescription": "抖音 / 快手短视频解析与下载",
+    "longDescription": "清影 ClearClip：粘贴抖音、快手分享链接，解析无水印视频与图集并下载到本地。仅用于下载你有权保存的内容。",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "nsis": { "languages": ["SimpChinese", "English"], "displayLanguageSelector": false }
+    },
+    "macOS": { "minimumSystemVersion": "10.15" }
+  }
+}
