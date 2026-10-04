@@ -60,7 +60,7 @@ impl Provider for Bilibili {
     }
 
     async fn resolve(&self, ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo> {
-        let cookie = ctx.settings.cookie("bilibili").map(String::from);
+        let cookie = ctx.cookie("https://api.bilibili.com/");
         let (vid, page) = match video_id_from_url(url) {
             Some(v) => (v, page_from_url(url)),
             None => {
@@ -80,7 +80,7 @@ impl Provider for Bilibili {
             .get(index)
             .and_then(|p| u64_at(p, "/cid"))
             .or_else(|| u64_at(data, "/cid"))
-            .ok_or_else(|| AppError::msg("B站稿件缺少 cid，无法获取播放地址。"))?;
+            .ok_or_else(|| AppError::parser("B站稿件缺少 cid，无法获取播放地址。"))?;
 
         let qn = if cookie.is_some() { 80 } else { 64 };
         let play_api =
@@ -98,9 +98,11 @@ async fn get_json(ctx: &Ctx<'_>, api: &str, cookie: Option<&str>) -> AppResult<V
     }
     let resp = req.send().await?;
     if !resp.status().is_success() {
-        return Err(AppError::msg(format!("B站接口返回 {}，可能触发了风控，请稍后再试或在设置中登录 B站。", resp.status())));
+        return Err(AppError::from_status(resp.status().as_u16(), "B站接口").context_suffix("，可能触发了风控，请稍后再试或在设置中登录 B站。"));
     }
-    Ok(resp.json().await?)
+    let text = resp.text().await?;
+    ctx.record("bilibili", "api", api, &text);
+    Ok(serde_json::from_str(&text)?)
 }
 
 /// B站接口统一格式 `{code, message, data}`，code 非 0 表示失败。
@@ -108,7 +110,13 @@ pub fn api_data(v: &Value) -> AppResult<&Value> {
     let code = v.get("code").and_then(Value::as_i64).unwrap_or(-1);
     if code != 0 {
         let msg = str_at(v, "/message").unwrap_or("未知错误");
-        return Err(AppError::msg(format!("B站：{msg}（{code}）")));
+        let text = format!("B站：{msg}（{code}）");
+        return Err(match code {
+            -101 | -403 | -10403 => AppError::need_login(text),
+            -404 | 62002 | 62004 => AppError::not_found(text),
+            -352 | -412 | -509 => AppError::new(crate::error::ErrorKind::RateLimited, text),
+            _ => AppError::classify(text),
+        });
     }
     v.get("data").filter(|d| d.is_object()).ok_or_else(|| AppError::msg("B站接口没有返回数据。"))
 }
@@ -149,7 +157,7 @@ pub fn parse_view(data: &Value, play: &Value, index: usize, source_url: &str) ->
 
     let video = str_at(play, "/durl/0/url")
         .or_else(|| str_at(play, "/durl/0/backup_url/0"))
-        .ok_or_else(|| AppError::msg("B站没有返回可直接下载的 MP4 地址。该视频可能需要登录、大会员或仅支持分段播放。"))?;
+        .ok_or_else(|| AppError::need_login("B站没有返回可直接下载的 MP4 地址。该视频可能需要登录、大会员或仅支持分段播放。"))?;
 
     let mut assets = vec![Asset::video(video.to_string(), width, height)];
     if let Some(c) = &cover {

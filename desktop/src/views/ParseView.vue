@@ -5,6 +5,7 @@ import { api, errorText } from '../api'
 import { useAppStore, useParseStore } from '../stores/app'
 import type { Asset, DetectedLink, HistoryItem } from '../types'
 import { formatDate, formatDuration } from '../utils/format'
+import ErrorAlert from '../components/ErrorAlert.vue'
 
 const app = useAppStore()
 const parse = useParseStore()
@@ -71,11 +72,14 @@ async function download() {
   }
   enqueuing.value = true
   try {
-    const tasks = await api.enqueue(result.value, ids)
-    const skipped = tasks.filter((t) => t.status === 'done').length
-    const added = tasks.length - skipped
-    if (added > 0 && skipped > 0) ElMessage.success(`已加入下载 ${added} 项，${skipped} 项之前已下载，已跳过`)
+    const r = await api.enqueue(result.value, ids)
+    const added = r.tasks.length
+    const parts: string[] = []
+    if (r.alreadyQueued) parts.push(`${r.alreadyQueued} 项已在队列中`)
+    if (r.alreadyDownloaded) parts.push(`${r.alreadyDownloaded} 项之前已下载`)
+    if (added > 0 && parts.length) ElMessage.success(`已加入下载 ${added} 项；${parts.join('，')}，已跳过`)
     else if (added > 0) ElMessage.success(`已加入下载队列：${added} 项`)
+    else if (r.alreadyQueued) ElMessage.info(`所选内容已在下载队列中。${r.alreadyDownloaded ? `另有 ${r.alreadyDownloaded} 项之前已下载。` : ''}`)
     else ElMessage.info('所选内容之前都已下载过，已跳过。可在设置中关闭“跳过已下载”。')
   } catch (e) {
     ElMessage.error(errorText(e))
@@ -165,7 +169,7 @@ function sizeText(a: Asset) {
       </el-button>
     </div>
 
-    <el-alert v-if="parse.error" type="error" :title="parse.error" show-icon :closable="false" class="selectable" />
+    <ErrorAlert v-if="parse.error" :message="parse.error" :kind="parse.errorKind" />
 
     <div v-if="parse.loading && !result" class="result card skeleton">
       <el-skeleton animated :rows="5" />

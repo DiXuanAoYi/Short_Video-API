@@ -31,8 +31,10 @@ pub struct Settings {
     pub notify_on_complete: bool,
     pub parse_mode: ParseMode,
     pub remote_endpoint: String,
-    /// 平台 → Cookie 字符串
+    /// 旧版：平台 → Cookie 字符串。启动时迁移到加密的 Cookie 存储后清空。
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub cookies: HashMap<String, String>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub cookie_updated_at: HashMap<String, i64>,
     /// `system` / `dark` / `light`
     pub theme: String,
@@ -40,6 +42,16 @@ pub struct Settings {
     pub shortcut: String,
     pub check_update: bool,
     pub disclaimer_accepted: bool,
+    /// 启动时自动继续未完成的任务（否则恢复为“已暂停”）
+    pub auto_resume: bool,
+    /// 网络错误时的自动重试次数
+    pub max_retries: u32,
+    /// 第一次重试前的等待秒数，之后每次翻倍
+    pub retry_delay_secs: u64,
+    /// 取消任务时保留已下载的部分
+    pub keep_part_on_cancel: bool,
+    /// 保存解析时的原始响应，用于排查问题
+    pub record_samples: bool,
 }
 
 impl Default for Settings {
@@ -62,6 +74,11 @@ impl Default for Settings {
             shortcut: "CommandOrControl+Shift+D".into(),
             check_update: true,
             disclaimer_accepted: false,
+            auto_resume: false,
+            max_retries: 3,
+            retry_delay_secs: 2,
+            keep_part_on_cancel: false,
+            record_samples: false,
         }
     }
 }
@@ -88,14 +105,12 @@ impl Settings {
 
     pub fn normalize(&mut self) {
         self.concurrency = self.concurrency.clamp(1, 8);
+        self.max_retries = self.max_retries.min(10);
+        self.retry_delay_secs = self.retry_delay_secs.clamp(1, 60);
         if self.filename_template.trim().is_empty() {
             self.filename_template = Settings::default().filename_template;
         }
         self.remote_endpoint = self.remote_endpoint.trim().to_string();
-    }
-
-    pub fn cookie(&self, platform: &str) -> Option<&str> {
-        self.cookies.get(platform).map(|s| s.trim()).filter(|s| !s.is_empty())
     }
 
     pub fn download_root(&self) -> PathBuf {

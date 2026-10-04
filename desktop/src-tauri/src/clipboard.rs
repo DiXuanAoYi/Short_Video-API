@@ -86,11 +86,17 @@ fn on_links(app: &AppHandle, text: String, links: Vec<DetectedLink>, auto_downlo
 pub async fn resolve_and_enqueue(app: &AppHandle, text: &str) -> crate::model::AppResult<String> {
     let st = app.state::<Arc<AppState>>().inner().clone();
     let settings = st.settings();
-    let info = providers::resolve_text(&st.client, &settings, text).await?;
+    let info = providers::resolve_text(&st.parse_ctx(&settings), text).await?;
     let _ = st.db.upsert_history(&info);
     let ids = info.default_asset_ids();
     let title = info.title.clone();
-    download::enqueue(app, info, &ids)?;
+    let r = download::enqueue(app, info, &ids)?;
+    if r.tasks.is_empty() && r.already_downloaded > 0 {
+        return Ok(format!("{title}（之前已下载）"));
+    }
+    if r.tasks.is_empty() && r.already_queued > 0 {
+        return Ok(format!("{title}（已在队列中）"));
+    }
     Ok(title)
 }
 

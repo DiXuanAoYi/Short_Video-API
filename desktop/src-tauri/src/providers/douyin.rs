@@ -46,20 +46,21 @@ impl Provider for Douyin {
                 // 短链：跟随跳转拿到真实地址
                 let resp = ctx.client.get(url).send().await?;
                 let final_url = resp.url().to_string();
-                aweme_id_from_url(&final_url).ok_or_else(|| AppError::msg("没能从链接里识别出抖音作品 ID，链接可能已失效。"))?
+                aweme_id_from_url(&final_url).ok_or_else(|| AppError::not_found("没能从链接里识别出抖音作品 ID，链接可能已失效。"))?
             }
         };
 
         let page = format!("https://www.iesdouyin.com/share/video/{id}/");
         let mut req = ctx.client.get(&page).header("Referer", "https://www.douyin.com/");
-        if let Some(cookie) = ctx.settings.cookie("douyin") {
+        if let Some(cookie) = ctx.cookie(&page) {
             req = req.header("Cookie", cookie);
         }
         let resp = req.send().await?;
         if !resp.status().is_success() {
-            return Err(AppError::msg(format!("抖音分享页返回 {}，请稍后再试或在设置中登录抖音。", resp.status())));
+            return Err(AppError::from_status(resp.status().as_u16(), "抖音分享页").context_suffix("，请稍后再试或在设置中登录抖音。"));
         }
         let html = resp.text().await?;
+        ctx.record("douyin", "share-page", &page, &html);
         let item = item_from_share_html(&html)?;
         parse_item(&item, &id, url)
     }
@@ -72,19 +73,19 @@ pub fn aweme_id_from_url(url: &str) -> Option<String> {
 /// 从分享页 HTML 中取出作品 JSON（`item_list[0]`）。
 pub fn item_from_share_html(html: &str) -> AppResult<Value> {
     let data = super::extract_json_after(html, "window._ROUTER_DATA")
-        .ok_or_else(|| AppError::msg("抖音页面结构已变化，没有找到作品数据。请尝试远程解析模式或等待更新。"))?;
-    let loader = data.get("loaderData").and_then(Value::as_object).ok_or_else(|| AppError::msg("抖音页面数据缺少 loaderData。"))?;
+        .ok_or_else(|| AppError::parser("抖音页面结构已变化，没有找到作品数据。请尝试远程解析模式或等待更新。"))?;
+    let loader = data.get("loaderData").and_then(Value::as_object).ok_or_else(|| AppError::parser("抖音页面数据缺少 loaderData。"))?;
     for page in loader.values() {
         let Some(res) = page.get("videoInfoRes") else { continue };
         if let Some(item) = res.pointer("/item_list/0") {
             return Ok(item.clone());
         }
         if let Some(reason) = res.pointer("/filter_list/0/detail_msg").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-            return Err(AppError::msg(format!("作品不可访问：{reason}")));
+            return Err(AppError::not_found(format!("作品不可访问：{reason}")));
         }
-        return Err(AppError::msg("作品不存在、已删除或仅作者可见。"));
+        return Err(AppError::not_found("作品不存在、已删除或仅作者可见。"));
     }
-    Err(AppError::msg("抖音页面里没有作品信息，可能需要登录。请在设置中登录抖音后重试。"))
+    Err(AppError::need_login("抖音页面里没有作品信息，可能需要登录。请在设置中登录抖音后重试。"))
 }
 
 /// 把抖音作品 JSON 转成统一结构。
@@ -112,7 +113,7 @@ pub fn parse_item(item: &Value, id: &str, source_url: &str) -> AppResult<MediaIn
     } else {
         let w = u32_at(item, "/video/width");
         let h = u32_at(item, "/video/height");
-        let play = video_play_url(item).ok_or_else(|| AppError::msg("没有找到视频地址，作品可能已删除。"))?;
+        let play = video_play_url(item).ok_or_else(|| AppError::not_found("没有找到视频地址，作品可能已删除。"))?;
         assets.push(Asset::video(play, w, h));
         (MediaKind::Video, w, h, u64_at(item, "/video/duration").filter(|d| *d > 0))
     };

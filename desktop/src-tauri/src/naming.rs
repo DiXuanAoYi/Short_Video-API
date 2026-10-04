@@ -25,7 +25,33 @@ pub fn render_base(template: &str, info: &MediaInfo) -> String {
     if name.is_empty() {
         name = "clearclip".into();
     }
-    name
+    avoid_reserved(name)
+}
+
+/// Windows 不允许 CON、NUL、COM1 等作为文件名（不论扩展名），在后面加下划线。
+pub fn avoid_reserved(name: String) -> String {
+    let stem = name.split('.').next().unwrap_or("").trim().to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT")) && stem.len() == 4 && stem.as_bytes()[3].is_ascii_digit() && stem.as_bytes()[3] != b'0');
+    if reserved {
+        format!("{name}_")
+    } else {
+        name
+    }
+}
+
+/// Windows 传统路径上限约 260 字符。完整路径过长时缩短文件名主体（保留后缀）。
+pub fn fit_path(dir: &Path, base: &str, asset: &Asset, max_len: usize) -> PathBuf {
+    let mut base: String = base.to_string();
+    loop {
+        let path = dir.join(file_name(&base, asset));
+        // 预留 ".part" 和 " (99)" 的长度
+        if path.as_os_str().len() + 10 <= max_len || base.chars().count() <= 8 {
+            return path;
+        }
+        let keep = base.chars().count().saturating_sub(4).max(8);
+        base = base.chars().take(keep).collect::<String>().trim_end().to_string();
+    }
 }
 
 /// 资源对应的文件名（不含目录）。
@@ -134,6 +160,27 @@ mod tests {
         assert_eq!(file_name("a", &Asset::image(0, "u.jpeg".into(), None, None)), "a_01.jpg");
         assert_eq!(file_name("a", &Asset::audio("u.mp3".into())), "a_music.mp3");
         assert_eq!(file_name("a", &Asset::cover("u.webp".into())), "a_cover.webp");
+    }
+
+    #[test]
+    fn reserved_names_are_escaped() {
+        assert_eq!(avoid_reserved("CON".into()), "CON_");
+        assert_eq!(avoid_reserved("nul.txt".into()), "nul.txt_");
+        assert_eq!(avoid_reserved("COM1".into()), "COM1_");
+        assert_eq!(avoid_reserved("COM0".into()), "COM0");
+        assert_eq!(avoid_reserved("CONSOLE".into()), "CONSOLE");
+        let mut i = info();
+        i.title = "AUX".into();
+        assert_eq!(render_base("{title}", &i), "AUX_");
+    }
+
+    #[test]
+    fn long_paths_are_shortened() {
+        let dir = PathBuf::from("/d".repeat(60));
+        let base = "很长的标题".repeat(30);
+        let p = fit_path(&dir, &base, &Asset::video("u".into(), None, None), 240);
+        assert!(p.as_os_str().len() + 10 <= 240, "{}", p.as_os_str().len());
+        assert!(p.to_string_lossy().ends_with(".mp4"));
     }
 
     #[test]

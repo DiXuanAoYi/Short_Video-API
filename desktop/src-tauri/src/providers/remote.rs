@@ -8,7 +8,7 @@ use crate::model::{AppError, AppResult, Asset, MediaInfo, MediaKind};
 
 pub async fn resolve(ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo> {
     let endpoint = ctx.settings.remote_endpoint.trim();
-    let mut api = Url::parse(endpoint).map_err(|_| AppError::msg("远程 API 地址格式不正确，应类似 https://example.com/jxindex.php"))?;
+    let mut api = Url::parse(endpoint).map_err(|_| AppError::invalid("远程 API 地址格式不正确，应类似 https://example.com/jxindex.php"))?;
     api.query_pairs_mut().append_pair("url", url);
     let resp = ctx.client.get(api).send().await?;
     let text = resp.text().await?;
@@ -22,7 +22,7 @@ pub fn parse_response(data: &Value, source_url: &str) -> AppResult<MediaInfo> {
     let message = data.get("message").cloned().unwrap_or(Value::Null);
     if code != 200 {
         let reason = message.as_str().unwrap_or("远程 API 解析失败。");
-        return Err(AppError::msg(format!("远程 API：{reason}")));
+        return Err(AppError::classify(format!("远程 API：{reason}")));
     }
 
     let title = message.get("nickname").and_then(Value::as_str).unwrap_or("作品").trim().to_string();

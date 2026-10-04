@@ -32,6 +32,26 @@ export interface MediaInfo {
 
 export type TaskStatus = 'queued' | 'running' | 'paused' | 'done' | 'failed' | 'canceled'
 
+export type ErrorKind =
+  | 'need_login'
+  | 'geo_blocked'
+  | 'not_found'
+  | 'encrypted'
+  | 'rate_limited'
+  | 'network'
+  | 'parser_broken'
+  | 'unsupported'
+  | 'need_update'
+  | 'disk'
+  | 'invalid'
+  | 'other'
+
+/** Rust 端 AppError 的序列化形式。 */
+export interface AppErrorPayload {
+  kind: ErrorKind
+  message: string
+}
+
 export interface TaskSnapshot {
   id: number
   platform: string
@@ -49,7 +69,9 @@ export interface TaskSnapshot {
   total: number | null
   speed: number
   error: string | null
+  errorKind: ErrorKind | null
   note: string | null
+  resumable: boolean | null
   createdAt: number
   finishedAt: number | null
 }
@@ -94,13 +116,45 @@ export interface Settings {
   notifyOnComplete: boolean
   parseMode: ParseMode
   remoteEndpoint: string
-  cookies: Record<string, string>
-  cookieUpdatedAt: Record<string, number>
   theme: 'system' | 'dark' | 'light'
   closeToTray: boolean
   shortcut: string
   checkUpdate: boolean
   disclaimerAccepted: boolean
+  autoResume: boolean
+  maxRetries: number
+  retryDelaySecs: number
+  keepPartOnCancel: boolean
+  recordSamples: boolean
+}
+
+export interface SaveSettingsResult {
+  settings: Settings
+  shortcutError: string | null
+}
+
+export interface EnqueueResult {
+  tasks: TaskSnapshot[]
+  alreadyDownloaded: number
+  alreadyQueued: number
+}
+
+export interface OrphanPart {
+  path: string
+  size: number
+  modified: number
+}
+
+export interface AccountSummary {
+  id: string
+  site: string
+  siteName: string
+  label: string
+  cookieCount: number
+  updatedAt: number
+  userName: string | null
+  expiresAt: number | null
+  isDefault: boolean
 }
 
 export interface DetectedLink {
@@ -114,6 +168,8 @@ export interface AppInfo {
   providers: { id: string; name: string }[]
   repo: string
   os: string
+  keyInKeyring: boolean
+  shortcutError: string | null
 }
 
 export interface UpdateInfo {

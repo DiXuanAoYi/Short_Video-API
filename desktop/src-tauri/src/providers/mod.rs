@@ -7,6 +7,7 @@ pub mod remote;
 pub mod weibo;
 pub mod xiaohongshu;
 
+use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ use regex::Regex;
 use serde::Serialize;
 use url::Url;
 
+use crate::cookies::CookieStore;
 use crate::model::{AppError, AppResult, MediaInfo};
 use crate::settings::{ParseMode, Settings};
 
@@ -26,6 +28,27 @@ pub const MOBILE_UA: &str =
 pub struct Ctx<'a> {
     pub client: &'a reqwest::Client,
     pub settings: &'a Settings,
+    pub cookies: &'a CookieStore,
+    /// 开启“录制样本”时保存原始响应的目录
+    pub samples: Option<PathBuf>,
+}
+
+impl<'a> Ctx<'a> {
+    pub fn new(client: &'a reqwest::Client, settings: &'a Settings, cookies: &'a CookieStore) -> Self {
+        Ctx { client, settings, cookies, samples: None }
+    }
+
+    /// 请求 `url` 时应带的 Cookie（按域名匹配当前默认账号）。
+    pub fn cookie(&self, url: &str) -> Option<String> {
+        self.cookies.header_for(url)
+    }
+
+    /// 保存一份原始响应作为调试样本（去掉 Cookie、令牌等敏感片段）。
+    pub fn record(&self, platform: &str, label: &str, url: &str, body: &str) {
+        if let Some(dir) = &self.samples {
+            crate::diagnostics::save_sample(dir, platform, label, url, body);
+        }
+    }
 }
 
 #[async_trait]
@@ -91,14 +114,14 @@ pub fn detect_links(text: &str) -> Vec<DetectedLink> {
 }
 
 /// 解析一段文本中的第一个链接，按设置决定本地 / 远程策略。
-pub async fn resolve_text(client: &reqwest::Client, settings: &Settings, text: &str) -> AppResult<MediaInfo> {
+pub async fn resolve_text(ctx: &Ctx<'_>, text: &str) -> AppResult<MediaInfo> {
     let urls = extract_urls(text);
     let Some(first) = urls.first() else {
-        return Err(AppError::msg("没有找到链接。请粘贴分享文案或链接。"));
+        return Err(AppError::invalid("没有找到链接。请粘贴分享文案或链接。"));
     };
     // 优先选受支持平台的链接，避免文案中混有其他网址。
     let url = urls.iter().find(|u| Url::parse(u).map(|p| all().iter().any(|pr| pr.matches(&p))).unwrap_or(false)).unwrap_or(first).clone();
-    resolve_url(client, settings, &url).await
+    resolve_url(ctx, &url).await
 }
 
 /// 旧版 PHP 接口（远程 API）只支持这些平台。
@@ -109,29 +132,29 @@ pub fn remote_allowed(provider: Option<&dyn Provider>) -> bool {
     provider.map_or(true, |p| REMOTE_PLATFORMS.contains(&p.id()))
 }
 
-pub async fn resolve_url(client: &reqwest::Client, settings: &Settings, url: &str) -> AppResult<MediaInfo> {
-    let ctx = Ctx { client, settings };
+pub async fn resolve_url(ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo> {
+    let settings = ctx.settings;
     let has_remote = !settings.remote_endpoint.is_empty();
-    let parsed = Url::parse(url).map_err(|_| AppError::msg("链接格式不正确。"))?;
+    let parsed = Url::parse(url).map_err(|_| AppError::invalid("链接格式不正确。"))?;
     let provider = all().iter().find(|p| p.matches(&parsed));
     let remote_ok = remote_allowed(provider.copied());
 
     if settings.parse_mode == ParseMode::Remote && remote_ok {
         if !has_remote {
-            return Err(AppError::msg("当前为远程解析模式，但没有填写远程 API 地址。请在设置中填写，或改为本地解析。"));
+            return Err(AppError::invalid("当前为远程解析模式，但没有填写远程 API 地址。请在设置中填写，或改为本地解析。"));
         }
-        return remote::resolve(&ctx, url).await;
+        return remote::resolve(ctx, url).await;
     }
 
     let local = match provider {
-        Some(p) => p.resolve(&ctx, url).await,
-        None => Err(AppError::msg("暂不支持这个平台。目前支持抖音、快手、小红书、B站、微博。")),
+        Some(p) => p.resolve(ctx, url).await,
+        None => Err(AppError::unsupported("暂不支持这个平台。目前支持抖音、快手、小红书、B站、微博。")),
     };
 
     match local {
         Ok(info) => Ok(info),
         Err(e) if settings.parse_mode != ParseMode::Local && has_remote && remote_ok && provider.is_some() => {
-            remote::resolve(&ctx, url).await.map_err(|re| AppError::msg(format!("本地解析失败：{e}；远程解析也失败：{re}")))
+            remote::resolve(ctx, url).await.map_err(|re| AppError::new(e.kind, format!("本地解析失败：{e}；远程解析也失败：{re}")))
         }
         Err(e) => Err(e),
     }
@@ -227,7 +250,8 @@ mod tests {
     #[tokio::test]
     async fn remote_mode_without_endpoint_is_an_error() {
         let s = Settings { parse_mode: ParseMode::Remote, ..Settings::default() };
-        let err = resolve_text(&build_client(), &s, "https://v.douyin.com/x/").await.unwrap_err();
+        let (c, store) = (build_client(), CookieStore::in_memory());
+        let err = resolve_text(&Ctx::new(&c, &s, &store), "https://v.douyin.com/x/").await.unwrap_err();
         assert!(err.to_string().contains("远程 API"));
     }
 
@@ -243,7 +267,8 @@ mod tests {
 
     #[tokio::test]
     async fn text_without_url_is_an_error() {
-        let err = resolve_text(&build_client(), &Settings::default(), "没有链接").await.unwrap_err();
+        let (c, s, store) = (build_client(), Settings::default(), CookieStore::in_memory());
+        let err = resolve_text(&Ctx::new(&c, &s, &store), "没有链接").await.unwrap_err();
         assert!(err.to_string().contains("没有找到链接"));
     }
 }

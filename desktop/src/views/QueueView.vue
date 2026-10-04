@@ -1,12 +1,38 @@
 <script setup lang="ts">
-import { computed } from 'vue'
-import { ElMessage } from 'element-plus'
+import { computed, onMounted, ref } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { api, errorText } from '../api'
-import { useQueueStore } from '../stores/app'
-import type { TaskSnapshot } from '../types'
+import { useAppStore, useQueueStore } from '../stores/app'
+import type { OrphanPart, TaskSnapshot } from '../types'
 import { formatBytes, formatEta, formatSpeed } from '../utils/format'
 
 const queue = useQueueStore()
+const app = useAppStore()
+const orphans = ref<OrphanPart[]>([])
+const orphanSize = computed(() => orphans.value.reduce((s, o) => s + o.size, 0))
+
+onMounted(async () => {
+  try {
+    orphans.value = await api.listOrphanParts()
+  } catch {
+    orphans.value = []
+  }
+})
+
+async function cleanOrphans() {
+  try {
+    await ElMessageBox.confirm(
+      `删除 ${orphans.value.length} 个不属于任何任务的未完成文件（共 ${formatBytes(orphanSize.value)}）？这些通常是旧版本或异常退出留下的。`,
+      '清理残留文件',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  const n = await api.deleteOrphanParts(orphans.value.map((o) => o.path))
+  ElMessage.success(`已删除 ${n} 个残留文件`)
+  orphans.value = await api.listOrphanParts()
+}
 const tasks = computed(() => [...queue.tasks].reverse())
 
 const statusText: Record<TaskSnapshot['status'], string> = {
@@ -71,6 +97,11 @@ async function run<A extends unknown[]>(fn: (...args: A) => Promise<unknown>, ..
       <el-button size="small" :disabled="!queue.tasks.some((t) => t.status === 'done' || t.status === 'canceled')" @click="run(api.clearFinished)">清除已完成</el-button>
     </div>
 
+    <el-alert v-if="orphans.length" type="info" show-icon :closable="false">
+      <template #title>下载目录里有 {{ orphans.length }} 个不属于任何任务的未完成文件（共 {{ formatBytes(orphanSize) }}）</template>
+      <el-button size="small" @click="cleanOrphans">清理</el-button>
+    </el-alert>
+
     <div v-if="tasks.length === 0" class="empty mute">队列是空的。在“解析”页选择内容并点击“下载所选”后，任务会出现在这里。</div>
 
     <div v-for="t in tasks" :key="t.id" class="task card" :class="t.status">
@@ -80,6 +111,11 @@ async function run<A extends unknown[]>(fn: (...args: A) => Promise<unknown>, ..
         <div class="name ellipsis" :title="t.title">{{ t.title }} <span class="mute">· {{ t.assetLabel }}</span></div>
         <div class="bar"><i :style="{ width: percent(t) + '%' }" /></div>
         <small class="mono detail ellipsis selectable" :title="detail(t)">{{ detail(t) }}</small>
+        <div class="tags">
+          <span v-if="t.resumable === false && t.status !== 'done'" class="chip">服务器不支持续传</span>
+          <span v-else-if="t.resumable && (t.status === 'paused' || t.status === 'running')" class="chip">可续传</span>
+          <el-button v-if="t.status === 'failed' && (t.errorKind === 'need_login' || t.errorKind === 'rate_limited')" link size="small" type="primary" @click="app.goSettings('accounts')">添加 Cookie 后重试</el-button>
+        </div>
       </div>
       <div class="st">
         <span class="state">{{ statusText[t.status] }}<template v-if="t.status === 'running' && t.total"> {{ percent(t) }}%</template></span>
@@ -181,6 +217,15 @@ h2 {
   display: block;
   font-size: 10.5px;
   color: var(--cc-mute);
+}
+.tags {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  min-height: 0;
+}
+.tags:empty {
+  display: none;
 }
 .failed .detail {
   color: var(--cc-err);

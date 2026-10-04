@@ -109,32 +109,4 @@ impl MediaInfo {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum AppError {
-    #[error("{0}")]
-    Message(String),
-    #[error("网络请求失败：{0}")]
-    Http(#[from] reqwest::Error),
-    #[error("数据解析失败：{0}")]
-    Json(#[from] serde_json::Error),
-    #[error("文件读写失败：{0}")]
-    Io(#[from] std::io::Error),
-    #[error("数据库错误：{0}")]
-    Db(#[from] rusqlite::Error),
-    #[error("{0}")]
-    Tauri(#[from] tauri::Error),
-}
-
-impl AppError {
-    pub fn msg(s: impl Into<String>) -> Self {
-        AppError::Message(s.into())
-    }
-}
-
-impl Serialize for AppError {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&self.to_string())
-    }
-}
-
-pub type AppResult<T> = Result<T, AppError>;
+pub use crate::error::{AppError, AppResult, ErrorKind};

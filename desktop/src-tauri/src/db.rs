@@ -94,7 +94,22 @@ impl Db {
                 size INTEGER NOT NULL,
                 finished_at INTEGER NOT NULL,
                 UNIQUE(platform, media_id, asset_id)
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                media_json TEXT NOT NULL,
+                asset_json TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                status TEXT NOT NULL,
+                received INTEGER NOT NULL DEFAULT 0,
+                total INTEGER,
+                error TEXT,
+                meta_json TEXT NOT NULL DEFAULT '{}',
+                created_at INTEGER NOT NULL,
+                finished_at INTEGER
+             );
+             CREATE INDEX IF NOT EXISTS idx_history_created ON history(created_at);
+             CREATE INDEX IF NOT EXISTS idx_downloads_finished ON downloads(finished_at);",
         )?;
         Ok(Db { conn: Mutex::new(conn) })
     }
@@ -222,6 +237,94 @@ impl Db {
     }
 }
 
+/// 持久化的下载任务。
+#[derive(Debug, Clone)]
+pub struct JobRow {
+    pub id: i64,
+    pub media_json: String,
+    pub asset_json: String,
+    pub file_path: String,
+    pub status: String,
+    pub received: i64,
+    pub total: Option<i64>,
+    pub error: Option<String>,
+    pub meta_json: String,
+    pub created_at: i64,
+    pub finished_at: Option<i64>,
+}
+
+impl Db {
+    pub fn insert_job(&self, r: &JobRow) -> AppResult<i64> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO jobs (media_json, asset_json, file_path, status, received, total, error, meta_json, created_at, finished_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![r.media_json, r.asset_json, r.file_path, r.status, r.received, r.total, r.error, r.meta_json, r.created_at, r.finished_at],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_job(
+        &self,
+        id: i64,
+        status: &str,
+        received: i64,
+        total: Option<i64>,
+        error: Option<&str>,
+        file_path: &str,
+        meta_json: &str,
+        finished_at: Option<i64>,
+    ) -> AppResult<()> {
+        self.conn().execute(
+            "UPDATE jobs SET status=?2, received=?3, total=?4, error=?5, file_path=?6, meta_json=?7, finished_at=?8 WHERE id=?1",
+            params![id, status, received, total, error, file_path, meta_json, finished_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_job_asset(&self, id: i64, asset_json: &str) -> AppResult<()> {
+        self.conn().execute("UPDATE jobs SET asset_json=?2 WHERE id=?1", params![id, asset_json])?;
+        Ok(())
+    }
+
+    pub fn delete_job(&self, id: i64) -> AppResult<()> {
+        self.conn().execute("DELETE FROM jobs WHERE id=?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn delete_jobs_with_status(&self, statuses: &[&str]) -> AppResult<()> {
+        let conn = self.conn();
+        for s in statuses {
+            conn.execute("DELETE FROM jobs WHERE status=?1", params![s])?;
+        }
+        Ok(())
+    }
+
+    pub fn load_jobs(&self) -> AppResult<Vec<JobRow>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, media_json, asset_json, file_path, status, received, total, error, meta_json, created_at, finished_at FROM jobs ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(JobRow {
+                id: r.get(0)?,
+                media_json: r.get(1)?,
+                asset_json: r.get(2)?,
+                file_path: r.get(3)?,
+                status: r.get(4)?,
+                received: r.get(5)?,
+                total: r.get(6)?,
+                error: r.get(7)?,
+                meta_json: r.get(8)?,
+                created_at: r.get(9)?,
+                finished_at: r.get(10)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+}
+
 pub fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
@@ -259,6 +362,31 @@ mod tests {
             assets: vec![Asset::video("https://x/v.mp4".into(), None, None)],
             ..placeholder_info()
         }
+    }
+
+    #[test]
+    fn jobs_roundtrip() {
+        let db = Db::open_in_memory().unwrap();
+        let row = JobRow {
+            id: 0,
+            media_json: "{}".into(),
+            asset_json: "{}".into(),
+            file_path: "/x.mp4".into(),
+            status: "queued".into(),
+            received: 0,
+            total: None,
+            error: None,
+            meta_json: "{}".into(),
+            created_at: 1,
+            finished_at: None,
+        };
+        let id = db.insert_job(&row).unwrap();
+        db.update_job(id, "paused", 10, Some(20), None, "/x.mp4", r#"{"etag":"e"}"#, None).unwrap();
+        let jobs = db.load_jobs().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!((jobs[0].status.as_str(), jobs[0].received, jobs[0].total), ("paused", 10, Some(20)));
+        db.delete_jobs_with_status(&["paused"]).unwrap();
+        assert!(db.load_jobs().unwrap().is_empty());
     }
 
     #[test]
