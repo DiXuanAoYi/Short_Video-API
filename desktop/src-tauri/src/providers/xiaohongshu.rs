@@ -40,16 +40,17 @@ impl Provider for Xiaohongshu {
     }
 
     async fn resolve(&self, ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo> {
-        let mut req = ctx.client.get(url).header("User-Agent", DESKTOP_UA).header("Referer", "https://www.xiaohongshu.com/");
-        if let Some(cookie) = ctx.settings.cookie("xiaohongshu") {
+        let mut req = ctx.get(url).header("User-Agent", DESKTOP_UA).header("Referer", "https://www.xiaohongshu.com/");
+        if let Some(cookie) = ctx.cookie("https://www.xiaohongshu.com/") {
             req = req.header("Cookie", cookie);
         }
         let resp = req.send().await?;
         let final_url = resp.url().to_string();
         if final_url.contains("/404") || final_url.contains("website-login") {
-            return Err(AppError::msg("小红书要求登录或笔记不可见。请在设置中登录小红书，或使用带 xsec_token 的完整分享链接。"));
+            return Err(AppError::need_login("小红书要求登录或笔记不可见。请在设置中登录小红书，或使用带 xsec_token 的完整分享链接。"));
         }
         let html = resp.text().await?;
+        ctx.record("xiaohongshu", "note-page", &final_url, &html);
         let id = note_id_from_url(&final_url).or_else(|| note_id_from_url(url));
         let note = note_from_html(&html, id.as_deref())?;
         let id = id.or_else(|| str_at(&note, "/noteId").map(String::from)).unwrap_or_default();
@@ -64,14 +65,15 @@ pub fn note_id_from_url(url: &str) -> Option<String> {
 /// 从页面 HTML 中取出笔记 JSON（`note.noteDetailMap[id].note`）。
 pub fn note_from_html(html: &str, id: Option<&str>) -> AppResult<Value> {
     let state = super::extract_json_after(html, "window.__INITIAL_STATE__")
-        .ok_or_else(|| AppError::msg("小红书页面结构已变化或需要登录，没有找到笔记数据。请在设置中登录小红书后重试。"))?;
-    let map = state.pointer("/note/noteDetailMap").and_then(Value::as_object).ok_or_else(|| AppError::msg("小红书页面里没有笔记信息，可能需要登录。"))?;
+        .ok_or_else(|| AppError::parser("小红书页面结构已变化或需要登录，没有找到笔记数据。请在设置中登录小红书后重试。"))?;
+    let map =
+        state.pointer("/note/noteDetailMap").and_then(Value::as_object).ok_or_else(|| AppError::need_login("小红书页面里没有笔记信息，可能需要登录。"))?;
     let entry = id.and_then(|id| map.get(id)).or_else(|| map.values().find(|v| v.pointer("/note/noteId").is_some()));
     entry
         .and_then(|e| e.get("note"))
         .filter(|n| n.get("noteId").is_some() || n.get("imageList").is_some())
         .cloned()
-        .ok_or_else(|| AppError::msg("笔记不存在、已删除或需要登录才能查看。"))
+        .ok_or_else(|| AppError::need_login("笔记不存在、已删除或需要登录才能查看。"))
 }
 
 pub fn parse_note(note: &Value, id: &str, source_url: &str) -> AppResult<MediaInfo> {
@@ -84,7 +86,7 @@ pub fn parse_note(note: &Value, id: &str, source_url: &str) -> AppResult<MediaIn
     let mut assets = Vec::new();
     let is_video = str_at(note, "/type") == Some("video");
     let (kind, width, height, duration_ms) = if is_video {
-        let url = video_url(note).ok_or_else(|| AppError::msg("没有找到视频地址，笔记可能已删除。"))?;
+        let url = video_url(note).ok_or_else(|| AppError::not_found("没有找到视频地址，笔记可能已删除。"))?;
         let stream = note.pointer("/video/media/stream/h264/0");
         let w = stream.and_then(|s| u32_at(s, "/width"));
         let h = stream.and_then(|s| u32_at(s, "/height"));
@@ -120,6 +122,9 @@ pub fn parse_note(note: &Value, id: &str, source_url: &str) -> AppResult<MediaIn
         height,
         published_at,
         assets,
+        entries: vec![],
+        series: None,
+        extractor: Some("native".into()),
     })
 }
 

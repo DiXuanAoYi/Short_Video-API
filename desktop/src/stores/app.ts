@@ -1,25 +1,36 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import { api, errorText, events } from '../api'
-import type { AppInfo, HistoryItem, MediaInfo, Settings, TaskSnapshot } from '../types'
+import { api, errorKind, errorText, events } from '../api'
+import type { AppInfo, ErrorKind, HistoryItem, MediaInfo, Settings, TaskSnapshot } from '../types'
 
-export type ViewName = 'parse' | 'queue' | 'library' | 'settings'
+export type ViewName = 'parse' | 'queue' | 'subs' | 'live' | 'library' | 'settings'
+export type SettingsTab = 'download' | 'parse' | 'network' | 'accounts' | 'phone' | 'components' | 'diagnostics' | 'general'
 
 /** 设置、主题与当前页面。 */
 export const useAppStore = defineStore('app', () => {
   const settings = ref<Settings | null>(null)
   const info = ref<AppInfo | null>(null)
   const view = ref<ViewName>('parse')
+  const settingsTab = ref<SettingsTab>('download')
+  const shortcutError = ref<string | null>(null)
+
+  function goSettings(tab: SettingsTab) {
+    settingsTab.value = tab
+    view.value = 'settings'
+  }
 
   async function load() {
     const [s, i] = await Promise.all([api.getSettings(), api.appInfo()])
     settings.value = s
     info.value = i
+    shortcutError.value = i.shortcutError
     applyTheme()
   }
 
   async function save(next: Settings) {
-    settings.value = await api.saveSettings(next)
+    const r = await api.saveSettings(next)
+    settings.value = r.settings
+    shortcutError.value = r.shortcutError
     applyTheme()
   }
 
@@ -36,7 +47,7 @@ export const useAppStore = defineStore('app', () => {
   }
   media.addEventListener('change', applyTheme)
 
-  return { settings, info, view, load, save, patch, applyTheme }
+  return { settings, info, view, settingsTab, shortcutError, goSettings, load, save, patch, applyTheme }
 })
 
 /** 下载队列，监听后端事件保持同步。 */
@@ -77,6 +88,7 @@ export const useParseStore = defineStore('parse', () => {
   const text = ref('')
   const loading = ref(false)
   const error = ref('')
+  const errorKindRef = ref<ErrorKind>('other')
   const result = ref<MediaInfo | null>(null)
   const recent = ref<HistoryItem[]>([])
 
@@ -95,6 +107,7 @@ export const useParseStore = defineStore('parse', () => {
     } catch (e) {
       result.value = null
       error.value = errorText(e)
+      errorKindRef.value = errorKind(e)
     } finally {
       loading.value = false
     }
@@ -110,5 +123,5 @@ export const useParseStore = defineStore('parse', () => {
     result.value = null
   }
 
-  return { text, loading, error, result, recent, parse, loadRecent, clear }
+  return { text, loading, error, errorKind: errorKindRef, result, recent, parse, loadRecent, clear }
 })

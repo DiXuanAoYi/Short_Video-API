@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { api, errorText } from '../api'
+import type { UnlistenFn } from '@tauri-apps/api/event'
+import { api, errorText, events } from '../api'
 import { useAppStore, useParseStore } from '../stores/app'
-import type { Asset, DetectedLink, HistoryItem } from '../types'
-import { formatDate, formatDuration } from '../utils/format'
+import type { Asset, BatchProgress, DetectedLink, HistoryItem, MediaInfo } from '../types'
+import { formatBytes, formatDate, formatDuration } from '../utils/format'
+import ErrorAlert from '../components/ErrorAlert.vue'
 
 const app = useAppStore()
 const parse = useParseStore()
@@ -15,18 +17,66 @@ const batchRunning = ref(false)
 const batchDone = ref(0)
 const preview = ref(false)
 const enqueuing = ref(false)
+const audioOnly = ref(false)
+const slideOpen = ref(false)
+const slideSecs = ref(3)
+const slideMusic = ref(true)
+const sliding = ref(false)
+const musicAsset = computed(() => result.value?.assets.find((a) => a.kind === 'audio') ?? null)
+
+async function makeSlideshow() {
+  if (!result.value) return
+  const ids = images.value.filter((a) => selected.value.has(a.id)).map((a) => a.id)
+  if (!ids.length) {
+    ElMessage.warning('请至少选择一张图片。')
+    return
+  }
+  sliding.value = true
+  try {
+    const path = await api.makeSlideshow(result.value, ids, slideMusic.value && musicAsset.value ? musicAsset.value.id : null, slideSecs.value)
+    slideOpen.value = false
+    ElMessage.success({ message: `已生成：${path}`, duration: 5000 })
+    api.revealFile(path).catch(() => {})
+  } catch (e) {
+    ElMessage.error(errorText(e))
+  } finally {
+    sliding.value = false
+  }
+}
+const entrySel = ref<Set<string>>(new Set())
+const batchInfo = ref<BatchProgress | null>(null)
+let unlistenBatch: UnlistenFn | undefined
 
 const result = computed(() => parse.result)
 const images = computed(() => result.value?.assets.filter((a) => a.kind === 'image') ?? [])
-const extras = computed(() => result.value?.assets.filter((a) => a.kind !== 'image') ?? [])
-const videoAsset = computed(() => result.value?.assets.find((a) => a.kind === 'video'))
+const videoFormats = computed(() => result.value?.assets.filter((a) => a.kind === 'video') ?? [])
+const extras = computed(() => result.value?.assets.filter((a) => a.kind !== 'image' && a.kind !== 'video') ?? [])
+const videoAsset = computed(() => result.value?.assets.find((a) => a.kind === 'video' && a.protocol === 'http'))
+const entries = computed(() => result.value?.entries ?? [])
+const isPlaylist = computed(() => result.value?.kind === 'playlist')
+const kindText = computed(() => {
+  const r = result.value
+  if (!r) return ''
+  if (r.kind === 'playlist') return `列表 ${r.entries.length} 条`
+  if (r.kind === 'audio') return '音频'
+  if (r.kind === 'images') return `图集 ${images.value.length} 张`
+  return '视频'
+})
 const selectedImages = computed(() => images.value.filter((a) => selected.value.has(a.id)).length)
-const supported = computed(() => app.info?.providers.map((p) => p.name).join('、') ?? '')
+const supported = computed(() => (app.info?.providers.map((p) => p.name).join('、') ?? '') + (app.settings?.useYtdlp ? '，其他网站用 yt-dlp' : ''))
 
 watch(
   result,
   (r) => {
-    selected.value = new Set(r ? defaultSelection(r.assets, r.kind) : [])
+    selected.value = new Set(r ? defaultSelection(r) : [])
+    entrySel.value = new Set(r?.entries.map((e) => e.id) ?? [])
+    audioOnly.value = false
+    if (r && r.kind === 'video' && app.settings?.qualityPreset === 'audio') {
+      // “只要音频”：优先选单独的音频轨，没有时下载视频后提取音频
+      const audio = bestAudio(r)
+      if (audio) selected.value = new Set([audio.id])
+      else audioOnly.value = true
+    }
   },
   { immediate: true },
 )
@@ -42,15 +92,100 @@ watch(
   },
 )
 
-function defaultSelection(assets: Asset[], kind: string) {
-  return assets.filter((a) => (kind === 'video' ? a.kind === 'video' : a.kind === 'image')).map((a) => a.id)
+function bestAudio(r: MediaInfo): Asset | undefined {
+  return r.assets.filter((a) => a.kind === 'audio').sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0]
 }
+
+/** 默认选中：视频选第一个格式（后端已按清晰度预设排序），图集选全部图片，音频选第一个音轨。 */
+function defaultSelection(r: MediaInfo): string[] {
+  if (r.kind === 'images') return r.assets.filter((a) => a.kind === 'image').map((a) => a.id)
+  const want = r.kind === 'audio' ? 'audio' : 'video'
+  const first = r.assets.find((a) => a.kind === want)
+  return first ? [first.id] : []
+}
+
+function toggleEntry(id: string) {
+  const next = new Set(entrySel.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  entrySel.value = next
+}
+
+function selectAllEntries(on: boolean) {
+  entrySel.value = new Set(on ? entries.value.map((e) => e.id) : [])
+}
+
+async function downloadEntries() {
+  if (!result.value) return
+  const ids = entries.value.filter((e) => entrySel.value.has(e.id)).map((e) => e.id)
+  if (!ids.length) {
+    ElMessage.warning('请至少选择一个条目。')
+    return
+  }
+  enqueuing.value = true
+  try {
+    const n = await api.enqueueEntries(result.value, ids)
+    ElMessage.success(`正在逐条解析 ${n} 个条目并加入队列…`)
+  } catch (e) {
+    ElMessage.error(errorText(e))
+  } finally {
+    enqueuing.value = false
+  }
+}
+
+onMounted(async () => {
+  unlistenBatch = await events.onBatch((p) => {
+    batchInfo.value = p
+    if (p.finished) {
+      const skipped = p.skipped ? `，${p.skipped} 项之前已下载或已在队列中` : ''
+      if (p.failed.length) ElMessage.warning({ message: `“${p.title}”：已加入 ${p.queued} 项${skipped}，${p.failed.length} 条失败。${p.failed.slice(0, 3).join('；')}`, duration: 8000 })
+      else if (p.skipped) ElMessage.success(`“${p.title}”：已加入 ${p.queued} 项${skipped}`)
+      else ElMessage.success(`“${p.title}”：${p.total} 条已全部加入下载队列`)
+      window.setTimeout(() => (batchInfo.value = null), 1500)
+    }
+  })
+})
+onUnmounted(() => unlistenBatch?.())
 
 function toggle(id: string) {
   const next = new Set(selected.value)
   if (next.has(id)) next.delete(id)
   else next.add(id)
   selected.value = next
+}
+
+/** 清晰度只能选一个；再次点击已选中的格式则取消（只下载音乐、封面等）。 */
+function pickVideo(id: string) {
+  const next = new Set(selected.value)
+  const had = next.has(id)
+  for (const v of videoFormats.value) next.delete(v.id)
+  if (!had) next.add(id)
+  selected.value = next
+}
+
+/** avc1.64001F → H.264 这类可读名称。 */
+function prettyCodec(c: string | null): string {
+  if (!c) return ''
+  const l = c.toLowerCase()
+  if (l.startsWith('avc') || l.startsWith('h264') || l === 'h.264') return 'H.264'
+  if (l.startsWith('hev') || l.startsWith('hvc') || l.startsWith('h265') || l === 'h.265') return 'H.265'
+  if (l.startsWith('av01') || l === 'av1') return 'AV1'
+  if (l.startsWith('vp9') || l.startsWith('vp09')) return 'VP9'
+  return c.split('.')[0].toUpperCase()
+}
+
+function formatMeta(a: Asset) {
+  const parts: string[] = []
+  if (a.width && a.height) parts.push(`${a.width}×${a.height}`)
+  const codec = prettyCodec(a.vcodec)
+  if (codec && !a.label.includes(codec)) parts.push(codec)
+  if (a.fps) parts.push(`${a.fps}fps`)
+  if (a.filesize) parts.push(formatBytes(a.filesize))
+  else if (a.bitrate) parts.push(`${a.bitrate} kbps`)
+  if (a.hasAudio === false) parts.push('需合并音频')
+  if (a.protocol === 'hls') parts.push('M3U8')
+  if (a.protocol === 'ytdlp') parts.push('yt-dlp 下载')
+  return parts.join(' · ') || a.ext.toUpperCase()
 }
 
 function selectAllImages(on: boolean) {
@@ -71,11 +206,15 @@ async function download() {
   }
   enqueuing.value = true
   try {
-    const tasks = await api.enqueue(result.value, ids)
-    const skipped = tasks.filter((t) => t.status === 'done').length
-    const added = tasks.length - skipped
-    if (added > 0 && skipped > 0) ElMessage.success(`已加入下载 ${added} 项，${skipped} 项之前已下载，已跳过`)
+    const fmt = app.settings?.audioFormat ?? 'mp3'
+    const r = await api.enqueue(result.value, ids, { extractAudio: audioOnly.value ? fmt : null, embedMetadata: false })
+    const added = r.tasks.length
+    const parts: string[] = []
+    if (r.alreadyQueued) parts.push(`${r.alreadyQueued} 项已在队列中`)
+    if (r.alreadyDownloaded) parts.push(`${r.alreadyDownloaded} 项之前已下载`)
+    if (added > 0 && parts.length) ElMessage.success(`已加入下载 ${added} 项；${parts.join('，')}，已跳过`)
     else if (added > 0) ElMessage.success(`已加入下载队列：${added} 项`)
+    else if (r.alreadyQueued) ElMessage.info(`所选内容已在下载队列中。${r.alreadyDownloaded ? `另有 ${r.alreadyDownloaded} 项之前已下载。` : ''}`)
     else ElMessage.info('所选内容之前都已下载过，已跳过。可在设置中关闭“跳过已下载”。')
   } catch (e) {
     ElMessage.error(errorText(e))
@@ -128,6 +267,13 @@ function onKey(e: KeyboardEvent) {
   }
 }
 
+function recentKind(r: HistoryItem) {
+  if (r.kind === 'playlist') return `列表 ${r.info.entries.length} 条`
+  if (r.kind === 'audio') return '音频'
+  if (r.kind === 'images') return `图集 ${r.info.assets.filter((a) => a.kind === 'image').length} 张`
+  return '视频'
+}
+
 function sizeText(a: Asset) {
   if (a.width && a.height) return `${a.width}×${a.height}`
   return a.ext.toUpperCase()
@@ -142,7 +288,7 @@ function sizeText(a: Asset) {
         type="textarea"
         :autosize="{ minRows: 1, maxRows: 4 }"
         resize="none"
-        placeholder="粘贴抖音、快手、小红书、B站、微博的分享文案或链接，按 Enter 解析"
+        placeholder="粘贴分享文案或任意视频网页链接（抖音、B站、YouTube…），按 Enter 解析"
         class="paste-input"
         @keydown="onKey"
       />
@@ -165,7 +311,7 @@ function sizeText(a: Asset) {
       </el-button>
     </div>
 
-    <el-alert v-if="parse.error" type="error" :title="parse.error" show-icon :closable="false" class="selectable" />
+    <ErrorAlert v-if="parse.error" :message="parse.error" :kind="parse.errorKind" />
 
     <div v-if="parse.loading && !result" class="result card skeleton">
       <el-skeleton animated :rows="5" />
@@ -180,14 +326,16 @@ function sizeText(a: Asset) {
       </div>
       <div class="meta">
         <div class="chips">
-          <span class="chip acc">{{ result.platformName }} · {{ result.kind === 'video' ? '视频' : `图集 ${images.length} 张` }}</span>
-          <span class="chip">无水印</span>
+          <span class="chip acc">{{ result.platformName }} · {{ kindText }}</span>
+          <span v-if="result.extractor === 'native' || !result.extractor" class="chip">无水印</span>
+          <span v-else-if="result.extractor.startsWith('yt-dlp')" class="chip">yt-dlp 解析</span>
+          <span v-else-if="result.extractor === 'generic'" class="chip">网页嗅探</span>
           <span v-if="result.width && result.height" class="chip">{{ result.width }}×{{ result.height }}</span>
         </div>
         <h3 class="title selectable">{{ result.title }}</h3>
         <div class="mute">
           <span v-if="result.author">@{{ result.author }}</span>
-          <span v-if="result.publishedAt"> · {{ formatDate(result.publishedAt) }} 发布</span>
+          <span v-if="result.publishedAt">{{ result.author ? ' · ' : '' }}{{ formatDate(result.publishedAt) }} 发布</span>
         </div>
 
         <div v-if="images.length" class="grid-head">
@@ -212,6 +360,23 @@ function sizeText(a: Asset) {
           </button>
         </div>
 
+        <div v-if="videoFormats.length" class="fmt-head">{{ videoFormats.length > 1 ? `清晰度（${videoFormats.length} 种）` : '视频' }}</div>
+        <div v-if="videoFormats.length" class="formats" role="radiogroup">
+          <button
+            v-for="v in videoFormats"
+            :key="v.id"
+            type="button"
+            role="radio"
+            class="opt fmt"
+            :class="{ on: selected.has(v.id) }"
+            :aria-checked="selected.has(v.id)"
+            @click="pickVideo(v.id)"
+          >
+            <span>{{ v.label }}</span>
+            <small class="mono">{{ formatMeta(v) }}</small>
+          </button>
+        </div>
+        <div v-if="extras.length" class="fmt-head">其他内容</div>
         <div class="opts">
           <button
             v-for="a in extras"
@@ -227,9 +392,37 @@ function sizeText(a: Asset) {
           </button>
         </div>
 
-        <div class="row">
+        <template v-if="isPlaylist">
+          <div class="grid-head">
+            <span>已选 {{ entrySel.size }} / {{ entries.length }} 条</span>
+            <el-button link type="primary" @click="selectAllEntries(entrySel.size < entries.length)">
+              {{ entrySel.size < entries.length ? '全选' : '全不选' }}
+            </el-button>
+          </div>
+          <div class="entries">
+            <label v-for="e in entries" :key="e.id" class="entry" :class="{ on: entrySel.has(e.id) }">
+              <el-checkbox :model-value="entrySel.has(e.id)" @change="toggleEntry(e.id)" />
+              <span class="mono mute idx">{{ e.index }}</span>
+              <span class="ellipsis grow">{{ e.title }}</span>
+              <small v-if="e.durationMs" class="mono mute">{{ formatDuration(e.durationMs) }}</small>
+            </label>
+          </div>
+          <small class="mute">每个条目会按设置里的默认清晰度下载，保存到以列表名命名的文件夹。</small>
+          <div class="row">
+            <el-button type="primary" :loading="enqueuing" :disabled="!!batchInfo && !batchInfo.finished" @click="downloadEntries">
+              {{ batchInfo && !batchInfo.finished ? `解析中 ${batchInfo.done}/${batchInfo.total}` : `下载所选 ${entrySel.size} 条` }}
+            </el-button>
+          </div>
+        </template>
+
+        <div v-if="!isPlaylist && result.kind !== 'images'" class="kv-line">
+          <el-checkbox v-model="audioOnly">只保留音频（下载后转为 {{ (app.settings?.audioFormat ?? 'mp3').toUpperCase() }}）</el-checkbox>
+        </div>
+
+        <div v-if="!isPlaylist" class="row">
           <el-button type="primary" :loading="enqueuing" @click="download">下载所选</el-button>
           <el-button @click="copyLinks">复制直链</el-button>
+          <el-button v-if="images.length > 1" @click="slideOpen = true">合成视频</el-button>
           <el-button @click="preview = true">预览</el-button>
         </div>
       </div>
@@ -241,7 +434,7 @@ function sizeText(a: Asset) {
         <img v-if="r.cover" :src="r.cover" class="thumb" referrerpolicy="no-referrer" alt="" />
         <div v-else class="thumb" />
         <span class="ellipsis">{{ r.title }}</span>
-        <small class="mono mute">{{ r.info.platformName }} · {{ r.kind === 'video' ? '视频' : `图集 ${r.info.assets.filter((a) => a.kind === 'image').length} 张` }}</small>
+        <small class="mono mute">{{ r.info.platformName }} · {{ recentKind(r) }}</small>
       </button>
     </section>
 
@@ -253,6 +446,16 @@ function sizeText(a: Asset) {
         <li>选择视频、图片或背景音乐，点击“下载所选”。</li>
       </ol>
     </section>
+
+    <el-dialog v-model="slideOpen" title="图集合成视频" width="400px" append-to-body>
+      <p class="mute">把选中的 {{ selectedImages }} 张图片合成一个视频（需要 ffmpeg），保存在下载目录。</p>
+      <div class="slide-row"><span>每张显示</span><el-input-number v-model="slideSecs" :min="0.5" :max="30" :step="0.5" size="small" /><span>秒</span></div>
+      <el-checkbox v-if="musicAsset" v-model="slideMusic">配上背景音乐</el-checkbox>
+      <template #footer>
+        <el-button @click="slideOpen = false">取消</el-button>
+        <el-button type="primary" :loading="sliding" @click="makeSlideshow">生成</el-button>
+      </template>
+    </el-dialog>
 
     <el-dialog v-model="preview" :title="result?.title" width="720px" align-center destroy-on-close>
       <div v-if="result" class="preview">
@@ -268,6 +471,41 @@ function sizeText(a: Asset) {
 </template>
 
 <style scoped>
+.slide-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.entries {
+  max-height: 320px;
+  overflow: auto;
+  border: 1px solid var(--cc-line);
+  border-radius: 6px;
+}
+.entry {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  border-top: 1px dashed var(--cc-line);
+  cursor: pointer;
+  font-size: 12.5px;
+}
+.entry:first-child {
+  border-top: 0;
+}
+.entry .idx {
+  width: 28px;
+  text-align: right;
+}
+.entry .grow {
+  flex: 1;
+  min-width: 0;
+}
+.kv-line {
+  margin-top: 4px;
+}
 .page {
   padding: 20px 24px;
   display: flex;
@@ -433,6 +671,16 @@ function sizeText(a: Asset) {
 }
 .ph:focus-visible {
   outline: 2px solid var(--cc-acc);
+}
+.fmt-head {
+  font-size: 11.5px;
+  color: var(--cc-mute);
+  margin-bottom: -4px;
+}
+.formats {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 8px;
 }
 .opts {
   display: grid;

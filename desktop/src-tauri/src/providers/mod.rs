@@ -2,11 +2,17 @@
 
 pub mod bilibili;
 pub mod douyin;
+pub mod generic;
 pub mod kuaishou;
+pub mod listing;
+pub mod live;
+pub mod pixiv;
 pub mod remote;
 pub mod weibo;
 pub mod xiaohongshu;
+pub mod ytdlp;
 
+use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -15,7 +21,9 @@ use regex::Regex;
 use serde::Serialize;
 use url::Url;
 
-use crate::model::{AppError, AppResult, MediaInfo};
+use crate::cookies::CookieStore;
+use crate::model::{AppError, AppResult, ErrorKind, MediaInfo};
+use crate::net::NetManager;
 use crate::settings::{ParseMode, Settings};
 
 pub const DESKTOP_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36";
@@ -24,8 +32,55 @@ pub const MOBILE_UA: &str =
 
 /// 解析时共享的上下文。
 pub struct Ctx<'a> {
+    /// 没有网络管理器时（测试）使用的默认客户端
     pub client: &'a reqwest::Client,
     pub settings: &'a Settings,
+    pub cookies: &'a CookieStore,
+    /// 按网站分流的客户端；为 None 时一律用 `client`
+    pub net: Option<&'a NetManager>,
+    /// 开启“录制样本”时保存原始响应的目录
+    pub samples: Option<PathBuf>,
+    /// 指定使用某个账号的 Cookie（检查账号状态时），否则用网站的默认账号
+    pub account: Option<String>,
+    /// yt-dlp 位置；为 None 时不使用 yt-dlp（未安装或已在设置中关闭）
+    pub ytdlp: Option<PathBuf>,
+    pub ffmpeg: Option<PathBuf>,
+}
+
+impl<'a> Ctx<'a> {
+    pub fn new(client: &'a reqwest::Client, settings: &'a Settings, cookies: &'a CookieStore) -> Self {
+        Ctx { client, settings, cookies, net: None, samples: None, account: None, ytdlp: None, ffmpeg: None }
+    }
+
+    /// 按网络分流规则选择访问 `url` 的客户端。
+    pub fn http(&self, url: &str) -> reqwest::Client {
+        self.net.and_then(|n| n.clients_for(&self.settings.network, url).ok()).map(|c| c.api).unwrap_or_else(|| self.client.clone())
+    }
+
+    pub fn get(&self, url: impl AsRef<str>) -> reqwest::RequestBuilder {
+        let url = url.as_ref();
+        self.http(url).get(url)
+    }
+
+    pub fn post(&self, url: impl AsRef<str>) -> reqwest::RequestBuilder {
+        let url = url.as_ref();
+        self.http(url).post(url)
+    }
+
+    /// 请求 `url` 时应带的 Cookie（按域名匹配当前默认账号）。
+    pub fn cookie(&self, url: &str) -> Option<String> {
+        match &self.account {
+            Some(id) => self.cookies.header_for_account(id, url),
+            None => self.cookies.header_for(url),
+        }
+    }
+
+    /// 保存一份原始响应作为调试样本（去掉 Cookie、令牌等敏感片段）。
+    pub fn record(&self, platform: &str, label: &str, url: &str, body: &str) {
+        if let Some(dir) = &self.samples {
+            crate::diagnostics::save_sample(dir, platform, label, url, body);
+        }
+    }
 }
 
 #[async_trait]
@@ -39,10 +94,24 @@ pub trait Provider: Send + Sync {
     /// 内置登录窗口打开的地址，也用于读取登录后的 Cookie。
     fn login_url(&self) -> &'static str;
     async fn resolve(&self, ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo>;
+
+    /// 检查当前账号的登录状态；平台不支持时返回 None。
+    async fn account_status(&self, _ctx: &Ctx<'_>) -> AppResult<Option<AccountStatus>> {
+        Ok(None)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountStatus {
+    pub logged_in: bool,
+    pub user_name: Option<String>,
+    /// 会员等级 / 状态描述，如“大会员”
+    pub vip: Option<String>,
 }
 
 pub fn all() -> &'static [&'static dyn Provider] {
-    static ALL: [&dyn Provider; 5] = [&douyin::Douyin, &kuaishou::Kuaishou, &xiaohongshu::Xiaohongshu, &bilibili::Bilibili, &weibo::Weibo];
+    static ALL: [&dyn Provider; 6] = [&douyin::Douyin, &kuaishou::Kuaishou, &xiaohongshu::Xiaohongshu, &bilibili::Bilibili, &weibo::Weibo, &pixiv::Pixiv];
     &ALL
 }
 
@@ -90,15 +159,32 @@ pub fn detect_links(text: &str) -> Vec<DetectedLink> {
     out
 }
 
+/// 剪贴板 / 手机发送用的链接识别：内置平台，加上设置里的额外网站（或全部网址）。
+pub fn detect_links_with(text: &str, settings: &Settings) -> Vec<DetectedLink> {
+    let mut out = detect_links(text);
+    for raw in extract_urls(text) {
+        if out.iter().any(|d| d.url == raw) {
+            continue;
+        }
+        let Some(host) = Url::parse(&raw).ok().and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase())) else { continue };
+        let listed = settings.clipboard_domains.iter().any(|d| host == *d || host.ends_with(&format!(".{d}")));
+        if settings.clipboard_all_sites || listed {
+            let site = crate::cookies::registrable_domain(&host);
+            out.push(DetectedLink { url: raw, platform: site.clone(), platform_name: site });
+        }
+    }
+    out
+}
+
 /// 解析一段文本中的第一个链接，按设置决定本地 / 远程策略。
-pub async fn resolve_text(client: &reqwest::Client, settings: &Settings, text: &str) -> AppResult<MediaInfo> {
+pub async fn resolve_text(ctx: &Ctx<'_>, text: &str) -> AppResult<MediaInfo> {
     let urls = extract_urls(text);
     let Some(first) = urls.first() else {
-        return Err(AppError::msg("没有找到链接。请粘贴分享文案或链接。"));
+        return Err(AppError::invalid("没有找到链接。请粘贴分享文案或链接。"));
     };
     // 优先选受支持平台的链接，避免文案中混有其他网址。
     let url = urls.iter().find(|u| Url::parse(u).map(|p| all().iter().any(|pr| pr.matches(&p))).unwrap_or(false)).unwrap_or(first).clone();
-    resolve_url(client, settings, &url).await
+    resolve_url(ctx, &url).await
 }
 
 /// 旧版 PHP 接口（远程 API）只支持这些平台。
@@ -109,32 +195,77 @@ pub fn remote_allowed(provider: Option<&dyn Provider>) -> bool {
     provider.map_or(true, |p| REMOTE_PLATFORMS.contains(&p.id()))
 }
 
-pub async fn resolve_url(client: &reqwest::Client, settings: &Settings, url: &str) -> AppResult<MediaInfo> {
-    let ctx = Ctx { client, settings };
+pub async fn resolve_url(ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo> {
+    let settings = ctx.settings;
     let has_remote = !settings.remote_endpoint.is_empty();
-    let parsed = Url::parse(url).map_err(|_| AppError::msg("链接格式不正确。"))?;
+    let parsed = Url::parse(url).map_err(|_| AppError::invalid("链接格式不正确。"))?;
     let provider = all().iter().find(|p| p.matches(&parsed));
     let remote_ok = remote_allowed(provider.copied());
 
     if settings.parse_mode == ParseMode::Remote && remote_ok {
         if !has_remote {
-            return Err(AppError::msg("当前为远程解析模式，但没有填写远程 API 地址。请在设置中填写，或改为本地解析。"));
+            return Err(AppError::invalid("当前为远程解析模式，但没有填写远程 API 地址。请在设置中填写，或改为本地解析。"));
         }
-        return remote::resolve(&ctx, url).await;
+        return remote::resolve(ctx, url).await;
     }
 
+    if let (Some(net), Some(p)) = (ctx.net, provider) {
+        net.wait_turn(p.id(), std::time::Duration::from_millis(settings.site_request_interval_ms)).await;
+    }
     let local = match provider {
-        Some(p) => p.resolve(&ctx, url).await,
-        None => Err(AppError::msg("暂不支持这个平台。目前支持抖音、快手、小红书、B站、微博。")),
+        Some(p) => match p.resolve(ctx, url).await {
+            // 内置解析器失效时让 yt-dlp 试一次（它也支持 B站、微博等大部分平台）
+            Err(e) if e.kind == ErrorKind::ParserBroken && ctx.ytdlp.is_some() => {
+                ytdlp::resolve(ctx, url).await.map_err(|ye| AppError::new(e.kind, format!("{e}；yt-dlp 也失败：{ye}")))
+            }
+            other => other,
+        },
+        None => resolve_generic(ctx, url).await,
     };
 
     match local {
-        Ok(info) => Ok(info),
+        Ok(mut info) => {
+            crate::quality::sort_videos(&mut info, settings);
+            Ok(info)
+        }
         Err(e) if settings.parse_mode != ParseMode::Local && has_remote && remote_ok && provider.is_some() => {
-            remote::resolve(&ctx, url).await.map_err(|re| AppError::msg(format!("本地解析失败：{e}；远程解析也失败：{re}")))
+            remote::resolve(ctx, url).await.map_err(|re| AppError::new(e.kind, format!("本地解析失败：{e}；远程解析也失败：{re}")))
         }
         Err(e) => Err(e),
     }
+}
+
+/// 没有内置解析器的网站：先交给 yt-dlp，再尝试网页嗅探。
+async fn resolve_generic(ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo> {
+    let mut first_err: Option<AppError> = None;
+    if ctx.ytdlp.is_some() {
+        if let Some(net) = ctx.net {
+            let host = Url::parse(url).ok().and_then(|u| u.host_str().map(crate::cookies::registrable_domain)).unwrap_or_default();
+            net.wait_turn(&host, Duration::from_millis(ctx.settings.site_request_interval_ms)).await;
+        }
+        match ytdlp::resolve(ctx, url).await {
+            Ok(info) => return Ok(info),
+            // 需要登录、地区限制等明确的错误直接返回，嗅探也不会成功
+            Err(e) if !matches!(e.kind, ErrorKind::Unsupported | ErrorKind::NotFound | ErrorKind::Other) => return Err(e),
+            Err(e) => first_err = Some(e),
+        }
+    }
+    if ctx.settings.generic_sniffer {
+        match generic::resolve(ctx, url).await {
+            Ok(info) => return Ok(info),
+            Err(e) if first_err.is_none() => first_err = Some(e),
+            Err(_) => {}
+        }
+    }
+    Err(match first_err {
+        Some(e) if ctx.ytdlp.is_some() => e,
+        _ if ctx.ytdlp.is_none() => AppError::new(
+            ErrorKind::NeedUpdate,
+            "内置解析器不支持这个网站。在“设置 → 组件”中安装 yt-dlp 后可支持上千个视频网站（YouTube、Pornhub、Twitter/X、TikTok 等）。",
+        ),
+        Some(e) => e,
+        None => AppError::unsupported("暂不支持这个网站。"),
+    })
 }
 
 /// 下载某个平台资源时使用的 Referer。
@@ -217,6 +348,16 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_whitelist() {
+        let text = "https://www.youtube.com/watch?v=1 https://example.com/a https://v.douyin.com/x/";
+        let s = Settings::default();
+        let links: Vec<String> = detect_links_with(text, &s).into_iter().map(|d| d.platform).collect();
+        assert_eq!(links, vec!["douyin", "youtube.com"]);
+        let s = Settings { clipboard_all_sites: true, ..Settings::default() };
+        assert_eq!(detect_links_with(text, &s).len(), 3);
+    }
+
+    #[test]
     fn extract_json_handles_braces_in_strings() {
         let html = r#"<script>window.X = {"a":"}{","b":{"c":1}};</script>"#;
         let v = extract_json_after(html, "window.X").unwrap();
@@ -227,7 +368,8 @@ mod tests {
     #[tokio::test]
     async fn remote_mode_without_endpoint_is_an_error() {
         let s = Settings { parse_mode: ParseMode::Remote, ..Settings::default() };
-        let err = resolve_text(&build_client(), &s, "https://v.douyin.com/x/").await.unwrap_err();
+        let (c, store) = (build_client(), CookieStore::in_memory());
+        let err = resolve_text(&Ctx::new(&c, &s, &store), "https://v.douyin.com/x/").await.unwrap_err();
         assert!(err.to_string().contains("远程 API"));
     }
 
@@ -243,7 +385,8 @@ mod tests {
 
     #[tokio::test]
     async fn text_without_url_is_an_error() {
-        let err = resolve_text(&build_client(), &Settings::default(), "没有链接").await.unwrap_err();
+        let (c, s, store) = (build_client(), Settings::default(), CookieStore::in_memory());
+        let err = resolve_text(&Ctx::new(&c, &s, &store), "没有链接").await.unwrap_err();
         assert!(err.to_string().contains("没有找到链接"));
     }
 }

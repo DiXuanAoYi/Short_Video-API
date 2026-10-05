@@ -1,8 +1,33 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type {
+  AccountStatus,
+  AccountSummary,
+  RouteTest,
+  AppErrorPayload,
   AppInfo,
+  EnqueueResult,
+  ErrorKind,
+  OrphanPart,
+  SaveSettingsResult,
   AutoResult,
+  BatchProgress,
+  LiveRoom,
+  LiveSettings,
+  LiveStatus,
+  Recording,
+  ListResult,
+  SubItem,
+  SubSettings,
+  Subscription,
+  HealthResult,
+  LibraryFilter,
+  PairRequest,
+  PhoneInfo,
+  PlatformCount,
+  PostOptions,
+  ToolProgress,
+  ToolStatus,
   ClipboardLink,
   DetectedLink,
   HistoryItem,
@@ -16,12 +41,20 @@ import type {
 export const api = {
   appInfo: () => invoke<AppInfo>('get_app_info'),
   getSettings: () => invoke<Settings>('get_settings'),
-  saveSettings: (settings: Settings) => invoke<Settings>('save_settings', { settings }),
+  saveSettings: (settings: Settings) => invoke<SaveSettingsResult>('save_settings', { settings }),
 
   detectLinks: (text: string) => invoke<DetectedLink[]>('detect_links', { text }),
   resolve: (text: string) => invoke<MediaInfo>('resolve_link', { text }),
   resolveAndEnqueue: (text: string) => invoke<string>('resolve_and_enqueue', { text }),
-  enqueue: (media: MediaInfo, assetIds: string[]) => invoke<TaskSnapshot[]>('enqueue', { media, assetIds }),
+  enqueue: (media: MediaInfo, assetIds: string[], post?: PostOptions) => invoke<EnqueueResult>('enqueue', { media, assetIds, post }),
+  enqueueEntries: (playlist: MediaInfo, entryIds: string[]) => invoke<number>('enqueue_entries', { playlist, entryIds }),
+
+  toolsStatus: () => invoke<ToolStatus[]>('tools_status'),
+  installTool: (tool: string) => invoke<ToolStatus>('install_tool', { tool }),
+  rollbackTool: (tool: string) => invoke<ToolStatus>('rollback_tool', { tool }),
+  importTool: (tool: string, path: string) => invoke<ToolStatus>('import_tool', { tool, path }),
+  listExtractors: () => invoke<string[]>('list_extractors'),
+  openToolsDir: () => invoke<void>('open_tools_dir'),
 
   listTasks: () => invoke<TaskSnapshot[]>('list_tasks'),
   pauseTask: (id: number) => invoke<void>('pause_task', { id }),
@@ -31,11 +64,48 @@ export const api = {
   clearFinished: () => invoke<void>('clear_finished'),
   pauseAll: () => invoke<void>('pause_all'),
   resumeAll: () => invoke<void>('resume_all'),
+  listOrphanParts: () => invoke<OrphanPart[]>('list_orphan_parts'),
+  deleteOrphanParts: (paths: string[]) => invoke<number>('delete_orphan_parts', { paths }),
 
   listHistory: (query = '') => invoke<HistoryItem[]>('list_history', { query }),
   deleteHistory: (id: number) => invoke<void>('delete_history', { id }),
   clearHistory: () => invoke<void>('clear_history'),
-  listLibrary: (query = '') => invoke<LibraryItem[]>('list_library', { query }),
+  listLibrary: (filter?: Partial<LibraryFilter>) => invoke<LibraryItem[]>('list_library', { filter }),
+  libraryPlatforms: () => invoke<PlatformCount[]>('library_platforms'),
+  redownload: (id: number) => invoke<EnqueueResult>('redownload', { id }),
+  healthCheck: () => invoke<HealthResult[]>('health_check'),
+  moveTask: (id: number, to: 'top' | 'up' | 'down' | 'bottom') => invoke<void>('move_task', { id, to }),
+  scheduleTask: (id: number, startAt: number | null) => invoke<void>('schedule_task', { id, startAt }),
+  getAfterAllDone: () => invoke<string>('get_after_all_done'),
+  setAfterAllDone: (action: string) => invoke<void>('set_after_all_done', { action }),
+  readLinksFile: (path: string) => invoke<string>('read_links_file', { path }),
+  isPortable: () => invoke<boolean>('is_portable'),
+  makeSlideshow: (media: MediaInfo, imageIds: string[], musicId: string | null, seconds: number) => invoke<string>('make_slideshow', { media, imageIds, musicId, seconds }),
+  liveRooms: () => invoke<LiveRoom[]>('live_rooms'),
+  liveCheck: (url: string) => invoke<LiveStatus>('live_check', { url }),
+  liveAdd: (url: string, settings: LiveSettings) => invoke<LiveRoom>('live_add', { url, settings }),
+  liveUpdate: (id: number, streamer: string, settings: LiveSettings) => invoke<void>('live_update', { id, streamer, settings }),
+  liveSetMonitoring: (id: number, on: boolean) => invoke<void>('live_set_monitoring', { id, on }),
+  liveDelete: (id: number) => invoke<void>('live_delete', { id }),
+  liveStart: (id: number) => invoke<void>('live_start', { id }),
+  liveStop: (id: number) => invoke<void>('live_stop', { id }),
+  liveRecordings: (id?: number) => invoke<Recording[]>('live_recordings', { id }),
+  subsList: () => invoke<Subscription[]>('subs_list'),
+  subsPreview: (url: string) => invoke<ListResult>('subs_preview', { url }),
+  subsAdd: (url: string, title: string | null, settings: SubSettings) => invoke<Subscription>('subs_add', { url, title, settings }),
+  subsUpdate: (id: number, title: string, settings: SubSettings) => invoke<void>('subs_update', { id, title, settings }),
+  subsSetPaused: (id: number, paused: boolean) => invoke<void>('subs_set_paused', { id, paused }),
+  subsDelete: (id: number) => invoke<void>('subs_delete', { id }),
+  subsCheck: (id: number) => invoke<number>('subs_check', { id }),
+  subsItems: (id: number, statuses: string[]) => invoke<SubItem[]>('subs_items', { id, statuses }),
+  subsDownloadItems: (id: number, itemIds: string[]) => invoke<number>('subs_download_items', { id, itemIds }),
+  subsIgnoreItems: (id: number, itemIds: string[]) => invoke<void>('subs_ignore_items', { id, itemIds }),
+  subsClearNew: (id: number) => invoke<void>('subs_clear_new', { id }),
+  phoneInfo: () => invoke<PhoneInfo>('phone_info'),
+  phoneEnable: (on: boolean) => invoke<PhoneInfo>('phone_enable', { on }),
+  phoneResetToken: () => invoke<PhoneInfo>('phone_reset_token'),
+  phoneRevoke: (deviceId: string) => invoke<PhoneInfo>('phone_revoke', { deviceId }),
+  phonePairRespond: (deviceId: string, accept: boolean) => invoke<PhoneInfo>('phone_pair_respond', { deviceId, accept }),
   deleteLibrary: (id: number, deleteFile: boolean) => invoke<void>('delete_library', { id, deleteFile }),
 
   copyText: (text: string) => invoke<void>('copy_text', { text }),
@@ -44,9 +114,21 @@ export const api = {
   openUrl: (url: string) => invoke<void>('open_url', { url }),
   showMain: () => invoke<void>('show_main'),
   hideMini: () => invoke<void>('hide_mini'),
-  openLogin: (platform: string) => invoke<void>('open_login', { platform }),
-  saveLoginCookies: (platform: string) => invoke<Settings>('save_login_cookies', { platform }),
+  openLogin: (site: string, url?: string) => invoke<void>('open_login', { site, url }),
+  saveLoginCookies: (site: string, label?: string) => invoke<AccountSummary[]>('save_login_cookies', { site, label }),
+  listAccounts: () => invoke<AccountSummary[]>('list_accounts'),
+  importCookiesFile: (path: string, label?: string) => invoke<AccountSummary[]>('import_cookies_file', { path, label }),
+  importCookiesText: (site: string, text: string, label?: string) => invoke<AccountSummary[]>('import_cookies_text', { site, text, label }),
+  renameAccount: (id: string, label: string) => invoke<AccountSummary[]>('rename_account', { id, label }),
+  setDefaultAccount: (id: string) => invoke<AccountSummary[]>('set_default_account', { id }),
+  deleteAccount: (id: string) => invoke<AccountSummary[]>('delete_account', { id }),
+  checkAccount: (id: string) => invoke<AccountStatus>('check_account', { id }),
+  testRoute: (url: string) => invoke<RouteTest>('test_route', { url }),
+  getDiagnostics: () => invoke<string>('get_diagnostics'),
+  openLogDir: () => invoke<void>('open_log_dir'),
+  openSamplesDir: () => invoke<void>('open_samples_dir'),
   checkUpdate: () => invoke<UpdateInfo>('check_update'),
+  installUpdate: () => invoke<void>('install_update'),
 }
 
 export const events = {
@@ -54,12 +136,29 @@ export const events = {
   onProgress: (cb: (task: TaskSnapshot) => void): Promise<UnlistenFn> => listen<TaskSnapshot>('tasks://progress', (e) => cb(e.payload)),
   onClipboardLink: (cb: (p: ClipboardLink) => void): Promise<UnlistenFn> => listen<ClipboardLink>('clipboard://link', (e) => cb(e.payload)),
   onAutoResult: (cb: (p: AutoResult) => void): Promise<UnlistenFn> => listen<AutoResult>('clipboard://auto-result', (e) => cb(e.payload)),
+  onToolProgress: (cb: (p: ToolProgress) => void): Promise<UnlistenFn> => listen<ToolProgress>('tools://progress', (e) => cb(e.payload)),
+  onBatch: (cb: (p: BatchProgress) => void): Promise<UnlistenFn> => listen<BatchProgress>('batch://progress', (e) => cb(e.payload)),
+  onPairRequest: (cb: (p: PairRequest) => void): Promise<UnlistenFn> => listen<PairRequest>('phone://pair-request', (e) => cb(e.payload)),
+  onPhoneReceived: (cb: (text: string) => void): Promise<UnlistenFn> => listen<string>('phone://received', (e) => cb(e.payload)),
+  onPowerCountdown: (cb: (p: { action: string; seconds: number }) => void): Promise<UnlistenFn> =>
+    listen<{ action: string; seconds: number }>('app://power-countdown', (e) => cb(e.payload)),
+  onLive: (cb: () => void): Promise<UnlistenFn> => listen('live://updated', () => cb()),
+  onSubs: (cb: () => void): Promise<UnlistenFn> => listen('subs://updated', () => cb()),
   onParseRequest: (cb: (text: string) => void): Promise<UnlistenFn> => listen<string>('app://parse-request', (e) => cb(e.payload)),
 }
 
-/** Rust 端的错误会序列化成字符串。 */
+function isAppError(e: unknown): e is AppErrorPayload {
+  return typeof e === 'object' && e !== null && 'message' in e && 'kind' in e
+}
+
+/** Rust 端的错误序列化为 `{ kind, message }`。 */
 export function errorText(e: unknown): string {
+  if (isAppError(e)) return e.message
   if (typeof e === 'string') return e
   if (e instanceof Error) return e.message
   return String(e)
+}
+
+export function errorKind(e: unknown): ErrorKind {
+  return isAppError(e) ? e.kind : 'other'
 }

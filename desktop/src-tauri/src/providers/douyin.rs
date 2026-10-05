@@ -44,22 +44,23 @@ impl Provider for Douyin {
             Some(id) => id,
             None => {
                 // 短链：跟随跳转拿到真实地址
-                let resp = ctx.client.get(url).send().await?;
+                let resp = ctx.get(url).send().await?;
                 let final_url = resp.url().to_string();
-                aweme_id_from_url(&final_url).ok_or_else(|| AppError::msg("没能从链接里识别出抖音作品 ID，链接可能已失效。"))?
+                aweme_id_from_url(&final_url).ok_or_else(|| AppError::not_found("没能从链接里识别出抖音作品 ID，链接可能已失效。"))?
             }
         };
 
         let page = format!("https://www.iesdouyin.com/share/video/{id}/");
-        let mut req = ctx.client.get(&page).header("Referer", "https://www.douyin.com/");
-        if let Some(cookie) = ctx.settings.cookie("douyin") {
+        let mut req = ctx.get(&page).header("Referer", "https://www.douyin.com/");
+        if let Some(cookie) = ctx.cookie(&page) {
             req = req.header("Cookie", cookie);
         }
         let resp = req.send().await?;
         if !resp.status().is_success() {
-            return Err(AppError::msg(format!("抖音分享页返回 {}，请稍后再试或在设置中登录抖音。", resp.status())));
+            return Err(AppError::from_status(resp.status().as_u16(), "抖音分享页").context_suffix("，请稍后再试或在设置中登录抖音。"));
         }
         let html = resp.text().await?;
+        ctx.record("douyin", "share-page", &page, &html);
         let item = item_from_share_html(&html)?;
         parse_item(&item, &id, url)
     }
@@ -72,19 +73,19 @@ pub fn aweme_id_from_url(url: &str) -> Option<String> {
 /// 从分享页 HTML 中取出作品 JSON（`item_list[0]`）。
 pub fn item_from_share_html(html: &str) -> AppResult<Value> {
     let data = super::extract_json_after(html, "window._ROUTER_DATA")
-        .ok_or_else(|| AppError::msg("抖音页面结构已变化，没有找到作品数据。请尝试远程解析模式或等待更新。"))?;
-    let loader = data.get("loaderData").and_then(Value::as_object).ok_or_else(|| AppError::msg("抖音页面数据缺少 loaderData。"))?;
+        .ok_or_else(|| AppError::parser("抖音页面结构已变化，没有找到作品数据。请尝试远程解析模式或等待更新。"))?;
+    let loader = data.get("loaderData").and_then(Value::as_object).ok_or_else(|| AppError::parser("抖音页面数据缺少 loaderData。"))?;
     for page in loader.values() {
         let Some(res) = page.get("videoInfoRes") else { continue };
         if let Some(item) = res.pointer("/item_list/0") {
             return Ok(item.clone());
         }
         if let Some(reason) = res.pointer("/filter_list/0/detail_msg").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-            return Err(AppError::msg(format!("作品不可访问：{reason}")));
+            return Err(AppError::not_found(format!("作品不可访问：{reason}")));
         }
-        return Err(AppError::msg("作品不存在、已删除或仅作者可见。"));
+        return Err(AppError::not_found("作品不存在、已删除或仅作者可见。"));
     }
-    Err(AppError::msg("抖音页面里没有作品信息，可能需要登录。请在设置中登录抖音后重试。"))
+    Err(AppError::need_login("抖音页面里没有作品信息，可能需要登录。请在设置中登录抖音后重试。"))
 }
 
 /// 把抖音作品 JSON 转成统一结构。
@@ -112,8 +113,11 @@ pub fn parse_item(item: &Value, id: &str, source_url: &str) -> AppResult<MediaIn
     } else {
         let w = u32_at(item, "/video/width");
         let h = u32_at(item, "/video/height");
-        let play = video_play_url(item).ok_or_else(|| AppError::msg("没有找到视频地址，作品可能已删除。"))?;
-        assets.push(Asset::video(play, w, h));
+        let play = video_play_url(item).ok_or_else(|| AppError::not_found("没有找到视频地址，作品可能已删除。"))?;
+        let mut default = Asset::video(play, w, h);
+        default.label = format!("视频 {}", default.quality.clone().unwrap_or_else(|| "MP4".into()));
+        assets.push(default);
+        assets.extend(bitrate_variants(item));
         (MediaKind::Video, w, h, u64_at(item, "/video/duration").filter(|d| *d > 0))
     };
 
@@ -138,6 +142,9 @@ pub fn parse_item(item: &Value, id: &str, source_url: &str) -> AppResult<MediaIn
         height,
         published_at,
         assets,
+        entries: vec![],
+        series: None,
+        extractor: Some("native".into()),
     })
 }
 
@@ -151,6 +158,30 @@ fn video_play_url(item: &Value) -> Option<String> {
         return Some(uri.to_string());
     }
     Some(format!("https://www.iesdouyin.com/aweme/v1/play/?video_id={uri}&ratio=1080p&line=0"))
+}
+
+/// `video.bit_rate` 里的其他清晰度 / 编码，按清晰度从高到低排列。
+fn bitrate_variants(item: &Value) -> Vec<Asset> {
+    let Some(list) = item.pointer("/video/bit_rate").and_then(Value::as_array) else { return vec![] };
+    let mut out: Vec<Asset> = list
+        .iter()
+        .filter_map(|b| {
+            let url = str_at(b, "/play_addr/url_list/0")?.replace("playwm", "play");
+            let gear = str_at(b, "/gear_name").map(String::from).unwrap_or_else(|| format!("q{}", u64_at(b, "/quality_type").unwrap_or(0)));
+            let h265 = u64_at(b, "/is_h265") == Some(1) || str_at(b, "/format").is_some_and(|f| f.contains("265"));
+            let mut a = Asset::video(url, u32_at(b, "/play_addr/width"), u32_at(b, "/play_addr/height"));
+            a.id = format!("video-{gear}");
+            a.vcodec = Some(if h265 { "h265".into() } else { "h264".into() });
+            a.bitrate = u64_at(b, "/bit_rate").map(|n| n / 1000);
+            a.filesize = u64_at(b, "/play_addr/data_size");
+            a.fps = u64_at(b, "/FPS").map(|f| f as f32);
+            a.label = format!("视频 {} {}", a.quality.clone().unwrap_or_else(|| gear.clone()), if h265 { "H.265" } else { "H.264" });
+            Some(a)
+        })
+        .collect();
+    out.sort_by(|a, b| b.short_side().cmp(&a.short_side()).then(b.bitrate.cmp(&a.bitrate)));
+    out.dedup_by(|a, b| a.id == b.id);
+    out
 }
 
 /// 图集图片优先选 jpeg 格式的地址，方便直接打开。
@@ -185,6 +216,12 @@ mod tests {
         assert_eq!(info.duration_ms, Some(47_000));
         assert_eq!(info.width, Some(1080));
         let video = info.assets.iter().find(|a| a.id == "video").unwrap();
+        let variants: Vec<_> = info.assets.iter().filter(|a| a.id.starts_with("video-")).collect();
+        assert_eq!(variants.len(), 2);
+        assert_eq!(variants[0].quality.as_deref(), Some("1080P"));
+        assert_eq!(variants[0].vcodec.as_deref(), Some("h265"));
+        assert_eq!(variants[0].filesize, Some(12_000_000));
+        assert_eq!(variants[1].quality.as_deref(), Some("720P"));
         assert!(video.url.contains("/play/") && !video.url.contains("playwm"), "{}", video.url);
         assert!(info.assets.iter().any(|a| a.id == "music"));
         assert!(info.assets.iter().any(|a| a.id == "cover"));

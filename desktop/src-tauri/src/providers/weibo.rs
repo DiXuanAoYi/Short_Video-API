@@ -42,28 +42,39 @@ impl Provider for Weibo {
         "https://m.weibo.cn/"
     }
 
+    async fn account_status(&self, ctx: &Ctx<'_>) -> AppResult<Option<super::AccountStatus>> {
+        let api = "https://m.weibo.cn/api/config";
+        let mut req = ctx.get(api).header("Referer", "https://m.weibo.cn/");
+        if let Some(c) = ctx.cookie(api) {
+            req = req.header("Cookie", c);
+        }
+        let v: Value = req.send().await?.json().await?;
+        let login = v.pointer("/data/login").and_then(Value::as_bool).unwrap_or(false);
+        Ok(Some(super::AccountStatus { logged_in: login, user_name: str_at(&v, "/data/uid").map(|u| format!("UID {u}")), vip: None }))
+    }
+
     async fn resolve(&self, ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo> {
         let id = match status_id_from_url(url) {
             Some(id) => id,
             None => {
                 // t.cn 等短链
-                let resp = ctx.client.get(url).send().await?;
+                let resp = ctx.get(url).send().await?;
                 status_id_from_url(resp.url().as_str())
                     .ok_or_else(|| AppError::msg("没能从链接里识别出微博 ID。目前支持单条微博链接（weibo.com/用户ID/微博ID 或 m.weibo.cn/status/…）。"))?
             }
         };
         let mut req = ctx
-            .client
             .get(format!("https://m.weibo.cn/statuses/show?id={id}"))
             .header("Referer", "https://m.weibo.cn/")
             .header("MWeibo-Pwa", "1")
             .header("X-Requested-With", "XMLHttpRequest");
-        if let Some(cookie) = ctx.settings.cookie("weibo") {
+        if let Some(cookie) = ctx.cookie("https://m.weibo.cn/") {
             req = req.header("Cookie", cookie);
         }
         let resp = req.send().await?;
         let text = resp.text().await?;
-        let data: Value = serde_json::from_str(&text).map_err(|_| AppError::msg("微博返回的不是有效数据，可能需要登录。请在设置中登录微博后重试。"))?;
+        ctx.record("weibo", "statuses-show", &format!("https://m.weibo.cn/statuses/show?id={id}"), &text);
+        let data: Value = serde_json::from_str(&text).map_err(|_| AppError::need_login("微博返回的不是有效数据，可能需要登录。请在设置中登录微博后重试。"))?;
         let status = status_data(&data)?;
         parse_status(status, &id, url)
     }
@@ -80,7 +91,7 @@ pub fn status_id_from_url(url: &str) -> Option<String> {
 pub fn status_data(v: &Value) -> AppResult<&Value> {
     if v.get("ok").and_then(Value::as_i64) != Some(1) {
         let msg = str_at(v, "/msg").unwrap_or("微博不存在、已删除或需要登录才能查看。");
-        return Err(AppError::msg(format!("微博：{msg}")));
+        return Err(AppError::classify(format!("微博：{msg}")));
     }
     v.get("data").filter(|d| d.is_object()).ok_or_else(|| AppError::msg("微博没有返回内容。"))
 }
@@ -137,6 +148,9 @@ pub fn parse_status(status: &Value, id: &str, source_url: &str) -> AppResult<Med
         height: assets.first().and_then(|a| a.height),
         published_at,
         assets,
+        entries: vec![],
+        series: None,
+        extractor: Some("native".into()),
     })
 }
 

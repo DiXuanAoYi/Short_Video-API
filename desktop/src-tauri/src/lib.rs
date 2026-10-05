@@ -1,11 +1,25 @@
 mod clipboard;
 mod commands;
+pub mod cookies;
 pub mod db;
+pub mod diagnostics;
 pub mod download;
+pub mod engine;
+pub mod error;
+pub mod live;
 pub mod model;
 pub mod naming;
+pub mod net;
+pub mod organize;
+pub mod phone;
+pub mod postprocess;
+pub mod power;
 pub mod providers;
+pub mod quality;
+pub mod secret;
 pub mod settings;
+pub mod subs;
+pub mod tools;
 mod tray;
 
 use std::path::PathBuf;
@@ -14,6 +28,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use tauri::{Manager, WindowEvent};
 
+use crate::cookies::CookieStore;
 use crate::db::Db;
 use crate::download::DownloadManager;
 use crate::settings::Settings;
@@ -31,15 +46,85 @@ pub struct AppState {
     pub clipboard_paused: AtomicBool,
     /// 程序自己写入剪贴板的内容，监听时忽略
     pub clipboard_ignore: Mutex<Option<String>>,
+    pub cookies: CookieStore,
+    pub samples_dir: PathBuf,
+    pub log_dir: PathBuf,
+    /// 最近一次注册全局快捷键失败的原因
+    pub shortcut_error: Mutex<Option<String>>,
+    /// 按网站分流的网络客户端、限速与请求间隔
+    pub net: Arc<net::NetManager>,
+    /// 程序管理的外部组件目录（yt-dlp、ffmpeg）
+    pub tools_dir: PathBuf,
+    pub tools: tools::ToolsState,
+    pub data_dir: PathBuf,
+    pub phone: phone::PhoneState,
+    /// 全部下载完成后的动作：none / sleep / shutdown（不保存，每次启动为 none）
+    pub after_all_done: Mutex<String>,
+    pub subs: subs::SubsState,
+    pub live: live::LiveState,
 }
 
 impl AppState {
     pub fn settings(&self) -> Settings {
         self.settings.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
+
+    /// 解析用的上下文；开启“录制样本”时附带样本目录。
+    pub fn parse_ctx<'a>(&'a self, settings: &'a Settings) -> providers::Ctx<'a> {
+        let mut ctx = providers::Ctx::new(&self.client, settings, &self.cookies);
+        ctx.net = Some(&self.net);
+        if settings.record_samples {
+            ctx.samples = Some(self.samples_dir.clone());
+        }
+        if settings.use_ytdlp {
+            ctx.ytdlp = tools::resolve(self, tools::Tool::YtDlp);
+        }
+        ctx.ffmpeg = tools::resolve(self, tools::Tool::Ffmpeg);
+        ctx
+    }
+}
+
+/// 定期检查即将过期的登录 Cookie 并发送通知（每个账号每天最多提醒一次）。
+fn spawn_account_reminders(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut notified: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+        loop {
+            let st = app.state::<Arc<AppState>>().inner().clone();
+            let now = db::now();
+            for a in st.cookies.summaries() {
+                let Some(exp) = a.expires_at else { continue };
+                let left = exp - now;
+                if left > 3 * 86400 || notified.get(&a.id).is_some_and(|t| now - t < 86400) {
+                    continue;
+                }
+                let body = if left <= 0 {
+                    format!("{}账号“{}”的登录状态已过期，需要登录的内容将无法下载。", a.site_name, a.label)
+                } else {
+                    format!("{}账号“{}”的登录状态将在 {} 小时后过期。", a.site_name, a.label, left / 3600 + 1)
+                };
+                use tauri_plugin_notification::NotificationExt;
+                let _ = app.notification().builder().title("登录即将失效").body(body).show();
+                notified.insert(a.id.clone(), now);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
+        }
+    });
+}
+
+/// 便携模式：程序目录下有 `portable` 文件（或 `data` 目录）时，设置、数据和日志都保存在程序目录的 `data` 下。
+pub fn portable_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    (dir.join("portable").exists() || dir.join("data").is_dir()).then(|| dir.join("data"))
 }
 
 pub fn run() {
+    let portable = portable_dir();
+    let log_target = match &portable {
+        Some(p) => tauri_plugin_log::TargetKind::Folder { path: p.join("logs"), file_name: Some("clearclip".into()) },
+        None => tauri_plugin_log::TargetKind::LogDir { file_name: Some("clearclip".into()) },
+    };
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             tray::show_main(app);
@@ -48,6 +133,15 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec!["--autostart"])))
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .targets([tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout), tauri_plugin_log::Target::new(log_target)])
+                .level(log::LevelFilter::Info)
+                .max_file_size(2 * 1024 * 1024)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(5))
+                .build(),
+        )
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {
@@ -59,12 +153,30 @@ pub fn run() {
         )
         .setup(|app| {
             let handle = app.handle().clone();
-            let config_dir = app.path().app_config_dir()?;
-            let data_dir = app.path().app_data_dir()?;
+            let (config_dir, data_dir) = match portable_dir() {
+                Some(p) => (p.clone(), p),
+                None => (app.path().app_config_dir()?, app.path().app_data_dir()?),
+            };
             let default_dl = app.path().download_dir().or_else(|_| app.path().home_dir()).unwrap_or_else(|_| PathBuf::from(".")).join("ClearClip");
             let settings_path = config_dir.join("settings.json");
-            let settings = Settings::load(&settings_path, &default_dl);
+            let mut settings = Settings::load(&settings_path, &default_dl);
             let db = Db::open(&data_dir.join("clearclip.db")).map_err(|e| e.to_string())?;
+            let log_dir = if portable_dir().is_some() { data_dir.join("logs") } else { app.path().app_log_dir().unwrap_or_else(|_| data_dir.join("logs")) };
+            log::info!("ClearClip {} starting on {}", app.package_info().version, std::env::consts::OS);
+
+            let key = secret::load_or_create_key(&data_dir);
+            let cookie_store = CookieStore::open(cookies::store_path(&data_dir), key.key, key.in_keyring);
+            if !settings.cookies.is_empty() {
+                match cookie_store.migrate_legacy(&settings.cookies) {
+                    Ok(n) => {
+                        log::info!("migrated {n} legacy cookie entries into the encrypted store");
+                        settings.cookies.clear();
+                        settings.cookie_updated_at.clear();
+                        let _ = settings.save(&settings_path);
+                    }
+                    Err(e) => log::warn!("legacy cookie migration failed: {e}"),
+                }
+            }
 
             app.manage(Arc::new(AppState {
                 settings: RwLock::new(settings.clone()),
@@ -75,11 +187,39 @@ pub fn run() {
                 downloads: DownloadManager::default(),
                 clipboard_paused: AtomicBool::new(false),
                 clipboard_ignore: Mutex::new(None),
+                cookies: cookie_store,
+                samples_dir: diagnostics::samples_dir(&data_dir),
+                log_dir,
+                shortcut_error: Mutex::new(None),
+                net: Arc::new(net::NetManager::default()),
+                tools_dir: data_dir.join("tools"),
+                tools: tools::ToolsState::default(),
+                data_dir: data_dir.clone(),
+                phone: phone::PhoneState::default(),
+                after_all_done: Mutex::new("none".into()),
+                subs: subs::SubsState::default(),
+                live: live::LiveState::default(),
             }));
+            // 媒体库封面缓存通过 asset 协议显示
+            let covers = data_dir.join("covers");
+            let _ = std::fs::create_dir_all(&covers);
+            let _ = app.asset_protocol_scope().allow_directory(&covers, false);
+            download::restore(&handle);
+            download::spawn_timer(&handle);
+            spawn_account_reminders(handle.clone());
 
             tray::create(&handle)?;
             commands::apply_shortcut(&handle, &settings.shortcut);
             clipboard::start_watcher(handle.clone());
+            phone::restore(&handle);
+            subs::spawn_scheduler(&handle);
+            live::spawn_monitor(&handle);
+            // 开机自启时只在托盘运行
+            if std::env::args().any(|a| a == "--autostart") {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.hide();
+                }
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -103,6 +243,11 @@ pub fn run() {
                 }
             }
         })
+        // 构建时提供了签名公钥才启用程序内更新；否则注册一个空插件占位（读取同名配置，但不做任何事）
+        .plugin(match commands::UPDATER_PUBKEY.filter(|k| !k.is_empty()) {
+            Some(key) => tauri_plugin_updater::Builder::new().pubkey(key).build(),
+            None => tauri::plugin::Builder::<tauri::Wry, tauri_plugin_updater::Config>::new("updater").build(),
+        })
         .invoke_handler(tauri::generate_handler![
             commands::get_app_info,
             commands::get_settings,
@@ -111,6 +256,48 @@ pub fn run() {
             commands::resolve_link,
             commands::resolve_and_enqueue,
             commands::enqueue,
+            commands::enqueue_entries,
+            commands::tools_status,
+            commands::install_tool,
+            commands::rollback_tool,
+            commands::import_tool,
+            commands::list_extractors,
+            commands::open_tools_dir,
+            commands::make_slideshow,
+            commands::live_rooms,
+            commands::live_check,
+            commands::live_add,
+            commands::live_update,
+            commands::live_set_monitoring,
+            commands::live_delete,
+            commands::live_start,
+            commands::live_stop,
+            commands::live_recordings,
+            commands::subs_list,
+            commands::subs_preview,
+            commands::subs_add,
+            commands::subs_update,
+            commands::subs_set_paused,
+            commands::subs_delete,
+            commands::subs_check,
+            commands::subs_items,
+            commands::subs_download_items,
+            commands::subs_ignore_items,
+            commands::subs_clear_new,
+            commands::library_platforms,
+            commands::redownload,
+            commands::health_check,
+            commands::move_task,
+            commands::schedule_task,
+            commands::get_after_all_done,
+            commands::set_after_all_done,
+            commands::read_links_file,
+            commands::is_portable,
+            commands::phone_info,
+            commands::phone_enable,
+            commands::phone_reset_token,
+            commands::phone_revoke,
+            commands::phone_pair_respond,
             commands::list_tasks,
             commands::pause_task,
             commands::resume_task,
@@ -124,6 +311,19 @@ pub fn run() {
             commands::clear_history,
             commands::list_library,
             commands::delete_library,
+            commands::list_orphan_parts,
+            commands::delete_orphan_parts,
+            commands::list_accounts,
+            commands::import_cookies_file,
+            commands::import_cookies_text,
+            commands::rename_account,
+            commands::set_default_account,
+            commands::delete_account,
+            commands::check_account,
+            commands::test_route,
+            commands::get_diagnostics,
+            commands::open_log_dir,
+            commands::open_samples_dir,
             commands::copy_text,
             commands::open_file,
             commands::reveal_file,
@@ -133,6 +333,7 @@ pub fn run() {
             commands::open_login,
             commands::save_login_cookies,
             commands::check_update,
+            commands::install_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ClearClip");

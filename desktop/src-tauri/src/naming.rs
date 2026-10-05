@@ -25,7 +25,53 @@ pub fn render_base(template: &str, info: &MediaInfo) -> String {
     if name.is_empty() {
         name = "clearclip".into();
     }
-    name
+    avoid_reserved(name)
+}
+
+/// 剧集命名：模板如 `{series}/第{episode}集`，`/` 分隔子文件夹。返回（子文件夹列表，文件名主体）；
+/// 不是剧集或模板为空时返回 None。额外变量：{series} {season} {episode}。
+pub fn render_series(template: &str, info: &MediaInfo) -> Option<(Vec<String>, String)> {
+    let series = info.series.as_ref()?;
+    if template.trim().is_empty() || series.name.trim().is_empty() {
+        return None;
+    }
+    let ep = series.episode.map(|e| e.to_string()).unwrap_or_else(|| info.id.clone());
+    let season = series.season.map(|s| s.to_string()).unwrap_or_default();
+    let name: String = clean_title(&series.name).chars().take(MAX_TITLE_CHARS).collect();
+    let mut parts: Vec<String> = template
+        .split(['/', '\\'])
+        .map(|p| p.replace("{series}", &name).replace("{season}", &season).replace("{episode}", &ep))
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| render_base(&p, info))
+        .collect();
+    let base = parts.pop()?;
+    Some((parts, base))
+}
+
+/// Windows 不允许 CON、NUL、COM1 等作为文件名（不论扩展名），在后面加下划线。
+pub fn avoid_reserved(name: String) -> String {
+    let stem = name.split('.').next().unwrap_or("").trim().to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT")) && stem.len() == 4 && stem.as_bytes()[3].is_ascii_digit() && stem.as_bytes()[3] != b'0');
+    if reserved {
+        format!("{name}_")
+    } else {
+        name
+    }
+}
+
+/// Windows 传统路径上限约 260 字符。完整路径过长时缩短文件名主体（保留后缀）。
+pub fn fit_path(dir: &Path, base: &str, asset: &Asset, max_len: usize) -> PathBuf {
+    let mut base: String = base.to_string();
+    loop {
+        let path = dir.join(file_name(&base, asset));
+        // 预留 ".part" 和 " (99)" 的长度
+        if path.as_os_str().len() + 10 <= max_len || base.chars().count() <= 8 {
+            return path;
+        }
+        let keep = base.chars().count().saturating_sub(4).max(8);
+        base = base.chars().take(keep).collect::<String>().trim_end().to_string();
+    }
 }
 
 /// 资源对应的文件名（不含目录）。
@@ -35,6 +81,7 @@ pub fn file_name(base: &str, asset: &Asset) -> String {
         AssetKind::Image => format!("_{:02}", asset.index.unwrap_or(0) + 1),
         AssetKind::Audio => "_music".into(),
         AssetKind::Cover => "_cover".into(),
+        AssetKind::Subtitle => format!(".{}", sanitize(asset.quality.as_deref().unwrap_or("sub"))),
     };
     format!("{base}{suffix}.{}", asset.ext)
 }
@@ -112,6 +159,9 @@ mod tests {
             height: None,
             published_at: Some(1_727_856_000),
             assets: vec![],
+            entries: vec![],
+            series: None,
+            extractor: None,
         }
     }
 
@@ -137,8 +187,40 @@ mod tests {
     }
 
     #[test]
+    fn reserved_names_are_escaped() {
+        assert_eq!(avoid_reserved("CON".into()), "CON_");
+        assert_eq!(avoid_reserved("nul.txt".into()), "nul.txt_");
+        assert_eq!(avoid_reserved("COM1".into()), "COM1_");
+        assert_eq!(avoid_reserved("COM0".into()), "COM0");
+        assert_eq!(avoid_reserved("CONSOLE".into()), "CONSOLE");
+        let mut i = info();
+        i.title = "AUX".into();
+        assert_eq!(render_base("{title}", &i), "AUX_");
+    }
+
+    #[test]
+    fn long_paths_are_shortened() {
+        let dir = PathBuf::from("/d".repeat(60));
+        let base = "很长的标题".repeat(30);
+        let p = fit_path(&dir, &base, &Asset::video("u".into(), None, None), 240);
+        assert!(p.as_os_str().len() + 10 <= 240, "{}", p.as_os_str().len());
+        assert!(p.to_string_lossy().ends_with(".mp4"));
+    }
+
+    #[test]
     fn unique_path_appends_counter() {
         let taken = |p: &Path| p.ends_with("a.mp4") || p.ends_with("a (1).mp4");
         assert_eq!(unique_path(PathBuf::from("/x/a.mp4"), &taken), PathBuf::from("/x/a (2).mp4"));
+    }
+
+    #[test]
+    fn series_template() {
+        let mut i = info();
+        assert!(render_series("{series}/第{episode}集", &i).is_none());
+        i.series = Some(crate::model::SeriesInfo { name: "山野/日常".into(), season: Some(2), episode: Some(7) });
+        let (dirs, base) = render_series("{series}/S{season}/第{episode}集 {title}", &i).unwrap();
+        assert_eq!(dirs, vec!["山野_日常", "S2"]);
+        assert!(base.starts_with("第7集 秋天第一锅"), "{base}");
+        assert!(render_series("", &i).is_none());
     }
 }

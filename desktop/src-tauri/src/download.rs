@@ -1,28 +1,34 @@
-//! 下载队列：并发控制、暂停 / 继续（断点续传）、失败重试、直链过期自动重新解析。
+//! 下载队列：任务持久化、并发与按网站限流、暂停 / 继续、断点续传、失败重试、直链过期重新解析、
+//! 多输入任务（音视频分离时先分别下载再合并）、临时目录与文件冲突策略。
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use futures_util::StreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::io::AsyncWriteExt;
+use tokio::sync::watch;
 
-use crate::db::{self, NewDownload};
-use crate::model::{AppResult, Asset, AssetKind, MediaInfo};
-use crate::{naming, providers, AppState};
+use crate::db::{self, JobRow, NewDownload};
+use crate::engine::hls::{self as hls_engine, HlsOptions};
+use crate::engine::http::{self as http_engine, HttpOptions, HttpRequest};
+use crate::engine::{wait_ctrl, DlError, ResumeMeta, CTRL_CANCEL, CTRL_PAUSE, CTRL_RUN};
+use crate::error::ErrorKind;
+use crate::model::{AppResult, Asset, AssetKind, MediaInfo, Protocol};
+use crate::settings::{ConflictPolicy, Settings};
+use crate::{naming, postprocess, providers, AppState};
 
-const CTRL_RUN: u8 = 0;
-const CTRL_PAUSE: u8 = 1;
-const CTRL_CANCEL: u8 = 2;
-const MAX_NET_RETRIES: u32 = 3;
+/// 下载中进度写入数据库的最小间隔
+const PERSIST_EVERY: Duration = Duration::from_secs(2);
+/// 留给 ".part" 和重名序号的路径长度余量后，路径的上限
+const MAX_PATH_LEN: usize = 240;
 
 pub const EVT_TASKS: &str = "tasks://updated";
 pub const EVT_PROGRESS: &str = "tasks://progress";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub use crate::engine::http::build_download_client;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TaskStatus {
     Queued,
@@ -33,10 +39,78 @@ pub enum TaskStatus {
     Canceled,
 }
 
+impl TaskStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            TaskStatus::Queued => "queued",
+            TaskStatus::Running => "running",
+            TaskStatus::Paused => "paused",
+            TaskStatus::Done => "done",
+            TaskStatus::Failed => "failed",
+            TaskStatus::Canceled => "canceled",
+        }
+    }
+
+    fn parse(s: &str) -> TaskStatus {
+        match s {
+            "queued" => TaskStatus::Queued,
+            "running" => TaskStatus::Running,
+            "done" => TaskStatus::Done,
+            "failed" => TaskStatus::Failed,
+            "canceled" => TaskStatus::Canceled,
+            _ => TaskStatus::Paused,
+        }
+    }
+}
+
+/// 后处理选项（阶段 3、4 逐步实现）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PostOptions {
+    /// 提取音频为 mp3 / m4a
+    pub extract_audio: Option<String>,
+    /// 写入封面和标题等元数据
+    pub embed_metadata: bool,
+}
+
+/// 一个下载任务的内容：一个或多个输入（音视频分离时为视频轨 + 音频轨），完成后合并为一个文件。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobSpec {
+    pub inputs: Vec<Asset>,
+    #[serde(default)]
+    pub post: PostOptions,
+    /// 排序优先级：越大越先开始
+    #[serde(default)]
+    pub priority: i64,
+    /// 定时开始（Unix 秒）；未到时间时保持等待
+    #[serde(default)]
+    pub start_at: Option<i64>,
+    /// 来源：manual（默认）/ subscription / live
+    #[serde(default)]
+    pub origin: Option<String>,
+    /// 来自订阅时对应的条目（订阅 ID，条目 ID），完成后更新条目状态
+    #[serde(default)]
+    pub sub_item: Option<(i64, String)>,
+}
+
+impl JobSpec {
+    fn primary(&self) -> &Asset {
+        &self.inputs[0]
+    }
+}
+
+/// 每个输入各自的续传信息。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct JobMeta {
+    pub inputs: Vec<ResumeMeta>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskSnapshot {
-    pub id: u64,
+    pub id: i64,
     pub platform: String,
     pub platform_name: String,
     pub media_id: String,
@@ -52,40 +126,66 @@ pub struct TaskSnapshot {
     pub total: Option<u64>,
     pub speed: u64,
     pub error: Option<String>,
+    pub error_kind: Option<ErrorKind>,
     pub note: Option<String>,
+    pub resumable: Option<bool>,
+    /// 当前步骤：download / merge / post
+    pub step: Option<String>,
+    /// 输入数量（大于 1 时需要合并）
+    pub inputs: usize,
+    pub priority: i64,
+    pub start_at: Option<i64>,
     pub created_at: i64,
     pub finished_at: Option<i64>,
 }
 
 struct Entry {
     snap: TaskSnapshot,
-    asset: Asset,
+    spec: JobSpec,
     media: Arc<MediaInfo>,
-    control: Arc<AtomicU8>,
+    ctrl: watch::Sender<u8>,
+    meta: JobMeta,
 }
 
 #[derive(Default)]
 pub struct DownloadManager {
-    inner: Mutex<Inner>,
+    inner: Mutex<Vec<Entry>>,
 }
 
-#[derive(Default)]
-struct Inner {
-    tasks: Vec<Entry>,
-    next_id: u64,
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnqueueResult {
+    pub tasks: Vec<TaskSnapshot>,
+    /// 之前已下载过（或目标文件已存在且策略为跳过）而跳过的数量
+    pub already_downloaded: usize,
+    /// 已经在队列里（等待、下载中、暂停、失败）而跳过的数量
+    pub already_queued: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrphanPart {
+    pub path: String,
+    pub size: u64,
+    pub modified: i64,
 }
 
 impl DownloadManager {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Entry>> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn snapshots(&self) -> Vec<TaskSnapshot> {
-        self.lock().tasks.iter().map(|e| e.snap.clone()).collect()
+        self.lock().iter().map(|e| e.snap.clone()).collect()
+    }
+
+    /// 是否有正在下载的任务（定时未到的不算）。
+    pub fn has_active_running(&self) -> bool {
+        self.lock().iter().any(|e| e.snap.status == TaskStatus::Running)
     }
 
     pub fn has_active(&self) -> bool {
-        self.lock().tasks.iter().any(|e| matches!(e.snap.status, TaskStatus::Running | TaskStatus::Queued))
+        self.lock().iter().any(|e| matches!(e.snap.status, TaskStatus::Running | TaskStatus::Queued))
     }
 }
 
@@ -97,189 +197,814 @@ fn emit_all(app: &AppHandle) {
     let _ = app.emit(EVT_TASKS, state(app).downloads.snapshots());
 }
 
-/// 把作品中选中的资源加入队列。
-pub fn enqueue(app: &AppHandle, media: MediaInfo, asset_ids: &[String]) -> AppResult<Vec<TaskSnapshot>> {
-    let st = state(app);
-    let settings = st.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
-    let media = Arc::new(media);
-    let dir = naming::target_dir(&settings.download_root(), &media, settings.subfolder_by_platform);
-    let base = naming::render_base(&settings.filename_template, &media);
+fn persist(st: &AppState, e: &Entry) {
+    let meta = serde_json::to_string(&e.meta).unwrap_or_else(|_| "{}".into());
+    if let Err(err) = st.db.update_job(
+        e.snap.id,
+        e.snap.status.as_str(),
+        e.snap.received as i64,
+        e.snap.total.map(|t| t as i64),
+        e.snap.error.as_deref(),
+        &e.snap.file_path,
+        &meta,
+        e.snap.finished_at,
+    ) {
+        log::warn!("persist job {} failed: {err}", e.snap.id);
+    }
+}
 
-    let mut created = Vec::new();
+fn file_len(p: &Path) -> u64 {
+    std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+}
+
+/// 第 `i` 个输入的临时文件路径：设置了临时目录时放在临时目录，否则与目标文件同目录。
+pub fn input_part_path(settings: &Settings, job_id: i64, final_path: &Path, i: usize, count: usize) -> PathBuf {
+    if !settings.temp_dir.is_empty() {
+        return PathBuf::from(&settings.temp_dir).join(format!("clearclip-{job_id}-{i}.part"));
+    }
+    if count == 1 {
+        part_path(final_path)
+    } else {
+        let mut s = final_path.as_os_str().to_owned();
+        s.push(format!(".f{i}.part"));
+        PathBuf::from(s)
+    }
+}
+
+fn parse_spec(json: &str) -> Option<JobSpec> {
+    serde_json::from_str::<JobSpec>(json).ok().filter(|s| !s.inputs.is_empty()).or_else(|| {
+        serde_json::from_str::<Asset>(json).ok().map(|a| JobSpec {
+            inputs: vec![a],
+            post: PostOptions::default(),
+            priority: 0,
+            start_at: None,
+            origin: None,
+            sub_item: None,
+        })
+    })
+}
+
+fn parse_meta(json: &str) -> JobMeta {
+    serde_json::from_str::<JobMeta>(json)
+        .ok()
+        .filter(|m| !m.inputs.is_empty())
+        .or_else(|| serde_json::from_str::<ResumeMeta>(json).ok().map(|m| JobMeta { inputs: vec![m] }))
+        .unwrap_or_default()
+}
+
+/// 已下载的字节数：分段下载的文件是预分配的，按各段记录的进度计算；单线程下载按临时文件大小计算。
+fn received_on_disk(settings: &Settings, id: i64, path: &str, inputs: usize, meta: &JobMeta) -> u64 {
+    let empty = ResumeMeta::default();
+    (0..inputs).map(|i| input_received(&input_part_path(settings, id, Path::new(path), i, inputs), meta.inputs.get(i).unwrap_or(&empty))).sum()
+}
+
+/// 启动时从数据库恢复任务：未完成的任务恢复为“已暂停”（或按设置自动继续），进度以临时文件实际大小为准。
+pub fn restore(app: &AppHandle) {
+    let st = state(app);
+    let settings = st.settings();
+    let rows = match st.db.load_jobs() {
+        Ok(r) => r,
+        Err(e) => {
+            log::error!("load jobs failed: {e}");
+            return;
+        }
+    };
+    let mut restored = 0;
     {
-        let mut inner = st.downloads.lock();
-        for asset in media.assets.iter().filter(|a| asset_ids.contains(&a.id)) {
-            inner.next_id += 1;
-            let id = inner.next_id;
-            let existing = if settings.skip_existing { st.db.existing_download(&media.platform, &media.id, &asset.id)? } else { None };
-            let (status, path, note) = match existing {
-                Some(p) => (TaskStatus::Done, PathBuf::from(p), Some("之前已下载，已跳过".to_string())),
-                None => {
-                    let wanted = dir.join(naming::file_name(&base, asset));
-                    let taken_by_queue: Vec<String> =
-                        inner.tasks.iter().filter(|e| e.snap.status != TaskStatus::Canceled).map(|e| e.snap.file_path.clone()).collect();
-                    let path = naming::unique_path(wanted, &|p: &Path| p.exists() || part_path(p).exists() || taken_by_queue.iter().any(|t| Path::new(t) == p));
-                    (TaskStatus::Queued, path, None)
+        let mut list = st.downloads.lock();
+        for row in rows {
+            let (Ok(media), Some(spec)) = (serde_json::from_str::<MediaInfo>(&row.media_json), parse_spec(&row.asset_json)) else {
+                log::warn!("skip unreadable job {}", row.id);
+                continue;
+            };
+            let meta = parse_meta(&row.meta_json);
+            let mut status = TaskStatus::parse(&row.status);
+            if matches!(status, TaskStatus::Running | TaskStatus::Queued) {
+                status = if settings.auto_resume { TaskStatus::Queued } else { TaskStatus::Paused };
+            }
+            let received = if status == TaskStatus::Done {
+                row.received.max(0) as u64
+            } else {
+                received_on_disk(&settings, row.id, &row.file_path, spec.inputs.len(), &meta)
+            };
+            let (ctrl, _) = watch::channel(CTRL_RUN);
+            let mut snap = snapshot_for(row.id, &media, &spec, &row.file_path, status, row.created_at);
+            snap.received = received;
+            snap.total = row.total.map(|t| t as u64);
+            snap.resumable = meta.inputs.first().and_then(|m| m.resumable);
+            snap.error = row.error;
+            snap.finished_at = row.finished_at;
+            if status == TaskStatus::Paused && received > 0 {
+                snap.note = Some(format!("上次下载到 {}，继续时从这里开始", human_bytes(received)));
+            }
+            let e = Entry { snap, spec, media: Arc::new(media), ctrl, meta };
+            persist(&st, &e);
+            list.push(e);
+            restored += 1;
+        }
+    }
+    log::info!("restored {restored} download tasks");
+    schedule(app);
+}
+
+fn snapshot_for(id: i64, media: &MediaInfo, spec: &JobSpec, path: &str, status: TaskStatus, created_at: i64) -> TaskSnapshot {
+    let a = spec.primary();
+    let label = if spec.inputs.len() > 1 { format!("{}（音视频合并）", a.label) } else { a.label.clone() };
+    TaskSnapshot {
+        id,
+        platform: media.platform.clone(),
+        platform_name: media.platform_name.clone(),
+        media_id: media.id.clone(),
+        title: media.title.clone(),
+        author: media.author.clone(),
+        cover: media.cover.clone(),
+        asset_id: a.id.clone(),
+        asset_label: label,
+        asset_kind: a.kind,
+        file_path: path.to_string(),
+        status,
+        received: 0,
+        total: None,
+        speed: 0,
+        error: None,
+        error_kind: None,
+        note: None,
+        resumable: None,
+        step: None,
+        inputs: spec.inputs.len(),
+        priority: spec.priority,
+        start_at: spec.start_at,
+        created_at,
+        finished_at: None,
+    }
+}
+
+/// 根据选中的资源 ID 组成任务：无声视频轨自动带上它的音频轨，合并成一个任务。
+pub fn build_specs(media: &MediaInfo, asset_ids: &[String]) -> Vec<JobSpec> {
+    media
+        .assets
+        .iter()
+        .filter(|a| asset_ids.contains(&a.id))
+        .map(|a| {
+            let mut inputs = vec![a.clone()];
+            if a.kind == AssetKind::Video && a.has_audio == Some(false) {
+                if let Some(audio) = a.pair_audio.as_deref().and_then(|id| media.asset(id)) {
+                    inputs.push(audio.clone());
+                }
+            }
+            JobSpec { inputs, post: PostOptions::default(), priority: 0, start_at: None, origin: None, sub_item: None }
+        })
+        .collect()
+}
+
+/// 把作品中选中的资源加入队列。已在队列中、之前已下载过的资源会跳过。
+pub fn enqueue(app: &AppHandle, media: MediaInfo, asset_ids: &[String]) -> AppResult<EnqueueResult> {
+    enqueue_with(app, media, asset_ids, PostOptions::default())
+}
+
+pub fn enqueue_with(app: &AppHandle, media: MediaInfo, asset_ids: &[String], post: PostOptions) -> AppResult<EnqueueResult> {
+    enqueue_ext(app, media, asset_ids, post, EnqueueExtra::default())
+}
+
+/// 订阅等来源的额外选项。
+#[derive(Debug, Clone, Default)]
+pub struct EnqueueExtra {
+    /// 保存目录（替代下载目录）
+    pub dir: Option<PathBuf>,
+    /// 文件命名模板（替代设置里的模板）
+    pub template: Option<String>,
+    pub origin: Option<String>,
+    /// 对应的订阅条目（订阅 ID，条目 ID）
+    pub sub_item: Option<(i64, String)>,
+}
+
+pub fn enqueue_ext(app: &AppHandle, media: MediaInfo, asset_ids: &[String], post: PostOptions, extra: EnqueueExtra) -> AppResult<EnqueueResult> {
+    let st = state(app);
+    let settings = st.settings();
+    let media = Arc::new(media);
+    let root = extra.dir.clone().unwrap_or_else(|| settings.download_root());
+    let mut dir = if extra.dir.is_some() { root } else { naming::target_dir(&root, &media, settings.subfolder_by_platform) };
+    let base = match (&extra.template, naming::render_series(&settings.series_template, &media)) {
+        (Some(t), _) if !t.trim().is_empty() => naming::render_base(t, &media),
+        (_, Some((dirs, base))) => {
+            dir.extend(dirs);
+            base
+        }
+        _ => naming::render_base(&settings.filename_template, &media),
+    };
+    let media_json = serde_json::to_string(&*media)?;
+
+    let mut result = EnqueueResult { tasks: vec![], already_downloaded: 0, already_queued: 0 };
+    {
+        let mut list = st.downloads.lock();
+        for mut spec in build_specs(&media, asset_ids) {
+            spec.post = post.clone();
+            spec.origin = extra.origin.clone();
+            spec.sub_item = extra.sub_item.clone();
+            let primary = spec.primary().clone();
+            let in_queue = list.iter().any(|e| {
+                e.snap.platform == media.platform
+                    && e.snap.media_id == media.id
+                    && e.snap.asset_id == primary.id
+                    && matches!(e.snap.status, TaskStatus::Queued | TaskStatus::Running | TaskStatus::Paused | TaskStatus::Failed)
+            });
+            if in_queue {
+                result.already_queued += 1;
+                continue;
+            }
+            if settings.skip_existing && st.db.existing_download(&media.platform, &media.id, &primary.id)?.is_some() {
+                result.already_downloaded += 1;
+                continue;
+            }
+            let mut out_asset = primary.clone();
+            if spec.inputs.len() > 1 && settings.merge_container == "mkv" {
+                out_asset.ext = "mkv".into();
+            }
+            if let Some(fmt) = &spec.post.extract_audio {
+                out_asset.ext = fmt.clone();
+            }
+            let wanted = naming::fit_path(&dir, &base, &out_asset, MAX_PATH_LEN);
+            let path = match settings.conflict_policy {
+                ConflictPolicy::Skip if wanted.exists() => {
+                    result.already_downloaded += 1;
+                    continue;
+                }
+                ConflictPolicy::Overwrite => wanted,
+                _ => {
+                    // 已完成但文件已不在的任务不再占用文件名（重新下载时沿用原名）
+                    let taken: Vec<String> = list
+                        .iter()
+                        .filter(|e| e.snap.status != TaskStatus::Canceled && !(e.snap.status == TaskStatus::Done && !Path::new(&e.snap.file_path).exists()))
+                        .map(|e| e.snap.file_path.clone())
+                        .collect();
+                    naming::unique_path(wanted, &|p: &Path| p.exists() || part_path(p).exists() || taken.iter().any(|t| Path::new(t) == p))
                 }
             };
-            let snap = TaskSnapshot {
-                id,
-                platform: media.platform.clone(),
-                platform_name: media.platform_name.clone(),
-                media_id: media.id.clone(),
-                title: media.title.clone(),
-                author: media.author.clone(),
-                cover: media.cover.clone(),
-                asset_id: asset.id.clone(),
-                asset_label: asset.label.clone(),
-                asset_kind: asset.kind,
-                file_path: path.to_string_lossy().into_owned(),
-                status,
+            let path_str = path.to_string_lossy().into_owned();
+            let now = db::now();
+            let id = st.db.insert_job(&JobRow {
+                id: 0,
+                media_json: media_json.clone(),
+                asset_json: serde_json::to_string(&spec)?,
+                file_path: path_str.clone(),
+                status: "queued".into(),
                 received: 0,
                 total: None,
-                speed: 0,
                 error: None,
-                note,
-                created_at: db::now(),
-                finished_at: if status == TaskStatus::Done { Some(db::now()) } else { None },
-            };
-            created.push(snap.clone());
-            inner.tasks.push(Entry { snap, asset: asset.clone(), media: media.clone(), control: Arc::new(AtomicU8::new(CTRL_RUN)) });
+                meta_json: "{}".into(),
+                created_at: now,
+                finished_at: None,
+            })?;
+            let (ctrl, _) = watch::channel(CTRL_RUN);
+            let snap = snapshot_for(id, &media, &spec, &path_str, TaskStatus::Queued, now);
+            result.tasks.push(snap.clone());
+            let meta = JobMeta { inputs: vec![ResumeMeta::default(); spec.inputs.len()] };
+            list.push(Entry { snap, spec, media: media.clone(), ctrl, meta });
         }
     }
     schedule(app);
-    Ok(created)
+    Ok(result)
 }
 
-/// 按并发数启动等待中的任务。
+/// 每个网站同时下载的上限；带登录账号时更保守（减半，至少 1）。
+fn site_limit(st: &AppState, settings: &Settings, platform: &str) -> usize {
+    let base = settings.per_site_concurrency.max(1);
+    if st.cookies.has_account(platform) {
+        (base / 2).max(1)
+    } else {
+        base
+    }
+}
+
+/// 按全局并发数和按网站限流启动等待中的任务。
 pub fn schedule(app: &AppHandle) {
     let st = state(app);
-    let concurrency = st.settings.read().map(|s| s.concurrency).unwrap_or(3);
+    let settings = st.settings();
     let mut to_start = Vec::new();
     {
-        let mut inner = st.downloads.lock();
-        let mut running = inner.tasks.iter().filter(|e| e.snap.status == TaskStatus::Running).count();
-        for e in inner.tasks.iter_mut() {
-            if running >= concurrency {
+        let mut list = st.downloads.lock();
+        let mut running: Vec<String> = list.iter().filter(|e| e.snap.status == TaskStatus::Running).map(|e| e.snap.platform.clone()).collect();
+        let now = db::now();
+        // 按优先级（大的先）和加入顺序
+        let mut order: Vec<usize> = (0..list.len()).collect();
+        order.sort_by_key(|&i| (std::cmp::Reverse(list[i].spec.priority), list[i].snap.id));
+        for i in order {
+            if running.len() >= settings.concurrency {
                 break;
             }
-            if e.snap.status == TaskStatus::Queued {
-                e.snap.status = TaskStatus::Running;
-                e.snap.error = None;
-                e.control.store(CTRL_RUN, Ordering::SeqCst);
-                running += 1;
-                to_start.push(e.snap.id);
+            if list[i].snap.status != TaskStatus::Queued || list[i].spec.start_at.is_some_and(|t| t > now) {
+                continue;
             }
+            let platform = list[i].snap.platform.clone();
+            if running.iter().filter(|p| **p == platform).count() >= site_limit(&st, &settings, &platform) {
+                continue;
+            }
+            let e = &mut list[i];
+            e.snap.status = TaskStatus::Running;
+            e.snap.error = None;
+            e.snap.error_kind = None;
+            let _ = e.ctrl.send(CTRL_RUN);
+            running.push(platform);
+            to_start.push(e.snap.id);
+            persist(&st, e);
         }
     }
     for id in to_start {
         let app = app.clone();
         tauri::async_runtime::spawn(async move { run_task(app, id).await });
     }
+    crate::power::keep_awake(settings.prevent_sleep && st.downloads.has_active_running());
     emit_all(app);
 }
 
-async fn run_task(app: AppHandle, id: u64) {
+/// 定时任务：每 20 秒检查一次是否有到点的任务。
+pub fn spawn_timer(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            let st = state(&app);
+            let now = db::now();
+            let due = st.downloads.lock().iter().any(|e| e.snap.status == TaskStatus::Queued && e.spec.start_at.is_some_and(|t| t <= now));
+            if due {
+                schedule(&app);
+            }
+        }
+    });
+}
+
+/// 调整等待中任务的顺序：top / up / down / bottom。
+pub fn move_task(app: &AppHandle, id: i64, to: &str) {
+    let st = state(app);
+    {
+        let mut list = st.downloads.lock();
+        let waiting = |e: &Entry| matches!(e.snap.status, TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Failed);
+        let mut order: Vec<usize> = (0..list.len()).filter(|&i| waiting(&list[i])).collect();
+        order.sort_by_key(|&i| (std::cmp::Reverse(list[i].spec.priority), list[i].snap.id));
+        let Some(pos) = order.iter().position(|&i| list[i].snap.id == id) else { return };
+        reorder(&mut order, pos, to);
+        let n = order.len() as i64;
+        for (k, &i) in order.iter().enumerate() {
+            let p = n - k as i64;
+            if list[i].spec.priority != p {
+                list[i].spec.priority = p;
+                list[i].snap.priority = p;
+                let _ = st.db.update_job_asset(list[i].snap.id, &serde_json::to_string(&list[i].spec).unwrap_or_default());
+            }
+        }
+    }
+    emit_all(app);
+}
+
+/// 把 `pos` 处的元素移到 top / up / down / bottom。
+fn reorder<T>(v: &mut Vec<T>, pos: usize, to: &str) {
+    let item = v.remove(pos);
+    let new_pos = match to {
+        "top" => 0,
+        "up" => pos.saturating_sub(1),
+        "down" => (pos + 1).min(v.len()),
+        _ => v.len(),
+    };
+    v.insert(new_pos, item);
+}
+
+/// 设置定时开始时间（None 表示立即）；暂停或失败的任务会改为等待。
+pub fn schedule_task(app: &AppHandle, id: i64, start_at: Option<i64>) {
+    let st = state(app);
+    with_entry(&st, id, |e| {
+        e.spec.start_at = start_at;
+        e.snap.start_at = start_at;
+        if matches!(e.snap.status, TaskStatus::Paused | TaskStatus::Failed | TaskStatus::Canceled) {
+            e.snap.status = TaskStatus::Queued;
+            e.snap.error = None;
+            e.snap.error_kind = None;
+        }
+        let _ = st.db.update_job_asset(e.snap.id, &serde_json::to_string(&e.spec).unwrap_or_default());
+        persist(&st, e);
+    });
+    schedule(app);
+}
+
+fn with_entry<R>(st: &AppState, id: i64, f: impl FnOnce(&mut Entry) -> R) -> Option<R> {
+    let mut list = st.downloads.lock();
+    list.iter_mut().find(|e| e.snap.id == id).map(f)
+}
+
+fn build_request(st: &AppState, media: &MediaInfo, asset: &Asset) -> HttpRequest {
+    let mut req = HttpRequest::new(&asset.url);
+    let has = |k: &str| asset.headers.iter().any(|(h, _)| h.eq_ignore_ascii_case(k));
+    if !has("referer") {
+        req = req.header("Referer", providers::referer_for(&media.platform));
+    }
+    // Cookie 按域名匹配：只发给它所属的网站，不会发给 CDN
+    if let Some(c) = st.cookies.header_for(&asset.url) {
+        req = req.header("Cookie", c);
+    }
+    req.headers.extend(asset.headers.iter().cloned());
+    req
+}
+
+async fn run_task(app: AppHandle, id: i64) {
     let st = state(&app);
-    let Some((mut asset, media, control, final_path)) = ({
-        let inner = st.downloads.lock();
-        inner.tasks.iter().find(|e| e.snap.id == id).map(|e| (e.asset.clone(), e.media.clone(), e.control.clone(), PathBuf::from(&e.snap.file_path)))
-    }) else {
+    let Some((mut spec, media, mut rx, mut final_path, mut meta)) =
+        with_entry(&st, id, |e| (e.spec.clone(), e.media.clone(), e.ctrl.subscribe(), PathBuf::from(&e.snap.file_path), e.meta.clone()))
+    else {
         return;
     };
+    let settings = st.settings();
+    let count = spec.inputs.len();
+    meta.inputs.resize(count, ResumeMeta::default());
+    let parts: Vec<PathBuf> = (0..count).map(|i| input_part_path(&settings, id, &final_path, i, count)).collect();
+    let opts = HttpOptions {
+        segments: settings.segments,
+        min_segment_size: settings.segment_min_mb * 1024 * 1024,
+        speed_limit_kbps: settings.speed_limit_kbps,
+        disk_reserve: settings.disk_reserve_mb * 1024 * 1024,
+        net: Some(st.net.clone()),
+    };
+    let start_len: u64 = (0..count).map(|i| input_received(&parts[i], &meta.inputs[i])).sum();
+    if start_len > 0 {
+        set_note(&app, id, Some(&format!("从 {} 处继续下载", human_bytes(start_len))));
+    }
 
-    let part = part_path(&final_path);
-    let referer = providers::referer_for(&media.platform);
-    let cookie = st.settings.read().ok().and_then(|s| s.cookie(&media.platform).map(String::from));
-    let mut re_resolved = false;
-    let mut net_attempts = 0;
-
-    let outcome = loop {
-        if let Some(dir) = final_path.parent() {
-            if let Err(e) = tokio::fs::create_dir_all(dir).await {
-                break Err(DlError::Io(format!("无法创建目录 {}：{e}", dir.display())));
+    let mut outcome: Result<u64, DlError> = Ok(0);
+    let mut fmp4 = false;
+    for i in 0..count {
+        // 已完成的输入（合并前中断）直接跳过
+        if let Some(t) = meta.inputs[i].total {
+            if meta.inputs[i].segments.is_empty() && file_len(&parts[i]) == t {
+                continue;
             }
         }
-
-        let mut last = Instant::now();
-        let mut last_bytes = 0u64;
-        let app2 = app.clone();
-        let st2 = st.clone();
-        let res = download_to_file(&st.dl_client, &asset.url, referer, cookie.as_deref(), &part, &control, |received, total| {
-            let elapsed = last.elapsed();
-            if elapsed < Duration::from_millis(250) && Some(received) != total {
-                return;
-            }
-            let speed = ((received.saturating_sub(last_bytes)) as f64 / elapsed.as_secs_f64().max(0.001)) as u64;
-            last = Instant::now();
-            last_bytes = received;
-            let snap = {
-                let mut inner = st2.downloads.lock();
-                inner.tasks.iter_mut().find(|e| e.snap.id == id).map(|e| {
-                    e.snap.received = received;
-                    e.snap.total = total;
-                    e.snap.speed = speed;
-                    e.snap.clone()
-                })
-            };
-            if let Some(s) = snap {
-                let _ = app2.emit(EVT_PROGRESS, s);
-            }
-        })
-        .await;
-
-        match res {
-            Err(DlError::Status(code)) if matches!(code, 403 | 404 | 410) && !re_resolved && !media.source_url.is_empty() => {
-                // 直链过期：重新解析拿新地址
-                re_resolved = true;
-                set_note(&app, id, Some("直链已过期，正在重新解析…"));
-                let settings = st.settings.read().map(|s| s.clone()).unwrap_or_default();
-                match providers::resolve_url(&st.client, &settings, &media.source_url).await {
-                    Ok(fresh) => match fresh.assets.iter().find(|a| a.id == asset.id) {
-                        Some(a) => {
-                            asset = a.clone();
-                            let _ = tokio::fs::remove_file(&part).await;
-                            let mut inner = st.downloads.lock();
-                            if let Some(e) = inner.tasks.iter_mut().find(|e| e.snap.id == id) {
-                                e.asset = asset.clone();
-                                e.snap.note = None;
-                            }
-                        }
-                        None => break Err(DlError::Other("重新解析后找不到这个资源".into())),
-                    },
-                    Err(e) => break Err(DlError::Other(format!("直链已过期，重新解析失败：{e}"))),
-                }
-            }
-            Err(DlError::Net(_)) if net_attempts < MAX_NET_RETRIES => {
-                net_attempts += 1;
-                set_note(&app, id, Some(&format!("网络中断，第 {net_attempts} 次重试…")));
-                tokio::time::sleep(Duration::from_secs(1 << net_attempts)).await;
-                if control.load(Ordering::SeqCst) != CTRL_RUN {
-                    break Err(if control.load(Ordering::SeqCst) == CTRL_PAUSE { DlError::Paused } else { DlError::Canceled });
-                }
-            }
-            other => break other,
+        set_step(&st, id, "download");
+        let done_before: u64 = (0..i).map(|k| meta.inputs[k].total.unwrap_or_else(|| file_len(&parts[k]))).sum();
+        outcome = download_input(&app, &st, &settings, id, &media, &mut spec, i, &parts[i], &mut meta, &mut rx, &opts, done_before, &mut fmp4).await;
+        if outcome.is_err() {
+            break;
         }
+    }
+
+    let final_part = if count > 1 { part_path(&final_path) } else { parts[0].clone() };
+    // 合并 / 转封装使用源格式的容器；需要提取音频时最终文件才是音频格式
+    let container = match &spec.post.extract_audio {
+        Some(_) => final_path.with_extension(if spec.primary().ext.is_empty() { "mp4" } else { spec.primary().ext.as_str() }),
+        None => final_path.clone(),
+    };
+    let mut outcome = match outcome {
+        Ok(_) if count > 1 => {
+            set_step(&st, id, "merge");
+            set_note(&app, id, Some("正在合并音视频…"));
+            let aac_fix = spec.inputs.iter().any(|a| a.protocol == Protocol::Hls) && !fmp4;
+            match postprocess::merge(&st, &parts, &final_part, &container, aac_fix).await {
+                Ok(()) => {
+                    for p in &parts {
+                        remove_part(p);
+                    }
+                    Ok(file_len(&final_part))
+                }
+                Err(e) => Err(DlError::Other(e.message)),
+            }
+        }
+        // Pixiv 动图：帧压缩包合成为视频
+        Ok(_) if providers::pixiv::ugoira_frames(spec.primary()).is_some() => {
+            set_step(&st, id, "post");
+            set_note(&app, id, Some("正在把动图合成为视频…"));
+            let frames = providers::pixiv::ugoira_frames(spec.primary()).unwrap_or_default();
+            let out = suffixed(&final_part, ".remux");
+            match postprocess::ugoira(&st, &final_part, &frames, &out).await {
+                Ok(ext) => {
+                    let _ = std::fs::remove_file(&final_part);
+                    let _ = std::fs::rename(&out, &final_part);
+                    final_path = final_path.with_extension(ext);
+                    Ok(file_len(&final_part))
+                }
+                Err(e) => {
+                    remove_part(&out);
+                    Err(DlError::Other(e.message))
+                }
+            }
+        }
+        // m3u8 拼接出的是 TS 流：有 ffmpeg 时无损转封装为 MP4，否则保存为 .ts
+        Ok(size) if spec.primary().protocol == Protocol::Hls => {
+            if postprocess::find_ffmpeg(&st).is_some() {
+                set_step(&st, id, "post");
+                set_note(&app, id, Some("正在转换为 MP4…"));
+                let out = suffixed(&final_part, ".remux");
+                match postprocess::remux(&st, &final_part, &out, &container, !fmp4).await {
+                    Ok(()) => {
+                        let _ = std::fs::rename(&out, &final_part);
+                        Ok(file_len(&final_part))
+                    }
+                    Err(e) => {
+                        remove_part(&out);
+                        Err(DlError::Other(e.message))
+                    }
+                }
+            } else {
+                if !fmp4 && spec.post.extract_audio.is_none() {
+                    final_path = final_path.with_extension("ts");
+                }
+                Ok(size)
+            }
+        }
+        other => other,
     };
 
-    let mut notify: Option<(String, String)> = None;
+    // 提取音频
+    if let (Ok(_), Some(fmt)) = (&outcome, spec.post.extract_audio.clone()) {
+        if spec.primary().ext != fmt {
+            set_step(&st, id, "post");
+            set_note(&app, id, Some(&format!("正在提取音频（{}）…", fmt.to_uppercase())));
+            let out = suffixed(&final_part, ".audio");
+            outcome = match postprocess::extract_audio(&st, &final_part, &out, &fmt).await {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&final_part);
+                    let _ = std::fs::rename(&out, &final_part);
+                    final_path = final_path.with_extension(&fmt);
+                    Ok(file_len(&final_part))
+                }
+                Err(e) => {
+                    remove_part(&out);
+                    Err(DlError::Other(e.message))
+                }
+            };
+        }
+    }
+    // 写入标题、作者、封面
+    let primary = spec.primary();
+    let out_ext = final_path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    if outcome.is_ok()
+        && settings.embed_metadata
+        && matches!(primary.kind, AssetKind::Video | AssetKind::Audio)
+        && crate::organize::supports_metadata(&out_ext)
+        && postprocess::find_ffmpeg(&st).is_some()
     {
-        let mut inner = st.downloads.lock();
-        let Some(e) = inner.tasks.iter_mut().find(|e| e.snap.id == id) else {
-            // 任务已被移除
-            if matches!(outcome, Err(DlError::Canceled)) {
-                let _ = std::fs::remove_file(&part);
+        set_step(&st, id, "post");
+        set_note(&app, id, Some("正在写入标题和封面…"));
+        let cover = crate::organize::fetch_cover(&st, &settings, &media, &final_part).await;
+        let out = suffixed(&final_part, ".meta");
+        match crate::organize::embed(&st, &media, &final_part, &out, &final_path, cover.as_deref()).await {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&final_part);
+                let _ = std::fs::rename(&out, &final_part);
+                outcome = Ok(file_len(&final_part));
             }
-            drop(inner);
-            schedule(&app);
+            // 写入元数据失败不影响下载结果
+            Err(e) => {
+                log::warn!("job {id}: embedding metadata failed: {e}");
+                let _ = std::fs::remove_file(&out);
+            }
+        }
+        if let Some(c) = cover {
+            let _ = std::fs::remove_file(c);
+        }
+    }
+    finish(&app, &st, id, outcome, &final_part, &final_path, &parts, &settings);
+}
+
+/// 进度上报：限制频率、计算速度、定期写入数据库。
+struct Reporter {
+    app: AppHandle,
+    st: Arc<AppState>,
+    id: i64,
+    i: usize,
+    done_before: u64,
+    baseline: Option<(Instant, u64)>,
+    last_persist: Instant,
+}
+
+impl Reporter {
+    fn new(app: &AppHandle, st: &Arc<AppState>, id: i64, i: usize, done_before: u64) -> Self {
+        Reporter { app: app.clone(), st: st.clone(), id, i, done_before, baseline: None, last_persist: Instant::now() }
+    }
+
+    fn update(&mut self, received: u64, total: Option<u64>, speed: Option<u64>, meta_now: Option<&ResumeMeta>) {
+        let now = Instant::now();
+        let (t0, b0) = *self.baseline.get_or_insert((now, received));
+        let elapsed = now.duration_since(t0);
+        if elapsed < Duration::from_millis(250) && Some(received) != total {
             return;
+        }
+        let speed = speed.unwrap_or_else(|| (received.saturating_sub(b0) as f64 / elapsed.as_secs_f64().max(0.001)) as u64);
+        self.baseline = Some((now, received));
+        let save = self.last_persist.elapsed() >= PERSIST_EVERY;
+        if save {
+            self.last_persist = now;
+        }
+        let (i, done_before, st) = (self.i, self.done_before, &self.st);
+        let snap = with_entry(st, self.id, |e| {
+            e.snap.received = done_before + received;
+            e.snap.total = total.map(|t| done_before + t);
+            e.snap.speed = speed;
+            if let Some(m) = meta_now {
+                e.snap.resumable = m.resumable;
+                if e.meta.inputs.len() > i {
+                    e.meta.inputs[i] = m.clone();
+                }
+            }
+            if save {
+                persist(st, e);
+            }
+            e.snap.clone()
+        });
+        if let Some(s) = snap {
+            let _ = self.app.emit(EVT_PROGRESS, s);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_input(
+    app: &AppHandle,
+    st: &Arc<AppState>,
+    settings: &Settings,
+    id: i64,
+    media: &MediaInfo,
+    spec: &mut JobSpec,
+    i: usize,
+    part: &Path,
+    meta: &mut JobMeta,
+    rx: &mut watch::Receiver<u8>,
+    opts: &HttpOptions,
+    done_before: u64,
+    fmp4: &mut bool,
+) -> Result<u64, DlError> {
+    let mut re_resolved = false;
+    let mut net_attempts = 0u32;
+    loop {
+        if let Some(dir) = part.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(dir).await {
+                return Err(DlError::Io(format!("无法创建目录 {}：{e}", dir.display())));
+            }
+        }
+        let asset = spec.inputs[i].clone();
+        let mut reporter = Reporter::new(app, st, id, i, done_before);
+        let res = match asset.protocol {
+            Protocol::Http => {
+                let req = build_request(st, media, &asset);
+                let client = st.net.clients_for(&settings.network, &asset.url).map_err(|e| DlError::Other(e.message))?.download;
+                http_engine::download(&client, &req, part, &mut meta.inputs[i], rx, opts, |received, total, meta_now| {
+                    reporter.update(received, total, None, Some(meta_now))
+                })
+                .await
+            }
+            Protocol::Hls => {
+                let req = build_request(st, media, &asset);
+                let client = st.net.clients_for(&settings.network, &asset.url).map_err(|e| DlError::Other(e.message))?.download;
+                let hopts = HlsOptions {
+                    concurrency: settings.hls_concurrency,
+                    skip_ads: settings.hls_skip_ads,
+                    speed_limit_kbps: settings.speed_limit_kbps,
+                    disk_reserve: opts.disk_reserve,
+                    net: opts.net.clone(),
+                };
+                hls_engine::download(&client, &req, part, rx, &hopts, |received, total| reporter.update(received, total, None, None)).await.map(|r| {
+                    *fmp4 = r.fmp4;
+                    if r.skipped_ads > 0 {
+                        log::info!("job {id}: skipped {} ad segments", r.skipped_ads);
+                    }
+                    meta.inputs[i] = ResumeMeta { total: Some(r.size), ..Default::default() };
+                    r.size
+                })
+            }
+            Protocol::Ytdlp => {
+                let ctx = st.parse_ctx(settings);
+                let format_id = asset.format_id.clone().unwrap_or_else(|| "best".into());
+                let page = if media.source_url.is_empty() { asset.url.clone() } else { media.source_url.clone() };
+                providers::ytdlp::download(&ctx, &page, &format_id, &asset.ext, part, rx, settings.speed_limit_kbps, |p| {
+                    reporter.update(p.downloaded, p.total, p.speed, None)
+                })
+                .await
+                .inspect(|size| meta.inputs[i] = ResumeMeta { total: Some(*size), ..Default::default() })
+            }
         };
+        let m = meta.clone();
+        with_entry(st, id, |e| e.meta = m);
+
+        match res {
+            Err(DlError::Status(code))
+                if matches!(code, 403 | 404 | 410) && !re_resolved && !media.source_url.is_empty() && asset.protocol != Protocol::Ytdlp =>
+            {
+                re_resolved = true;
+                set_note(app, id, Some("下载地址已过期，正在重新解析…"));
+                let ctx = st.parse_ctx(settings);
+                let fresh = providers::resolve_url(&ctx, &media.source_url).await.map_err(|e| DlError::Other(format!("下载地址已过期，重新解析失败：{e}")))?;
+                for k in 0..spec.inputs.len() {
+                    if let Some(a) = fresh.asset(&spec.inputs[k].id) {
+                        spec.inputs[k] = a.clone();
+                    } else if k == i {
+                        return Err(DlError::Other("重新解析后找不到这个资源".into()));
+                    }
+                }
+                let note = if asset.protocol == Protocol::Hls {
+                    "已获取新地址，继续下载剩余分片".to_string()
+                } else if keep_part_after_refresh(st, settings, media, &spec.inputs[i], part, &mut meta.inputs[i]).await {
+                    format!("已获取新地址，从 {} 处继续", human_bytes(file_len(part)))
+                } else {
+                    "已获取新地址，文件已变化，从头下载".to_string()
+                };
+                let spec_json = serde_json::to_string(&*spec).unwrap_or_default();
+                let _ = st.db.update_job_asset(id, &spec_json);
+                let (s2, m2) = (spec.clone(), meta.clone());
+                with_entry(st, id, |e| {
+                    e.spec = s2;
+                    e.meta = m2;
+                });
+                set_note(app, id, Some(&note));
+            }
+            Err(DlError::Net(msg)) if net_attempts < settings.max_retries => {
+                net_attempts += 1;
+                log::info!("job {id} network error, retry {net_attempts}: {msg}");
+                set_note(app, id, Some(&format!("网络中断，第 {net_attempts} 次重试…")));
+                let delay = Duration::from_secs(settings.retry_delay_secs.saturating_mul(1 << (net_attempts - 1).min(5)));
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    c = wait_ctrl(rx) => return Err(DlError::from_ctrl(c)),
+                }
+            }
+            other => return other,
+        }
+    }
+}
+
+/// `p` 后面加上后缀（不替换扩展名）。
+fn suffixed(p: &Path, suffix: &str) -> PathBuf {
+    let mut s = p.as_os_str().to_owned();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// yt-dlp 下载时可能留下的临时文件（输出名为“临时文件名.扩展名”，下载中再加 .part / .ytdl）。
+fn ytdlp_leftovers(p: &Path) -> Vec<PathBuf> {
+    ["mp4", "m4a", "webm", "mkv", "mp3", "flv", "ts", "mov", "opus", "ogg", "flac", "aac"]
+        .iter()
+        .flat_map(|ext| {
+            let out = providers::ytdlp::output_path(p, ext);
+            [suffixed(&out, ".part"), suffixed(&out, ".ytdl"), out]
+        })
+        .collect()
+}
+
+/// 删除一个输入的临时文件，连同 m3u8 分片目录和 yt-dlp 的临时文件。
+fn remove_part(p: &Path) {
+    let _ = std::fs::remove_file(p);
+    for f in ytdlp_leftovers(p) {
+        let _ = std::fs::remove_file(f);
+    }
+    let _ = std::fs::remove_dir_all(hls_engine::segment_dir(p));
+}
+
+fn dir_size(dir: &Path) -> u64 {
+    std::fs::read_dir(dir).map(|rd| rd.flatten().filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum()).unwrap_or(0)
+}
+
+/// 某个输入已下载的字节数：分段下载按各段进度，m3u8 按已下载的分片，yt-dlp 按它的 .part 文件。
+fn input_received(part: &Path, meta: &ResumeMeta) -> u64 {
+    if !meta.segments.is_empty() {
+        return meta.segmented_received();
+    }
+    let done = file_len(part);
+    if done > 0 {
+        return done;
+    }
+    ytdlp_leftovers(part).iter().map(|f| file_len(f)).sum::<u64>() + dir_size(&hls_engine::segment_dir(part))
+}
+
+/// 移动到最终位置；跨磁盘时改为复制后删除。
+fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            std::fs::copy(from, to)?;
+            std::fs::remove_file(from)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>, part: &Path, final_path: &Path, inputs: &[PathBuf], settings: &Settings) {
+    let mut notify: Option<(String, String)> = None;
+    let mut done_file: Option<(PathBuf, Arc<MediaInfo>)> = None;
+    let mut sub_touched = false;
+    let leftovers: Vec<PathBuf> = inputs.iter().cloned().chain(std::iter::once(part.to_path_buf())).collect();
+    let found = with_entry(st, id, |e| {
         e.snap.speed = 0;
         e.snap.note = None;
+        e.snap.step = None;
         match outcome {
             Ok(size) => {
-                let dest = if final_path.exists() { naming::unique_path(final_path.clone(), &|p: &Path| p.exists()) } else { final_path.clone() };
-                match std::fs::rename(&part, &dest) {
+                let dest = match settings.conflict_policy {
+                    ConflictPolicy::Overwrite => {
+                        let _ = std::fs::remove_file(final_path);
+                        final_path.to_path_buf()
+                    }
+                    _ if final_path.exists() => naming::unique_path(final_path.to_path_buf(), &|p: &Path| p.exists()),
+                    _ => final_path.to_path_buf(),
+                };
+                if let Some(dir) = dest.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                match move_file(part, &dest) {
                     Ok(()) => {
                         e.snap.file_path = dest.to_string_lossy().into_owned();
                         e.snap.status = TaskStatus::Done;
@@ -295,109 +1020,297 @@ async fn run_task(app: AppHandle, id: u64) {
                             cover: e.snap.cover.as_deref(),
                             path: &e.snap.file_path,
                             size: size as i64,
+                            kind: kind_str(e.snap.asset_kind),
+                            source: e.spec.origin.as_deref().unwrap_or("manual"),
+                            source_url: &e.media.source_url,
+                            platform_name: &e.media.platform_name,
                         });
                         notify = Some((e.snap.title.clone(), e.snap.asset_label.clone()));
+                        if matches!(e.snap.asset_kind, AssetKind::Video | AssetKind::Audio) {
+                            crate::organize::write_sidecars(settings, &e.media, e.spec.primary(), &dest);
+                        }
+                        done_file = Some((dest.clone(), e.media.clone()));
                     }
                     Err(err) => {
                         e.snap.status = TaskStatus::Failed;
                         e.snap.error = Some(format!("保存文件失败：{err}"));
+                        e.snap.error_kind = Some(ErrorKind::Disk);
                     }
                 }
             }
             Err(DlError::Paused) => e.snap.status = TaskStatus::Paused,
             Err(DlError::Canceled) => {
                 e.snap.status = TaskStatus::Canceled;
-                e.snap.received = 0;
-                let _ = std::fs::remove_file(&part);
+                if !settings.keep_part_on_cancel {
+                    e.snap.received = 0;
+                    for p in &leftovers {
+                        remove_part(p);
+                    }
+                    e.meta = JobMeta { inputs: vec![ResumeMeta::default(); e.spec.inputs.len()] };
+                }
             }
             Err(err) => {
+                log::warn!("job {} failed: {err}", e.snap.id);
                 e.snap.status = TaskStatus::Failed;
+                e.snap.error_kind = Some(err.kind());
                 e.snap.error = Some(err.to_string());
             }
         }
+        persist(st, e);
+        // 订阅条目跟随任务结果更新
+        if let Some((sub_id, item_id)) = &e.spec.sub_item {
+            let status = match e.snap.status {
+                TaskStatus::Done => Some("downloaded"),
+                TaskStatus::Failed => Some("failed"),
+                _ => None,
+            };
+            if let Some(s) = status {
+                crate::subs::mark_item(st, *sub_id, item_id, s, Some(&e.snap.title));
+                sub_touched = true;
+            }
+        }
+    });
+    if sub_touched {
+        let _ = app.emit(crate::subs::EVT_SUBS, ());
     }
-
+    if found.is_none() {
+        // 任务已被移除：清理残留
+        for p in &leftovers {
+            remove_part(p);
+        }
+    }
+    if let Some((_, media)) = &done_file {
+        spawn_cover_cache(app, media.clone());
+    }
+    if let Some((file, media)) = &done_file {
+        if settings.post_script_enabled && !settings.post_script.trim().is_empty() {
+            run_post_script(&settings.post_script, file, media);
+        }
+    }
+    let all_done = !st.downloads.has_active();
     if let Some((title, label)) = notify {
-        let enabled = st.settings.read().map(|s| s.notify_on_complete).unwrap_or(false);
-        if enabled && !st.downloads.has_active() {
+        if settings.notify_on_complete && all_done {
             use tauri_plugin_notification::NotificationExt;
             let _ = app.notification().builder().title("下载完成").body(format!("{title}（{label}）")).show();
         }
     }
-    schedule(&app);
-}
-
-fn set_note(app: &AppHandle, id: u64, note: Option<&str>) {
-    let st = state(app);
-    {
-        let mut inner = st.downloads.lock();
-        if let Some(e) = inner.tasks.iter_mut().find(|e| e.snap.id == id) {
-            e.snap.note = note.map(String::from);
-        }
-    }
-    emit_all(app);
-}
-
-pub fn pause(app: &AppHandle, id: u64) {
-    let st = state(app);
-    {
-        let mut inner = st.downloads.lock();
-        if let Some(e) = inner.tasks.iter_mut().find(|e| e.snap.id == id) {
-            match e.snap.status {
-                TaskStatus::Running => e.control.store(CTRL_PAUSE, Ordering::SeqCst),
-                TaskStatus::Queued => e.snap.status = TaskStatus::Paused,
-                _ => {}
-            }
-        }
-    }
-    emit_all(app);
-}
-
-/// 继续暂停的任务，或重试失败 / 已取消的任务。
-pub fn resume(app: &AppHandle, id: u64) {
-    let st = state(app);
-    {
-        let mut inner = st.downloads.lock();
-        if let Some(e) = inner.tasks.iter_mut().find(|e| e.snap.id == id) {
-            if matches!(e.snap.status, TaskStatus::Paused | TaskStatus::Failed | TaskStatus::Canceled) {
-                e.snap.status = TaskStatus::Queued;
-                e.snap.error = None;
-            }
-        }
+    if all_done && done_file.is_some() {
+        on_all_done(app, st, settings, done_file.as_ref().map(|(f, _)| f.as_path()));
     }
     schedule(app);
 }
 
-pub fn cancel(app: &AppHandle, id: u64) {
-    let st = state(app);
-    {
-        let mut inner = st.downloads.lock();
-        if let Some(e) = inner.tasks.iter_mut().find(|e| e.snap.id == id) {
-            match e.snap.status {
-                TaskStatus::Running => e.control.store(CTRL_CANCEL, Ordering::SeqCst),
-                TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Failed => {
-                    e.snap.status = TaskStatus::Canceled;
-                    e.snap.received = 0;
-                    let _ = std::fs::remove_file(part_path(Path::new(&e.snap.file_path)));
-                }
-                _ => {}
+fn kind_str(k: AssetKind) -> &'static str {
+    match k {
+        AssetKind::Video => "video",
+        AssetKind::Image => "image",
+        AssetKind::Audio => "audio",
+        AssetKind::Cover => "cover",
+        AssetKind::Subtitle => "subtitle",
+    }
+}
+
+/// 媒体库封面缓存目录。
+pub fn covers_dir(st: &AppState) -> PathBuf {
+    st.data_dir.join("covers")
+}
+
+/// 在后台把封面缓存到本地（远程封面地址常常会过期）。
+fn spawn_cover_cache(app: &AppHandle, media: Arc<MediaInfo>) {
+    if media.cover.is_none() {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let st = state(&app);
+        let settings = st.settings();
+        let dir = covers_dir(&st);
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        use sha2::Digest;
+        let key = hex::encode(&sha2::Sha256::digest(format!("{}:{}", media.platform, media.id).as_bytes())[..12]);
+        if let Some(existing) = ["jpg", "png"].iter().map(|e| dir.join(format!("{key}.{e}"))).find(|p| p.exists()) {
+            let _ = st.db.set_cover_path(&media.platform, &media.id, &existing.to_string_lossy());
+            return;
+        }
+        let near = dir.join(&key);
+        if let Some(tmp) = crate::organize::fetch_cover(&st, &settings, &media, &near).await {
+            let ext = tmp.extension().and_then(|e| e.to_str()).unwrap_or("jpg").to_string();
+            let dest = dir.join(format!("{key}.{ext}"));
+            if std::fs::rename(&tmp, &dest).is_ok() {
+                let _ = st.db.set_cover_path(&media.platform, &media.id, &dest.to_string_lossy());
             }
         }
+    });
+}
+
+/// 每个任务完成后运行用户设置的命令（文件路径、标题、原链接通过环境变量传入，不拼接进命令行）。
+fn run_post_script(script: &str, file: &Path, media: &MediaInfo) {
+    let mut cmd = if cfg!(windows) {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", script]);
+        c
+    } else {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", script]);
+        c
+    };
+    cmd.env("CLEARCLIP_FILE", file)
+        .env("CLEARCLIP_TITLE", &media.title)
+        .env("CLEARCLIP_AUTHOR", &media.author)
+        .env("CLEARCLIP_URL", &media.source_url)
+        .env("CLEARCLIP_PLATFORM", &media.platform)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
     }
+    match cmd.spawn() {
+        Ok(_) => log::info!("post script started for {}", file.display()),
+        Err(e) => log::warn!("post script failed: {e}"),
+    }
+}
+
+pub const EVT_POWER_COUNTDOWN: &str = "app://power-countdown";
+
+/// 队列全部完成：打开文件夹、睡眠 / 关机（关机前倒计时 60 秒，期间可在界面取消）。
+fn on_all_done(app: &AppHandle, st: &AppState, settings: &Settings, last_file: Option<&Path>) {
+    crate::power::keep_awake(false);
+    if settings.open_folder_on_done {
+        if let Some(dir) = last_file.and_then(|f| f.parent()) {
+            use tauri_plugin_opener::OpenerExt;
+            let _ = app.opener().open_path(dir.to_string_lossy(), None::<&str>);
+        }
+    }
+    let action = st.after_all_done.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if action == "none" {
+        return;
+    }
+    let _ = app.emit(EVT_POWER_COUNTDOWN, serde_json::json!({ "action": action, "seconds": 60 }));
+    crate::tray::show_main(app);
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let st = state(&app);
+        let still = st.after_all_done.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if still == action && !st.downloads.has_active() {
+            *st.after_all_done.lock().unwrap_or_else(|e| e.into_inner()) = "none".into();
+            crate::power::run_power_action(&action);
+        }
+    });
+}
+
+/// 地址更新后判断能否保留已下载部分：新地址的文件总大小与记录一致才保留。
+async fn keep_part_after_refresh(st: &AppState, settings: &Settings, media: &MediaInfo, asset: &Asset, part: &Path, meta: &mut ResumeMeta) -> bool {
+    let have = file_len(part);
+    let Ok(client) = st.net.clients_for(&settings.network, &asset.url).map(|c| c.download) else { return false };
+    let req = build_request(st, media, asset);
+    let fresh_total = http_engine::probe_total(&client, &req).await;
+    let keep = have > 0 && meta.total.is_some() && fresh_total == meta.total;
+    if keep {
+        // 新地址的 ETag 与旧 CDN 不同，续传时只依赖大小和 Content-Range 校验
+        meta.etag = None;
+        meta.last_modified = None;
+    } else {
+        let _ = std::fs::remove_file(part);
+        *meta = ResumeMeta::default();
+    }
+    keep
+}
+
+fn set_note(app: &AppHandle, id: i64, note: Option<&str>) {
+    let st = state(app);
+    with_entry(&st, id, |e| e.snap.note = note.map(String::from));
     emit_all(app);
 }
 
-pub fn remove(app: &AppHandle, id: u64) {
+fn set_step(st: &AppState, id: i64, step: &str) {
+    with_entry(st, id, |e| e.snap.step = Some(step.to_string()));
+}
+
+pub fn pause(app: &AppHandle, id: i64) {
     let st = state(app);
-    {
-        let mut inner = st.downloads.lock();
-        if let Some(pos) = inner.tasks.iter().position(|e| e.snap.id == id) {
-            let e = inner.tasks.remove(pos);
-            if e.snap.status == TaskStatus::Running {
-                e.control.store(CTRL_CANCEL, Ordering::SeqCst);
-            } else if e.snap.status != TaskStatus::Done {
-                let _ = std::fs::remove_file(part_path(Path::new(&e.snap.file_path)));
+    with_entry(&st, id, |e| match e.snap.status {
+        TaskStatus::Running => {
+            let _ = e.ctrl.send(CTRL_PAUSE);
+        }
+        TaskStatus::Queued => {
+            e.snap.status = TaskStatus::Paused;
+            persist(&st, e);
+        }
+        _ => {}
+    });
+    emit_all(app);
+}
+
+/// 继续暂停的任务，或重试失败 / 已取消的任务。
+pub fn resume(app: &AppHandle, id: i64) {
+    let st = state(app);
+    with_entry(&st, id, |e| {
+        if matches!(e.snap.status, TaskStatus::Paused | TaskStatus::Failed | TaskStatus::Canceled) {
+            e.snap.status = TaskStatus::Queued;
+            e.snap.error = None;
+            e.snap.error_kind = None;
+            persist(&st, e);
+        }
+    });
+    schedule(app);
+}
+
+fn all_parts(settings: &Settings, e: &Entry) -> Vec<PathBuf> {
+    let n = e.spec.inputs.len();
+    let fp = Path::new(&e.snap.file_path);
+    let mut v: Vec<PathBuf> = (0..n).map(|i| input_part_path(settings, e.snap.id, fp, i, n)).collect();
+    v.push(part_path(fp));
+    // yt-dlp 下载时自己的临时文件，以及后处理的中间文件
+    let extra: Vec<PathBuf> =
+        v.iter().flat_map(|p| [suffixed(p, ".remux"), suffixed(p, ".audio"), suffixed(p, ".meta")].into_iter().chain(ytdlp_leftovers(p))).collect();
+    v.extend(extra);
+    v
+}
+
+pub fn cancel(app: &AppHandle, id: i64) {
+    let st = state(app);
+    let settings = st.settings();
+    with_entry(&st, id, |e| match e.snap.status {
+        TaskStatus::Running => {
+            let _ = e.ctrl.send(CTRL_CANCEL);
+        }
+        TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Failed => {
+            e.snap.status = TaskStatus::Canceled;
+            if !settings.keep_part_on_cancel {
+                e.snap.received = 0;
+                for p in all_parts(&settings, e) {
+                    remove_part(&p);
+                }
+                e.meta = JobMeta { inputs: vec![ResumeMeta::default(); e.spec.inputs.len()] };
             }
+            persist(&st, e);
+        }
+        _ => {}
+    });
+    emit_all(app);
+}
+
+pub fn remove(app: &AppHandle, id: i64) {
+    let st = state(app);
+    let settings = st.settings();
+    {
+        let mut list = st.downloads.lock();
+        if let Some(pos) = list.iter().position(|e| e.snap.id == id) {
+            let e = list.remove(pos);
+            if e.snap.status == TaskStatus::Running {
+                let _ = e.ctrl.send(CTRL_CANCEL);
+            } else if e.snap.status != TaskStatus::Done {
+                for p in all_parts(&settings, &e) {
+                    remove_part(&p);
+                }
+            }
+            let _ = st.db.delete_job(id);
         }
     }
     schedule(app);
@@ -405,12 +1318,13 @@ pub fn remove(app: &AppHandle, id: u64) {
 
 pub fn clear_finished(app: &AppHandle) {
     let st = state(app);
-    st.downloads.lock().tasks.retain(|e| !matches!(e.snap.status, TaskStatus::Done | TaskStatus::Canceled));
+    st.downloads.lock().retain(|e| !matches!(e.snap.status, TaskStatus::Done | TaskStatus::Canceled));
+    let _ = st.db.delete_jobs_with_status(&["done", "canceled"]);
     emit_all(app);
 }
 
 pub fn pause_all(app: &AppHandle) {
-    let ids: Vec<u64> =
+    let ids: Vec<i64> =
         state(app).downloads.snapshots().into_iter().filter(|s| matches!(s.status, TaskStatus::Running | TaskStatus::Queued)).map(|s| s.id).collect();
     for id in ids {
         pause(app, id);
@@ -420,13 +1334,51 @@ pub fn pause_all(app: &AppHandle) {
 pub fn resume_all(app: &AppHandle) {
     let st = state(app);
     {
-        let mut inner = st.downloads.lock();
-        for e in inner.tasks.iter_mut().filter(|e| matches!(e.snap.status, TaskStatus::Paused | TaskStatus::Failed)) {
+        let mut list = st.downloads.lock();
+        for e in list.iter_mut().filter(|e| matches!(e.snap.status, TaskStatus::Paused | TaskStatus::Failed)) {
             e.snap.status = TaskStatus::Queued;
             e.snap.error = None;
+            e.snap.error_kind = None;
+            persist(&st, e);
         }
     }
     schedule(app);
+}
+
+/// 下载目录和临时目录里不属于任何任务的 .part 文件。
+pub fn orphan_parts(app: &AppHandle) -> Vec<OrphanPart> {
+    let st = state(app);
+    let settings = st.settings();
+    let known: Vec<PathBuf> = st.downloads.lock().iter().filter(|e| e.snap.status != TaskStatus::Done).flat_map(|e| all_parts(&settings, e)).collect();
+    let mut out = Vec::new();
+    collect_parts(&settings.download_root(), 0, &known, &mut out);
+    if !settings.temp_dir.is_empty() {
+        collect_parts(Path::new(&settings.temp_dir), 3, &known, &mut out);
+    }
+    out
+}
+
+fn collect_parts(dir: &Path, depth: usize, known: &[PathBuf], out: &mut Vec<OrphanPart>) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        let Ok(md) = entry.metadata() else { continue };
+        if md.is_dir() {
+            collect_parts(&p, depth + 1, known, out);
+        } else if p.extension().is_some_and(|x| x == "part") && !known.contains(&p) {
+            let modified = md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64).unwrap_or(0);
+            out.push(OrphanPart { path: p.to_string_lossy().into_owned(), size: md.len(), modified });
+        }
+    }
+}
+
+/// 删除指定的孤立 .part 文件；只接受当前确实是孤立文件的路径。
+pub fn delete_orphans(app: &AppHandle, paths: &[String]) -> usize {
+    let orphans = orphan_parts(app);
+    paths.iter().filter(|p| orphans.iter().any(|o| &o.path == *p)).filter(|p| std::fs::remove_file(p).is_ok()).count()
 }
 
 pub fn part_path(p: &Path) -> PathBuf {
@@ -435,204 +1387,106 @@ pub fn part_path(p: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum DlError {
-    #[error("已暂停")]
-    Paused,
-    #[error("已取消")]
-    Canceled,
-    #[error("服务器返回 {0}")]
-    Status(u16),
-    #[error("网络错误：{0}")]
-    Net(String),
-    #[error("{0}")]
-    Io(String),
-    #[error("{0}")]
-    Other(String),
-}
-
-/// 流式下载到 `part`。已有部分内容时发送 Range 请求续传；服务器不支持续传时从头下载。
-pub async fn download_to_file(
-    client: &reqwest::Client,
-    url: &str,
-    referer: &str,
-    cookie: Option<&str>,
-    part: &Path,
-    control: &AtomicU8,
-    mut on_progress: impl FnMut(u64, Option<u64>),
-) -> Result<u64, DlError> {
-    let existing = tokio::fs::metadata(part).await.map(|m| m.len()).unwrap_or(0);
-    let mut req = client.get(url);
-    if !referer.is_empty() {
-        req = req.header("Referer", referer);
+fn human_bytes(n: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    if n as f64 >= MB {
+        format!("{:.1} MB", n as f64 / MB)
+    } else {
+        format!("{:.0} KB", (n as f64 / 1024.0).max(1.0))
     }
-    if let Some(c) = cookie {
-        req = req.header("Cookie", c);
-    }
-    if existing > 0 {
-        req = req.header("Range", format!("bytes={existing}-"));
-    }
-    let resp = req.send().await.map_err(|e| DlError::Net(e.to_string()))?;
-    let status = resp.status().as_u16();
-
-    if status == 416 && existing > 0 {
-        on_progress(existing, Some(existing));
-        return Ok(existing);
-    }
-    let (mut received, append) = match status {
-        206 => (existing, true),
-        200..=299 => (0, false),
-        _ => return Err(DlError::Status(status)),
-    };
-    let total = resp.content_length().map(|len| len + received);
-
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(append)
-        .truncate(!append)
-        .open(part)
-        .await
-        .map_err(|e| DlError::Io(format!("无法写入文件 {}：{e}", part.display())))?;
-
-    on_progress(received, total);
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        match control.load(Ordering::SeqCst) {
-            CTRL_PAUSE => {
-                let _ = file.flush().await;
-                return Err(DlError::Paused);
-            }
-            CTRL_CANCEL => return Err(DlError::Canceled),
-            _ => {}
-        }
-        let chunk = chunk.map_err(|e| DlError::Net(e.to_string()))?;
-        file.write_all(&chunk).await.map_err(|e| DlError::Io(format!("写入失败：{e}")))?;
-        received += chunk.len() as u64;
-        on_progress(received, total);
-    }
-    file.flush().await.map_err(|e| DlError::Io(format!("写入失败：{e}")))?;
-    if let Some(t) = total {
-        if received < t {
-            return Err(DlError::Net(format!("连接提前结束（{received}/{t} 字节）")));
-        }
-    }
-    Ok(received)
-}
-
-pub fn build_download_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .user_agent(providers::MOBILE_UA)
-        .connect_timeout(Duration::from_secs(15))
-        .read_timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-        .expect("failed to build download client")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use crate::model::MediaKind;
 
-    /// 极简 HTTP 服务器：`/file` 支持 Range，`/forbidden` 返回 403。
-    async fn serve(body: &'static [u8]) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else { break };
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 4096];
-                    let n = sock.read(&mut buf).await.unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let resp: Vec<u8> = if req.starts_with("GET /forbidden") {
-                        b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
-                    } else {
-                        let range_start = req
-                            .lines()
-                            .find(|l| l.to_ascii_lowercase().starts_with("range: bytes="))
-                            .and_then(|l| l.split('=').nth(1))
-                            .and_then(|r| r.trim_end_matches('-').trim_end_matches(|c: char| c == '-' || c.is_whitespace()).parse::<usize>().ok());
-                        match range_start {
-                            Some(s) => {
-                                let part = &body[s..];
-                                let mut v = format!(
-                                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nConnection: close\r\n\r\n",
-                                    part.len(),
-                                    s,
-                                    body.len() - 1,
-                                    body.len()
-                                )
-                                .into_bytes();
-                                v.extend_from_slice(part);
-                                v
-                            }
-                            None => {
-                                let mut v = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
-                                v.extend_from_slice(body);
-                                v
-                            }
-                        }
-                    };
-                    let _ = sock.write_all(&resp).await;
-                    let _ = sock.shutdown().await;
-                });
-            }
-        });
-        format!("http://{addr}")
-    }
-
-    fn tmp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("clearclip-dl-{}-{name}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join("f.bin.part")
-    }
-
-    #[tokio::test]
-    async fn downloads_full_file() {
-        let base = serve(b"hello world").await;
-        let part = tmp("full");
-        let ctrl = AtomicU8::new(CTRL_RUN);
-        let mut last = (0, None);
-        let n = download_to_file(&build_download_client(), &format!("{base}/file"), "https://ref/", None, &part, &ctrl, |r, t| last = (r, t)).await.unwrap();
-        assert_eq!(n, 11);
-        assert_eq!(last, (11, Some(11)));
-        assert_eq!(std::fs::read(&part).unwrap(), b"hello world");
-    }
-
-    #[tokio::test]
-    async fn resumes_partial_file_with_range() {
-        let base = serve(b"hello world").await;
-        let part = tmp("resume");
-        std::fs::write(&part, b"hello").unwrap();
-        let ctrl = AtomicU8::new(CTRL_RUN);
-        let n = download_to_file(&build_download_client(), &format!("{base}/file"), "", None, &part, &ctrl, |_, _| {}).await.unwrap();
-        assert_eq!(n, 11);
-        assert_eq!(std::fs::read(&part).unwrap(), b"hello world");
-    }
-
-    #[tokio::test]
-    async fn reports_http_status() {
-        let base = serve(b"x").await;
-        let part = tmp("403");
-        let ctrl = AtomicU8::new(CTRL_RUN);
-        let err = download_to_file(&build_download_client(), &format!("{base}/forbidden"), "", None, &part, &ctrl, |_, _| {}).await.unwrap_err();
-        assert!(matches!(err, DlError::Status(403)));
-    }
-
-    #[tokio::test]
-    async fn cancel_flag_stops_download() {
-        let base = serve(b"0123456789").await;
-        let part = tmp("cancel");
-        let ctrl = AtomicU8::new(CTRL_CANCEL);
-        let err = download_to_file(&build_download_client(), &format!("{base}/file"), "", None, &part, &ctrl, |_, _| {}).await.unwrap_err();
-        assert!(matches!(err, DlError::Canceled));
+    fn media() -> MediaInfo {
+        let mut v1080 = Asset::video("https://cdn/v1080.m4s".into(), Some(1920), Some(1080));
+        v1080.id = "video-1080".into();
+        v1080.has_audio = Some(false);
+        v1080.pair_audio = Some("audio-best".into());
+        let mut audio = Asset::base("audio-best", AssetKind::Audio, "https://cdn/a.m4s".into(), "音频轨", "m4a");
+        audio.has_audio = Some(true);
+        let v720 = Asset { id: "video-720".into(), ..Asset::video("https://cdn/v720.mp4".into(), Some(1280), Some(720)) };
+        MediaInfo {
+            platform: "bilibili".into(),
+            platform_name: "B站".into(),
+            id: "BV1".into(),
+            source_url: "x".into(),
+            title: "t".into(),
+            author: "a".into(),
+            cover: None,
+            duration_ms: None,
+            kind: MediaKind::Video,
+            width: None,
+            height: None,
+            published_at: None,
+            assets: vec![v1080, v720, audio],
+            entries: vec![],
+            series: None,
+            extractor: None,
+        }
     }
 
     #[test]
-    fn part_path_appends_suffix() {
-        assert_eq!(part_path(Path::new("/a/b.mp4")), PathBuf::from("/a/b.mp4.part"));
+    fn silent_video_is_paired_with_audio() {
+        let m = media();
+        let specs = build_specs(&m, &["video-1080".into(), "video-720".into()]);
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].inputs.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), vec!["video-1080", "audio-best"]);
+        assert_eq!(specs[1].inputs.len(), 1, "video with audio is downloaded alone");
+    }
+
+    #[test]
+    fn legacy_rows_parse() {
+        let a = Asset::video("u".into(), None, None);
+        let spec = parse_spec(&serde_json::to_string(&a).unwrap()).unwrap();
+        assert_eq!(spec.inputs.len(), 1);
+        let meta = parse_meta(r#"{"etag":"e","total":5}"#);
+        assert_eq!(meta.inputs[0].etag.as_deref(), Some("e"));
+    }
+
+    #[test]
+    fn part_paths_for_inputs() {
+        let s = Settings::default();
+        let f = Path::new("/d/a.mp4");
+        assert_eq!(input_part_path(&s, 1, f, 0, 1), PathBuf::from("/d/a.mp4.part"));
+        assert_eq!(input_part_path(&s, 1, f, 1, 2), PathBuf::from("/d/a.mp4.f1.part"));
+        let t = Settings { temp_dir: "/tmp/cc".into(), ..Settings::default() };
+        assert_eq!(input_part_path(&t, 7, f, 0, 1), PathBuf::from("/tmp/cc/clearclip-7-0.part"));
+    }
+
+    #[test]
+    fn move_file_works_within_same_fs() {
+        let dir = std::env::temp_dir().join(format!("clearclip-mv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a"), b"x").unwrap();
+        move_file(&dir.join("a"), &dir.join("b")).unwrap();
+        assert!(dir.join("b").exists() && !dir.join("a").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reorder_moves() {
+        let base = vec![1, 2, 3, 4];
+        let mv = |pos: usize, to: &str| {
+            let mut v = base.clone();
+            reorder(&mut v, pos, to);
+            v
+        };
+        assert_eq!(mv(2, "top"), vec![3, 1, 2, 4]);
+        assert_eq!(mv(2, "up"), vec![1, 3, 2, 4]);
+        assert_eq!(mv(0, "up"), vec![1, 2, 3, 4]);
+        assert_eq!(mv(1, "down"), vec![1, 3, 2, 4]);
+        assert_eq!(mv(3, "down"), vec![1, 2, 3, 4]);
+        assert_eq!(mv(0, "bottom"), vec![2, 3, 4, 1]);
+    }
+
+    #[test]
+    fn status_roundtrip() {
+        for s in [TaskStatus::Queued, TaskStatus::Running, TaskStatus::Paused, TaskStatus::Done, TaskStatus::Failed, TaskStatus::Canceled] {
+            assert_eq!(TaskStatus::parse(s.as_str()), s);
+        }
     }
 }

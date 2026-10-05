@@ -45,11 +45,12 @@ impl Provider for Kuaishou {
     }
 
     async fn resolve(&self, ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo> {
-        let cookie = ctx.settings.cookie("kuaishou").map(String::from).unwrap_or_else(random_did_cookie);
+        let cookie = ctx.cookie("https://www.kuaishou.com/").unwrap_or_else(random_did_cookie);
 
-        let resp = ctx.client.get(url).header("Cookie", &cookie).send().await?;
+        let resp = ctx.get(url).header("Cookie", &cookie).send().await?;
         let final_url = resp.url().to_string();
         let html = resp.text().await.unwrap_or_default();
+        ctx.record("kuaishou", "share-page", &final_url, &html);
         let photo_id = photo_id_from_url(&final_url).or_else(|| photo_id_from_url(url));
 
         if let Some(state) = super::extract_json_after(&html, "window.INIT_STATE") {
@@ -60,17 +61,19 @@ impl Provider for Kuaishou {
         }
 
         // 回退：移动端接口
-        let id = photo_id.ok_or_else(|| AppError::msg("没能从链接里识别出快手作品 ID，链接可能已失效。"))?;
+        let id = photo_id.ok_or_else(|| AppError::not_found("没能从链接里识别出快手作品 ID，链接可能已失效。"))?;
         let body = json!({ "photoId": id, "isLongVideo": false });
         let resp = ctx
-            .client
             .post("https://v.m.chenzhongtech.com/rest/wd/photo/info?kpn=KUAISHOU&captchaToken=")
             .header("Cookie", &cookie)
             .header("Referer", &final_url)
             .json(&body)
             .send()
             .await?;
-        let data: Value = resp.json().await.map_err(|_| AppError::msg("快手接口返回的不是有效数据，可能触发了风控。请在设置中登录快手后重试。"))?;
+        let data: Value = resp
+            .json()
+            .await
+            .map_err(|_| AppError::new(crate::error::ErrorKind::RateLimited, "快手接口返回的不是有效数据，可能触发了风控。请在设置中登录快手后重试。"))?;
         if let Some(photo) = data.get("photo").filter(|p| p.is_object()) {
             return parse_photo(photo, data.get("atlas"), &id, url);
         }
@@ -136,8 +139,9 @@ pub fn parse_photo(photo: &Value, atlas: Option<&Value>, id: &str, source_url: &
         }
         (MediaKind::Images, None, None, None)
     } else {
-        let url =
-            str_at(photo, "/mainMvUrls/0/url").or_else(|| str_at(photo, "/photoUrl")).ok_or_else(|| AppError::msg("没有找到视频地址，作品可能已删除。"))?;
+        let url = str_at(photo, "/mainMvUrls/0/url")
+            .or_else(|| str_at(photo, "/photoUrl"))
+            .ok_or_else(|| AppError::not_found("没有找到视频地址，作品可能已删除。"))?;
         let w = u32_at(photo, "/width");
         let h = u32_at(photo, "/height");
         assets.push(Asset::video(url.to_string(), w, h));
@@ -165,6 +169,9 @@ pub fn parse_photo(photo: &Value, atlas: Option<&Value>, id: &str, source_url: &
         height,
         published_at,
         assets,
+        entries: vec![],
+        series: None,
+        extractor: Some("native".into()),
     })
 }
 

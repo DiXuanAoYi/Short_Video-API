@@ -31,7 +31,7 @@ jobs:
         if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev libxdo-dev patchelf
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev libxdo-dev libdbus-1-dev patchelf
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -50,21 +50,83 @@ jobs:
       - run: npm ci
         working-directory: desktop
 
-      - uses: tauri-apps/tauri-action@v0
+      # 签名更新（可选）：配置 TAURI_SIGNING_PRIVATE_KEY（及密码）和对应的 TAURI_UPDATER_PUBKEY 后，
+      # 生成更新包和 latest.json，程序内可直接下载安装；未配置时只生成普通安装包。
+      - name: Updater signing
+        id: updater
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # 以下为可选的代码签名配置，未设置时生成未签名的安装包
+          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -n "$KEY" ]; then
+            echo 'args=--config {"bundle":{"createUpdaterArtifacts":true}}' >> "$GITHUB_OUTPUT"
+          else
+            echo 'args=' >> "$GITHUB_OUTPUT"
+          fi
+
+      # 可选的签名配置：只导出已配置的 Secrets。变量以空值存在时，打包工具会尝试导入空证书并失败。
+      - name: Export signing secrets
+        shell: bash
+        env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          CLEARCLIP_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
+        run: |
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD CLEARCLIP_UPDATER_PUBKEY; do
+            value="${!name}"
+            if [ -n "$value" ]; then
+              {
+                echo "$name<<__CLEARCLIP_EOF__"
+                echo "$value"
+                echo "__CLEARCLIP_EOF__"
+              } >> "$GITHUB_ENV"
+            fi
+          done
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: desktop
           tagName: desktop-v__VERSION__
           releaseName: 清影 ClearClip v__VERSION__
-          releaseBody: 下载对应系统的安装包。macOS 未签名版本首次打开需在“系统设置 → 隐私与安全性”中允许。
-          releaseDraft: true
+          releaseBody: |
+            清影 ClearClip 桌面版，下载后直接安装使用，不需要编译环境。
+
+            | 系统 | 下载哪个文件 |
+            | --- | --- |
+            | Windows 10 / 11 | `ClearClip_<版本>_x64-setup.exe`（安装版，推荐）或 `.msi`；免安装选 `ClearClip-<版本>-portable-windows-x64.zip` |
+            | macOS（M 系列芯片） | `ClearClip_<版本>_aarch64.dmg` |
+            | macOS（Intel 芯片） | `ClearClip_<版本>_x64.dmg` |
+            | Linux | `.AppImage`（赋予执行权限后直接运行）或 `.deb` |
+
+            首次运行说明：
+            - Windows：安装包未做代码签名，如出现“Windows 已保护你的电脑”，点“更多信息 → 仍要运行”。
+            - macOS：未签名版本首次打开会被拦截，在“系统设置 → 隐私与安全性”中点“仍要打开”；或在终端执行 `xattr -cr /Applications/ClearClip.app`。
+            - YouTube 等网站需要的 yt-dlp、ffmpeg 组件在“设置 → 组件”中一键安装，国内网络可填写 GitHub 镜像。
+
+            仅用于下载你有权保存的内容。
+          releaseDraft: false
           prerelease: false
-          args: ${{ matrix.args }}
+          args: ${{ matrix.args }} ${{ steps.updater.outputs.args }}
+
+      # Windows 便携版：免安装 zip，数据保存在程序目录的 data 文件夹（旁边放一个 portable 文件即启用）
+      - name: Upload Windows portable zip
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = (Get-Content desktop/src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          $dir = "ClearClip-$version-portable"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item desktop/src-tauri/target/release/clearclip.exe $dir/
+          Set-Content -Path "$dir/portable" -Value "设置、数据和日志保存在本目录的 data 文件夹。删除此文件则改用系统应用数据目录。"
+          Compress-Archive -Path $dir -DestinationPath "$dir-windows-x64.zip" -Force
+          gh release upload "desktop-v$version" "$dir-windows-x64.zip" --clobber
