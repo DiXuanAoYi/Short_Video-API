@@ -81,8 +81,23 @@ jobs:
           projectPath: desktop
           tagName: desktop-v__VERSION__
           releaseName: 清影 ClearClip v__VERSION__
-          releaseBody: 下载对应系统的安装包。macOS 未签名版本首次打开需在“系统设置 → 隐私与安全性”中允许。
-          releaseDraft: true
+          releaseBody: |
+            清影 ClearClip 桌面版，下载后直接安装使用，不需要编译环境。
+
+            | 系统 | 下载哪个文件 |
+            | --- | --- |
+            | Windows 10 / 11 | `ClearClip_<版本>_x64-setup.exe`（安装版，推荐）或 `.msi`；免安装选 `ClearClip-<版本>-portable-windows-x64.zip` |
+            | macOS（M 系列芯片） | `ClearClip_<版本>_aarch64.dmg` |
+            | macOS（Intel 芯片） | `ClearClip_<版本>_x64.dmg` |
+            | Linux | `.AppImage`（赋予执行权限后直接运行）或 `.deb` |
+
+            首次运行说明：
+            - Windows：安装包未做代码签名，如出现“Windows 已保护你的电脑”，点“更多信息 → 仍要运行”。
+            - macOS：未签名版本首次打开会被拦截，在“系统设置 → 隐私与安全性”中点“仍要打开”；或在终端执行 `xattr -cr /Applications/ClearClip.app`。
+            - YouTube 等网站需要的 yt-dlp、ffmpeg 组件在“设置 → 组件”中一键安装，国内网络可填写 GitHub 镜像。
+
+            仅用于下载你有权保存的内容。
+          releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }} ${{ steps.updater.outputs.args }}
 
