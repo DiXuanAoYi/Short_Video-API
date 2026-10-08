@@ -19,12 +19,14 @@ pub mod media_tools;
 pub mod model;
 pub mod naming;
 pub mod net;
+pub mod notify;
 pub mod organize;
 pub mod phone;
 pub mod postprocess;
 pub mod power;
 pub mod providers;
 pub mod quality;
+pub mod rules;
 pub mod secret;
 pub mod settings;
 pub mod subs;
@@ -33,6 +35,7 @@ pub mod subtitle_io;
 pub mod subtitle_tools;
 pub mod tools;
 mod tray;
+pub mod upload;
 pub mod vault;
 
 use std::path::PathBuf;
@@ -114,7 +117,8 @@ fn spawn_account_reminders(app: tauri::AppHandle) {
                     if !status.logged_in && a.valid != Some(false) {
                         use tauri_plugin_notification::NotificationExt;
                         let body = format!("{}账号“{}”的登录已失效，需要登录的内容将无法下载。请在“设置 → 账号与 Cookie”中重新登录。", a.site_name, a.label);
-                        let _ = app.notification().builder().title("登录已失效").body(body).show();
+                        let _ = app.notification().builder().title("登录已失效").body(&body).show();
+                        notify::emit(&app, notify::Event::Account, "登录已失效", &body);
                     }
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -133,7 +137,8 @@ fn spawn_account_reminders(app: tauri::AppHandle) {
                     format!("{}账号“{}”的登录状态将在 {} 小时后过期。", a.site_name, a.label, left / 3600 + 1)
                 };
                 use tauri_plugin_notification::NotificationExt;
-                let _ = app.notification().builder().title("登录即将失效").body(body).show();
+                let _ = app.notification().builder().title("登录即将失效").body(&body).show();
+                notify::emit(&app, notify::Event::Account, "登录即将失效", &body);
                 notified.insert(a.id.clone(), now);
             }
             tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
@@ -331,6 +336,7 @@ pub fn run() {
             commands::library_platforms,
             commands::redownload,
             commands::health_check,
+            commands::site_rule_test,
             commands::move_task,
             commands::schedule_task,
             commands::get_after_all_done,
@@ -365,6 +371,8 @@ pub fn run() {
             commands::clear_history,
             commands::list_library,
             commands::delete_library,
+            ai_cmds::notify_test,
+            ai_cmds::upload_test,
             library_cmds::library_set_meta,
             library_cmds::library_set_tags,
             library_cmds::library_bulk_tags,

@@ -296,6 +296,158 @@ pub struct Settings {
     pub auto_downgrade: bool,
     /// AI：语音转文字、字幕翻译、摘要与章节
     pub ai: AiSettings,
+    /// 自定义站点规则：用正则从网页源码里找视频地址
+    pub custom_sites: Vec<SiteRule>,
+    /// 把事件推送到手机 / 聊天工具
+    pub notify: NotifySettings,
+    /// 下载完成后自动上传 / 复制
+    pub upload: UploadSettings,
+    /// 下载完成后的自动规则
+    pub rules: Vec<AutoRule>,
+}
+
+/// 自动规则：下载完成后，满足条件就执行动作。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AutoRule {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub when: RuleWhen,
+    pub then: RuleThen,
+}
+
+/// 条件：留空的不限制，填了的必须全部满足。文字条件用 `|` 分隔多个关键词（满足任意一个），以 `re:` 开头表示正则。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RuleWhen {
+    /// 平台 ID（douyin / bilibili / …）或平台名称
+    pub platform: String,
+    pub author: String,
+    pub title: String,
+    /// video / audio / image / subtitle
+    pub kind: String,
+    /// manual / subscription / live …
+    pub source: String,
+    pub min_size_mb: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RuleThen {
+    pub add_tags: Vec<String>,
+    pub favorite: bool,
+    /// 移动到下载目录下的这个子目录（可用 {platform} {author} {year} {month} {day} {date} {kind}）
+    pub move_to: String,
+    /// 另外提取音频：mp3 / m4a / flac / opus；留空不提取
+    pub extract_audio: String,
+    /// 上传（需要在“自动上传”里填好目标，不论是否启用自动上传）
+    pub upload: bool,
+    /// 命中时推送一条通知
+    pub notify: bool,
+}
+
+/// 下载完成后自动上传到 WebDAV（Nextcloud、坚果云、Alist 等），或复制到另一个文件夹（NAS 挂载盘等）。
+/// WebDAV 密码保存在加密的保险箱里（`upload.webdav`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct UploadSettings {
+    pub enabled: bool,
+    /// webdav / folder
+    pub kind: String,
+    /// WebDAV 地址，或目标文件夹路径
+    pub url: String,
+    pub user: String,
+    /// 目标下的子目录规则；变量同“整理文件夹”：{platform} {author} {year} {month} {day} {date} {kind}
+    pub remote_dir: String,
+    /// 哪些类型的文件要上传
+    pub kinds: Vec<String>,
+    /// 上传成功后删除本地文件（默认保留）
+    pub delete_after: bool,
+}
+
+impl Default for UploadSettings {
+    fn default() -> Self {
+        UploadSettings {
+            enabled: false,
+            kind: "webdav".into(),
+            url: String::new(),
+            user: String::new(),
+            remote_dir: "ClearClip/{platform}".into(),
+            kinds: vec!["video".into(), "audio".into()],
+            delete_after: false,
+        }
+    }
+}
+
+/// 外部通知渠道。令牌 / Webhook 地址保存在加密的保险箱里（`notify.<id>`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct NotifyChannel {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    /// webhook / telegram / bark / serverchan / wecom / dingtalk / feishu / ntfy
+    pub kind: String,
+    /// Telegram 的 chat id、Bark 的服务器地址等不敏感的部分
+    pub target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct NotifySettings {
+    pub channels: Vec<NotifyChannel>,
+    /// 下载完成
+    pub on_done: bool,
+    /// 下载失败
+    pub on_failed: bool,
+    /// 直播开播 / 录制开始 / 结束 / 异常
+    pub on_live: bool,
+    /// 订阅有新内容
+    pub on_sub: bool,
+    /// 登录失效 / 即将失效
+    pub on_account: bool,
+}
+
+impl Default for NotifySettings {
+    fn default() -> Self {
+        NotifySettings { channels: vec![], on_done: true, on_failed: true, on_live: true, on_sub: true, on_account: true }
+    }
+}
+
+/// 自定义站点规则。内置解析器、yt-dlp 都不支持的网站，可以自己写一条正则来取视频地址。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SiteRule {
+    pub name: String,
+    pub enabled: bool,
+    /// 网址里包含这段文字时使用本规则；以 `re:` 开头表示正则
+    pub pattern: String,
+    /// 在网页源码里找视频地址的正则：取第一个捕获组，没有捕获组就取整个匹配
+    pub video_regex: String,
+    /// 标题的正则（取第一个捕获组）；留空用网页标题
+    pub title_regex: String,
+    /// 封面的正则（取第一个捕获组）；留空用 og:image
+    pub cover_regex: String,
+    /// 下载时的 Referer；留空用网页地址
+    pub referer: String,
+    /// 请求网页和下载时的 User-Agent；留空用电脑浏览器的
+    pub user_agent: String,
+}
+
+impl Default for SiteRule {
+    fn default() -> Self {
+        SiteRule {
+            name: String::new(),
+            enabled: true,
+            pattern: String::new(),
+            video_regex: String::new(),
+            title_regex: String::new(),
+            cover_regex: String::new(),
+            referer: String::new(),
+            user_agent: String::new(),
+        }
+    }
 }
 
 /// AI 功能的设置。API 密钥不在这里，保存在加密的保险箱里（`ai.api_key`、`stt.api_key`）。
@@ -550,6 +702,10 @@ impl Default for Settings {
             max_size_mb: 0,
             auto_downgrade: true,
             ai: AiSettings::default(),
+            custom_sites: vec![],
+            notify: NotifySettings::default(),
+            upload: UploadSettings::default(),
+            rules: vec![],
         }
     }
 }
@@ -618,6 +774,36 @@ impl Settings {
         self.remote_endpoint = self.remote_endpoint.trim().to_string();
         self.danmaku.normalize();
         self.ai.normalize();
+        self.rules.truncate(50);
+        for r in &mut self.rules {
+            r.id = r.id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(32).collect();
+            r.name = r.name.trim().to_string();
+            r.then.add_tags = r.then.add_tags.iter().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+            r.then.move_to = r.then.move_to.trim().to_string();
+            if !matches!(r.then.extract_audio.as_str(), "" | "mp3" | "m4a" | "flac" | "opus") {
+                r.then.extract_audio.clear();
+            }
+        }
+        self.upload.url = self.upload.url.trim().to_string();
+        self.upload.user = self.upload.user.trim().to_string();
+        self.upload.remote_dir = self.upload.remote_dir.trim().to_string();
+        if !matches!(self.upload.kind.as_str(), "webdav" | "folder") {
+            self.upload.kind = "webdav".into();
+        }
+        self.upload.kinds.retain(|k| matches!(k.as_str(), "video" | "audio" | "image" | "cover" | "subtitle"));
+        self.notify.channels.truncate(10);
+        for c in &mut self.notify.channels {
+            c.name = c.name.trim().to_string();
+            c.target = c.target.trim().to_string();
+            c.id = c.id.chars().filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_').take(32).collect();
+        }
+        self.notify.channels.retain(|c| !c.id.is_empty());
+        self.custom_sites.truncate(50);
+        for r in &mut self.custom_sites {
+            for f in [&mut r.name, &mut r.pattern, &mut r.video_regex, &mut r.title_regex, &mut r.cover_regex, &mut r.referer, &mut r.user_agent] {
+                *f = f.trim().to_string();
+            }
+        }
         self.max_size_mb = self.max_size_mb.min(1_000_000);
         self.library.trash_keep_days = self.library.trash_keep_days.min(3650);
         self.library.reorganize_template = self.library.reorganize_template.trim().to_string();

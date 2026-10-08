@@ -15,7 +15,7 @@ const tick = ref(Date.now())
 let unlisten: UnlistenFn | undefined
 let timer: number | undefined
 
-const DEFAULTS: LiveSettings = { autoRecord: true, quality: '', checkIntervalS: 60, segmentMinutes: 60, segmentMb: 0, convertMp4: false, mergeSegments: false, dir: '', notify: true }
+const DEFAULTS: LiveSettings = { autoRecord: true, quality: '', checkIntervalS: 60, segmentMinutes: 60, segmentMb: 0, convertMp4: false, mergeSegments: false, dir: '', notify: true, schedule: [] }
 
 async function load() {
   try {
@@ -55,7 +55,8 @@ function elapsed(r: LiveRoom) {
   return `${h}:${String(m).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
 }
 
-const STATE: Record<string, string> = { offline: '未开播', live: '直播中', recording: '录制中', error: '异常', checking: '检测中…' }
+const DAYS = ['一', '二', '三', '四', '五', '六', '日']
+const STATE: Record<string, string> = { offline: '未开播', live: '直播中', recording: '录制中', error: '异常', checking: '检测中…', scheduled: '等待预约时段' }
 
 async function remove(r: LiveRoom) {
   try {
@@ -223,6 +224,22 @@ const REC_STATUS: Record<string, string> = { recording: '录制中', done: '已�
             每 <el-input-number v-model="editing.settings.segmentMinutes" :min="0" :max="1440" :step="30" size="small" /> 分钟 或
             <el-input-number v-model="editing.settings.segmentMb" :min="0" :max="102400" :step="512" size="small" /> MB
             <span class="mute small">（0 表示不限）</span>
+          </div>
+          <label>预约时段</label>
+          <div class="col">
+            <div v-for="(w, i) in editing.settings.schedule" :key="i" class="win">
+              <el-checkbox-group v-model="w.days" size="small">
+                <el-checkbox-button v-for="(d, k) in DAYS" :key="k" :value="k + 1">{{ d }}</el-checkbox-button>
+              </el-checkbox-group>
+              <el-time-select v-model="w.start" size="small" class="tsel" start="00:00" end="23:30" step="00:30" :clearable="false" />
+              <span class="mute small">到</span>
+              <el-time-select v-model="w.end" size="small" class="tsel" start="00:00" end="23:30" step="00:30" :clearable="false" />
+              <el-button link size="small" @click="editing.settings.schedule.splice(i, 1)">删除</el-button>
+            </div>
+            <div>
+              <el-button size="small" @click="editing.settings.schedule.push({ days: [], start: '20:00', end: '23:00' })">添加时段</el-button>
+              <span class="mute small"> {{ editing.settings.schedule.length ? '只在这些时段检测开播和录制（不选星期表示每天；结束早于开始表示跨过午夜）' : '不设置时段则全天监控' }}</span>
+            </div>
           </div>
           <label>录完后</label>
           <div class="col">
@@ -433,5 +450,14 @@ h2 {
   gap: 6px;
   align-items: center;
   font-size: 12px;
+}
+.win {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.tsel {
+  width: 110px;
 }
 </style>

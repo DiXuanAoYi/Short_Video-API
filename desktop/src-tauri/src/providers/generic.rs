@@ -14,14 +14,14 @@ static ATTR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?is)([a-z:_-]+
 static TAG_SRC_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?is)<(?:video|source)\s[^>]*?src\s*=\s*["']([^"']+)["']"#).unwrap());
 static MEDIA_URL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)https?:(?:\\?/){2}(?:[^\s"'<>()\\]|\\/)+?\.(?:mp4|m3u8|webm|m4v|mov)(?:\?[^\s"'<>\\]*)?"#).unwrap());
-static TITLE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?is)<title[^>]*>(.*?)</title>"#).unwrap());
+pub(super) static TITLE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?is)<title[^>]*>(.*?)</title>"#).unwrap());
 
 fn attrs(tag: &str) -> Vec<(String, String)> {
     ATTR_RE.captures_iter(tag).map(|c| (c[1].to_ascii_lowercase(), c.get(3).or(c.get(4)).map(|m| m.as_str()).unwrap_or("").to_string())).collect()
 }
 
 /// `<meta property|name="key" content="...">` 的内容。
-fn meta(html: &str, keys: &[&str]) -> Vec<String> {
+pub(super) fn meta(html: &str, keys: &[&str]) -> Vec<String> {
     let mut out = vec![];
     for m in META_RE.find_iter(html) {
         let a = attrs(m.as_str());
@@ -35,13 +35,42 @@ fn meta(html: &str, keys: &[&str]) -> Vec<String> {
     out
 }
 
-fn html_unescape(s: &str) -> String {
+pub(super) fn html_unescape(s: &str) -> String {
     s.replace("&amp;", "&").replace("&quot;", "\"").replace("&#39;", "'").replace("&lt;", "<").replace("&gt;", ">")
 }
 
-fn ext_of(url: &str) -> Option<&'static str> {
+pub(super) fn ext_of(url: &str) -> Option<&'static str> {
     let path = url.split(['?', '#']).next().unwrap_or(url).to_ascii_lowercase();
-    ["mp4", "m3u8", "webm", "m4v", "mov", "mp3", "m4a", "jpg", "jpeg", "png", "gif", "webp"].into_iter().find(|e| path.ends_with(&format!(".{e}")))
+    ["mp4", "m3u8", "webm", "m4v", "mov", "mp3", "m4a", "aac", "ogg", "opus", "flac", "wav", "jpg", "jpeg", "png", "gif", "webp"]
+        .into_iter()
+        .find(|e| path.ends_with(&format!(".{e}")))
+}
+
+const VIDEO_EXTS: &[&str] = &["mp4", "m3u8", "webm", "m4v", "mov"];
+const AUDIO_EXTS: &[&str] = &["mp3", "m4a", "aac", "ogg", "opus", "flac", "wav"];
+
+/// 链接本身就是视频 / 音频文件（地址以媒体扩展名结尾，或带有订阅源附带的 `#cc-ext=` 提示）。
+pub fn direct_media_ext(url: &str) -> Option<&'static str> {
+    if let Some(e) = ext_of(url).filter(|e| VIDEO_EXTS.contains(e) || AUDIO_EXTS.contains(e)) {
+        return Some(e);
+    }
+    let hint = super::rss::fragment_hints(url).remove("cc-ext")?;
+    VIDEO_EXTS.iter().chain(AUDIO_EXTS).copied().find(|e| *e == hint)
+}
+
+pub fn is_direct_media(url: &str) -> bool {
+    direct_media_ext(url).is_some()
+}
+
+fn short_hash(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(&Sha256::digest(s.as_bytes())[..5])
+}
+
+fn audio_asset(url: &str, ext: &str, referer: &str) -> Asset {
+    let mut a = Asset::base("audio", AssetKind::Audio, url.to_string(), format!("音频 {}", ext.to_uppercase()), ext);
+    a.headers = vec![("Referer".into(), referer.to_string()), ("User-Agent".into(), DESKTOP_UA.into())];
+    a
 }
 
 /// 从网页中找出候选视频地址（按出现顺序去重，已转为绝对地址）。
@@ -73,7 +102,7 @@ pub fn sniff(html: &str, base: &Url) -> Vec<String> {
     found
 }
 
-fn asset_for(i: usize, url: &str, referer: &str) -> Asset {
+pub(super) fn asset_for(i: usize, url: &str, referer: &str) -> Asset {
     let ext = ext_of(url).unwrap_or("mp4");
     let hls = ext == "m3u8";
     let mut a = Asset::base(format!("video-{i}"), AssetKind::Video, url.to_string(), "", if hls { "mp4" } else { ext });
@@ -110,10 +139,37 @@ pub async fn resolve(ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo> {
     let name_from_path = || base.path_segments().and_then(|mut s| s.rfind(|x| !x.is_empty())).map(|s| s.to_string()).unwrap_or_else(|| host.clone());
 
     // 链接本身就是媒体文件
-    if let Some(e @ ("mp4" | "m3u8" | "webm" | "m4v" | "mov")) = ext_of(url) {
-        info.title = name_from_path().trim_end_matches(&format!(".{e}")).to_string();
-        info.id = info.title.clone();
-        info.assets.push(asset_for(0, url, &format!("{}://{host}/", base.scheme())));
+    if let Some(e) = direct_media_ext(url) {
+        let hints = super::rss::fragment_hints(url);
+        let mut clean = base.clone();
+        clean.set_fragment(None);
+        let clean = clean.to_string();
+        let referer = format!("{}://{host}/", base.scheme());
+        info.title = hints.get("cc-title").cloned().unwrap_or_else(|| name_from_path().trim_end_matches(&format!(".{e}")).to_string());
+        info.id = if hints.is_empty() {
+            info.title.clone()
+        } else {
+            format!("{}-{}", short_hash(&clean), crate::naming::sanitize(&info.title).chars().take(20).collect::<String>())
+        };
+        if let Some(a) = hints.get("cc-author") {
+            info.author = a.clone();
+        }
+        info.published_at = hints.get("cc-date").and_then(|d| d.parse().ok());
+        if !hints.is_empty() {
+            // 播客附件：按“播客”归类，避免被当成某个 CDN 站点
+            info.platform = "rss".into();
+            info.platform_name = "播客".into();
+        }
+        if AUDIO_EXTS.contains(&e) {
+            info.kind = MediaKind::Audio;
+            info.assets.push(audio_asset(&clean, e, &referer));
+        } else {
+            info.assets.push(asset_for(0, &clean, &referer));
+        }
+        if let Some(c) = hints.get("cc-cover") {
+            info.cover = Some(c.clone());
+            info.assets.push(Asset::cover(c.clone()));
+        }
         return Ok(info);
     }
 
@@ -139,10 +195,20 @@ pub async fn resolve(ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo> {
         info.assets.push(a);
         return Ok(info);
     }
+    if ctype.contains("xml") || ctype.contains("rss") {
+        let body = resp.text().await?;
+        let feed = super::rss::parse_feed(&body, &final_url).ok_or_else(|| AppError::unsupported("这个地址不是播客 / RSS 订阅源。"))?;
+        return Ok(super::rss::to_media_info(&feed, url, &host));
+    }
     if !ctype.is_empty() && !ctype.contains("html") && !ctype.contains("text") {
         return Err(AppError::unsupported("这个链接不是网页也不是视频文件。"));
     }
     let html = resp.text().await?;
+    if super::rss::is_feed_body(&html) {
+        if let Some(feed) = super::rss::parse_feed(&html, &final_url) {
+            return Ok(super::rss::to_media_info(&feed, url, &host));
+        }
+    }
     ctx.record("generic", "page", url, &html);
 
     info.title = meta(&html, &["og:title", "twitter:title"])
@@ -195,6 +261,30 @@ mod tests {
         let a = asset_for(2, &urls[2], base.as_str());
         assert_eq!(a.protocol, Protocol::Hls);
         assert_eq!(a.ext, "mp4");
+    }
+
+    #[tokio::test]
+    async fn podcast_attachment_links_resolve_without_network() {
+        let client = reqwest::Client::new();
+        let settings = crate::settings::Settings::default();
+        let store = crate::cookies::CookieStore::in_memory();
+        let ctx = Ctx::new(&client, &settings, &store);
+        let url = "https://media.example.com/dl?id=9#cc-title=%E7%AC%AC1%E6%9C%9F&cc-ext=m4a&cc-author=%E8%80%81%E7%8E%8B&cc-cover=https%3A%2F%2Fc.example.com%2Fx.jpg&cc-date=1759824000";
+        assert_eq!(direct_media_ext(url), Some("m4a"));
+        let info = resolve(&ctx, url).await.unwrap();
+        assert_eq!((info.title.as_str(), info.author.as_str(), info.platform.as_str()), ("第1期", "老王", "rss"));
+        assert_eq!(info.kind, MediaKind::Audio);
+        assert_eq!(info.published_at, Some(1_759_824_000));
+        let audio = info.assets.iter().find(|a| a.kind == AssetKind::Audio).unwrap();
+        assert_eq!((audio.ext.as_str(), audio.url.as_str()), ("m4a", "https://media.example.com/dl?id=9"), "the fragment is not part of the download address");
+        assert!(info.assets.iter().any(|a| a.kind == AssetKind::Cover));
+        // 两个不同的附件不会得到同一个作品 ID
+        let other = resolve(&ctx, "https://media.example.com/dl?id=10#cc-title=%E7%AC%AC1%E6%9C%9F&cc-ext=m4a").await.unwrap();
+        assert_ne!(info.id, other.id);
+        // 普通音频直链
+        let plain = resolve(&ctx, "https://x.example.com/a/song.mp3").await.unwrap();
+        assert_eq!((plain.title.as_str(), plain.kind), ("song", MediaKind::Audio));
+        assert!(!is_direct_media("https://x.example.com/watch?v=1"));
     }
 
     #[test]

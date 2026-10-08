@@ -11,6 +11,10 @@ import NetworkPanel from '../components/NetworkPanel.vue'
 import ComponentsPanel from '../components/ComponentsPanel.vue'
 import PhonePanel from '../components/PhonePanel.vue'
 import AiPanel from '../components/AiPanel.vue'
+import SiteRulesPanel from '../components/SiteRulesPanel.vue'
+import NotifyPanel from '../components/NotifyPanel.vue'
+import UploadPanel from '../components/UploadPanel.vue'
+import RulesPanel from '../components/RulesPanel.vue'
 import type { HealthResult } from '../types'
 import { copyDiagnostics } from '../composables/diagnostics'
 
@@ -402,6 +406,7 @@ function insertVar(v: string) {
               <small class="mute">变量：{series} 剧名或列表名、{season} 季、{episode} 集数，以及 {title} {author} 等；“/” 表示子文件夹。留空则使用普通文件命名。</small>
             </div>
           </section>
+          <SiteRulesPanel v-model="form.customSites" />
           <section class="group card">
             <h3>其他网站</h3>
             <div class="kv">
@@ -434,6 +439,14 @@ function insertVar(v: string) {
 
       <el-tab-pane label="手机与浏览器扩展" name="phone">
         <PhonePanel />
+      </el-tab-pane>
+
+      <el-tab-pane label="自动化" name="automation">
+        <div class="groups">
+          <NotifyPanel v-model="form.notify" />
+          <UploadPanel v-model="form.upload" />
+          <RulesPanel v-model="form.rules" class="wide" />
+        </div>
       </el-tab-pane>
 
       <el-tab-pane label="AI" name="ai">
@@ -539,6 +552,9 @@ function insertVar(v: string) {
 </template>
 
 <style scoped>
+.wide {
+  grid-column: 1 / -1;
+}
 .slim {
   width: 180px;
 }

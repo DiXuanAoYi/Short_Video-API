@@ -222,6 +222,10 @@ pub async fn after_download(app: AppHandle, platform: String, media_id: String, 
     if item.kind == "video" {
         crate::ai::auto_transcribe(&app, &st, &item);
     }
+    // 自动规则可能会移动文件，所以放在上传之前，上传时重新读取记录
+    crate::rules::run_for(&app, &st, &item);
+    let item = st.db.library_item(item.id).ok().flatten().unwrap_or(item);
+    crate::upload::auto_upload(&app, &st, &item);
     if !st.settings().library.probe_new_files {
         return;
     }

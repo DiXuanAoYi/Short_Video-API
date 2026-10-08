@@ -51,6 +51,10 @@ pub struct SubSettings {
     /// 命名模板（为空时用全局模板）
     pub template: String,
     pub notify: bool,
+    /// 只保留最近多少个作品，更早的移到回收站（0 表示全部保留）
+    pub keep_latest: u32,
+    /// 只保留最近多少天下载的，更早的移到回收站（0 表示全部保留）
+    pub keep_days: u32,
 }
 
 impl Default for SubSettings {
@@ -69,6 +73,8 @@ impl Default for SubSettings {
             dir: String::new(),
             template: String::new(),
             notify: true,
+            keep_latest: 0,
+            keep_days: 0,
         }
     }
 }
@@ -86,6 +92,8 @@ impl SubSettings {
         }
         self.dir = self.dir.trim().to_string();
         self.template = self.template.trim().to_string();
+        self.keep_latest = self.keep_latest.min(100_000);
+        self.keep_days = self.keep_days.min(36_500);
     }
 
     /// 条目是否通过过滤条件；不通过时返回原因。
@@ -556,6 +564,10 @@ async fn check_inner(app: &AppHandle, state: &Arc<AppState>, id: i64) -> AppResu
         let _ = state.db.conn().execute("UPDATE subscriptions SET avatar=?2 WHERE id=?1", params![id, list.avatar]);
     }
     emit(app);
+    {
+        let (state2, sub2) = (state.clone(), sub.clone());
+        let _ = tokio::task::spawn_blocking(move || apply_retention(&state2, &sub2)).await;
+    }
     if !to_download.is_empty() {
         let n = to_download.len();
         download_entries(app, &sub, to_download).await;
@@ -564,6 +576,55 @@ async fn check_inner(app: &AppHandle, state: &Arc<AppState>, id: i64) -> AppResu
         }
     }
     Ok(found)
+}
+
+/// 订阅的保存目录：自己设置的，或“下载目录 / 订阅名”。
+pub fn sub_dir(download_root: &std::path::Path, sub: &Subscription) -> std::path::PathBuf {
+    if sub.settings.dir.is_empty() {
+        download_root.join(crate::naming::sanitize(&sub.title))
+    } else {
+        std::path::PathBuf::from(&sub.settings.dir)
+    }
+}
+
+/// 按保留规则找出要清理的记录：同一个作品的视频、字幕、封面一起算，按下载时间从新到旧保留。
+pub fn retention_victims(items: &[crate::db::LibraryItem], keep_latest: u32, keep_days: u32, now: i64) -> Vec<i64> {
+    use std::collections::HashMap;
+    if keep_latest == 0 && keep_days == 0 {
+        return vec![];
+    }
+    let mut groups: HashMap<(&str, &str), Vec<&crate::db::LibraryItem>> = HashMap::new();
+    for i in items {
+        groups.entry((i.platform.as_str(), i.media_id.as_str())).or_default().push(i);
+    }
+    let mut ordered: Vec<(i64, Vec<&crate::db::LibraryItem>)> = groups.into_values().map(|v| (v.iter().map(|i| i.finished_at).max().unwrap_or(0), v)).collect();
+    ordered.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
+    let mut out = vec![];
+    for (idx, (newest, group)) in ordered.iter().enumerate() {
+        let too_many = keep_latest > 0 && idx >= keep_latest as usize;
+        let too_old = keep_days > 0 && now - newest > keep_days as i64 * 86400;
+        if too_many || too_old {
+            out.extend(group.iter().map(|i| i.id));
+        }
+    }
+    out
+}
+
+/// 按订阅的保留规则清理旧文件（移到回收站，开启回收站时可还原）。返回清理的文件数。
+pub fn apply_retention(state: &AppState, sub: &Subscription) -> usize {
+    if sub.settings.keep_latest == 0 && sub.settings.keep_days == 0 {
+        return 0;
+    }
+    let dir = sub_dir(&state.settings().download_root(), sub);
+    let Ok(all) = state.db.search_library(&crate::db::LibraryFilter { source: Some("subscription".into()), ..Default::default() }, 100_000) else { return 0 };
+    let mine: Vec<crate::db::LibraryItem> = all.into_iter().filter(|i| std::path::Path::new(&i.path).starts_with(&dir)).collect();
+    let victims = retention_victims(&mine, sub.settings.keep_latest, sub.settings.keep_days, now());
+    if victims.is_empty() {
+        return 0;
+    }
+    let rep = crate::library_cmds::delete_items(state, &victims, true);
+    log::info!("subscription {} retention: removed {} files ({} to trash)", sub.id, rep.removed, rep.trashed);
+    rep.removed
 }
 
 /// 逐条解析并加入下载队列（订阅自己的保存目录、命名和清晰度）。
@@ -582,11 +643,7 @@ async fn download_entries(app: &AppHandle, sub: &Subscription, entries: Vec<SubE
             }
             quality::sort_videos(&mut info, &settings);
             let (ids, post): (Vec<String>, PostOptions) = quality::auto_selection(&info, &settings);
-            let dir = if sub.settings.dir.is_empty() {
-                settings.download_root().join(crate::naming::sanitize(&sub.title))
-            } else {
-                std::path::PathBuf::from(&sub.settings.dir)
-            };
+            let dir = sub_dir(&settings.download_root(), sub);
             let extra = EnqueueExtra {
                 dir: Some(dir),
                 template: (!sub.settings.template.is_empty()).then(|| sub.settings.template.clone()),
@@ -644,6 +701,7 @@ pub fn ignore_items(app: &AppHandle, id: i64, item_ids: &[String]) -> AppResult<
 fn notify(app: &AppHandle, title: &str, body: &str) {
     use tauri_plugin_notification::NotificationExt;
     let _ = app.notification().builder().title(title).body(body).show();
+    crate::notify::emit(app, crate::notify::Event::Sub, title, body);
 }
 
 /// 后台调度：每分钟检查一次到期的订阅；启动后补做错过的检查。
@@ -717,6 +775,61 @@ mod tests {
         assert_eq!(s.first_run, "new_only");
         assert_eq!(s.max_auto, 1);
         assert_eq!(s.include, vec!["a"]);
+    }
+
+    fn li(id: i64, media: &str, kind: &str, finished_at: i64) -> crate::db::LibraryItem {
+        crate::db::LibraryItem {
+            id,
+            platform: "bilibili".into(),
+            media_id: media.into(),
+            asset_id: kind.into(),
+            title: media.into(),
+            author: String::new(),
+            cover: None,
+            path: format!("/dl/{media}.{kind}"),
+            size: 1,
+            finished_at,
+            exists: true,
+            kind: kind.into(),
+            source: "subscription".into(),
+            source_url: String::new(),
+            platform_name: String::new(),
+            cover_path: None,
+            favorite: false,
+            rating: 0,
+            note: String::new(),
+            tags: vec![],
+            duration_ms: None,
+        }
+    }
+
+    #[test]
+    fn retention_removes_whole_works_oldest_first() {
+        let day = 86400;
+        let now = 100 * day;
+        // 四个作品：A 最新（有视频和字幕）、B、C、D 最旧
+        let items = vec![
+            li(1, "A", "video", now - day),
+            li(2, "A", "subtitle", now - day + 10),
+            li(3, "B", "video", now - 5 * day),
+            li(4, "C", "video", now - 20 * day),
+            li(5, "C", "cover", now - 20 * day),
+            li(6, "D", "video", now - 60 * day),
+        ];
+        assert!(retention_victims(&items, 0, 0, now).is_empty(), "no rule keeps everything");
+        let mut v = retention_victims(&items, 2, 0, now);
+        v.sort();
+        assert_eq!(v, vec![4, 5, 6], "keep the 2 newest works, C's cover goes with its video");
+        let mut v = retention_victims(&items, 0, 30, now);
+        v.sort();
+        assert_eq!(v, vec![6], "only D is older than 30 days");
+        let mut v = retention_victims(&items, 3, 30, now);
+        v.sort();
+        assert_eq!(v, vec![6], "3 newest are kept by count, D is too old");
+        let mut v = retention_victims(&items, 2, 30, now);
+        v.sort();
+        assert_eq!(v, vec![4, 5, 6], "both rules apply");
+        assert!(retention_victims(&items, 10, 0, now).is_empty());
     }
 
     #[test]

@@ -30,6 +30,8 @@ const DEFAULTS: SubSettings = {
   dir: '',
   template: '',
   notify: true,
+  keepLatest: 0,
+  keepDays: 0,
 }
 
 // ---------- 列表 ----------
@@ -335,6 +337,11 @@ const ITEM_STATUS: Record<string, string> = { seen: '订阅前已发布', pendin
           </div>
           <label>只下载最近</label>
           <div class="row"><el-input-number v-model="editing.settings.maxAgeDays" :min="0" :max="3650" size="small" placeholder="不限" /> <span class="mute small">天内发布的</span></div>
+          <label>只保留最近</label>
+          <div class="row">
+            <el-input-number v-model="editing.settings.keepLatest" :min="0" :max="100000" size="small" /> <span class="mute small">个作品</span>
+            <el-input-number v-model="editing.settings.keepDays" :min="0" :max="36500" size="small" /> <span class="mute small">天内下载的（0 表示不清理；超出的移到回收站）</span>
+          </div>
           <label>清晰度</label>
           <el-select v-model="editing.settings.quality" size="small" clearable placeholder="跟随全局设置">
             <el-option value="best" label="最高画质" />

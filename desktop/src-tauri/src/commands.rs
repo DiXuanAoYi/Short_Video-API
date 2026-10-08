@@ -606,6 +606,19 @@ const HEALTH_SAMPLES: &[(&str, &str)] =
     &[("bilibili", "https://www.bilibili.com/video/BV1GJ411x7h7"), ("yt-dlp", "https://www.youtube.com/watch?v=jNQXAC9IVRw")];
 
 /// 平台健康检查：用示例链接测试各平台解析是否正常。
+/// 试用一条自定义站点规则：用它解析给定网址，返回解析结果（不下载）。
+#[tauri::command]
+pub async fn site_rule_test(state: St<'_>, rule: crate::settings::SiteRule, url: String) -> AppResult<MediaInfo> {
+    let settings = state.settings();
+    let ctx = state.parse_ctx(&settings);
+    let mut rule = rule;
+    rule.enabled = true;
+    if rule.video_regex.trim().is_empty() {
+        return Err(AppError::invalid("请先填写“视频地址”的正则。"));
+    }
+    providers::custom::resolve(&ctx, &rule, url.trim()).await
+}
+
 #[tauri::command]
 pub async fn health_check(state: St<'_>) -> AppResult<Vec<HealthResult>> {
     let settings = state.settings();

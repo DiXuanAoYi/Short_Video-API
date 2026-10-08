@@ -318,6 +318,70 @@ export type SubOp =
 
 export type SubJob = SubOp & { input: string; format?: string | null }
 
+export interface SiteRule {
+  name: string
+  enabled: boolean
+  pattern: string
+  videoRegex: string
+  titleRegex: string
+  coverRegex: string
+  referer: string
+  userAgent: string
+}
+
+export interface NotifyChannel {
+  id: string
+  name: string
+  enabled: boolean
+  kind: 'webhook' | 'telegram' | 'bark' | 'serverchan' | 'wecom' | 'dingtalk' | 'feishu' | 'ntfy'
+  target: string
+}
+
+export interface NotifySettings {
+  channels: NotifyChannel[]
+  onDone: boolean
+  onFailed: boolean
+  onLive: boolean
+  onSub: boolean
+  onAccount: boolean
+}
+
+export interface UploadSettings {
+  enabled: boolean
+  kind: 'webdav' | 'folder'
+  url: string
+  user: string
+  remoteDir: string
+  kinds: string[]
+  deleteAfter: boolean
+}
+
+export interface RuleWhen {
+  platform: string
+  author: string
+  title: string
+  kind: string
+  source: string
+  minSizeMb: number
+}
+
+export interface RuleThen {
+  addTags: string[]
+  favorite: boolean
+  moveTo: string
+  extractAudio: string
+  upload: boolean
+  notify: boolean
+}
+
+export interface AutoRule {
+  id: string
+  name: string
+  enabled: boolean
+  when: RuleWhen
+  then: RuleThen
+}
+
 export interface AiSettings {
   baseUrl: string
   model: string
@@ -499,6 +563,17 @@ export interface Settings {
   maxSizeMb: number
   autoDowngrade: boolean
   ai: AiSettings
+  customSites: SiteRule[]
+  notify: NotifySettings
+  upload: UploadSettings
+  rules: AutoRule[]
+}
+
+export interface TimeWindow {
+  /** 1 = 周一 … 7 = 周日；空表示每天 */
+  days: number[]
+  start: string
+  end: string
 }
 
 export interface LiveSettings {
@@ -511,6 +586,7 @@ export interface LiveSettings {
   mergeSegments: boolean
   dir: string
   notify: boolean
+  schedule: TimeWindow[]
 }
 
 export interface LiveStream {
@@ -580,6 +656,8 @@ export interface SubSettings {
   dir: string
   template: string
   notify: boolean
+  keepLatest: number
+  keepDays: number
 }
 
 export interface Subscription {

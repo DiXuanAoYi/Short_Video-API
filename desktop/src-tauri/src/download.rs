@@ -1216,6 +1216,7 @@ fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>
     let mut done_file: Option<(PathBuf, Arc<MediaInfo>)> = None;
     let mut done_key: Option<(String, String, String)> = None;
     let mut downgrade: Option<(Arc<MediaInfo>, JobSpec, ErrorKind)> = None;
+    let mut failed_note: Option<(String, String)> = None;
     let mut sub_touched = false;
     let leftovers: Vec<PathBuf> = inputs.iter().cloned().chain(std::iter::once(part.to_path_buf())).collect();
     let found = with_entry(st, id, |e| {
@@ -1289,6 +1290,7 @@ fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>
                 e.snap.status = TaskStatus::Failed;
                 e.snap.error_kind = Some(err.kind());
                 e.snap.error = Some(err.to_string());
+                failed_note = Some((e.snap.title.clone(), err.to_string()));
             }
         }
         persist(st, e);
@@ -1308,8 +1310,12 @@ fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>
     if sub_touched {
         let _ = app.emit(crate::subs::EVT_SUBS, ());
     }
+    let mut downgraded = false;
     if let (Some((media, spec, kind)), Some(_)) = (downgrade, found) {
-        try_downgrade(app, id, &media, &spec, kind);
+        downgraded = try_downgrade(app, id, &media, &spec, kind);
+    }
+    if let (Some((title, err)), false) = (failed_note, downgraded) {
+        crate::notify::emit(app, crate::notify::Event::Failed, "下载失败", &format!("{title}\n{err}"));
     }
     if found.is_none() {
         // 任务已被移除：清理残留
@@ -1329,6 +1335,9 @@ fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>
         }
     }
     let all_done = !st.downloads.has_active();
+    if let Some((title, label)) = &notify {
+        crate::notify::emit(app, crate::notify::Event::Done, "下载完成", &format!("{title}（{label}）"));
+    }
     if let Some((title, label)) = notify {
         if settings.notify_on_complete && all_done {
             use tauri_plugin_notification::NotificationExt;

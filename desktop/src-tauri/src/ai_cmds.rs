@@ -118,3 +118,15 @@ pub fn media_job_text(state: St<'_>, id: u64, which: Option<String>) -> AppResul
     }
     std::fs::read_to_string(&path).map_err(|_| AppError::not_found("读不到输出文件"))
 }
+
+/// 给指定的通知渠道发一条测试通知。
+#[tauri::command]
+pub async fn notify_test(state: St<'_>, id: String) -> AppResult<()> {
+    crate::notify::test(&state, &id).await
+}
+
+/// 测试自动上传的连接（WebDAV 或目标文件夹）。
+#[tauri::command]
+pub async fn upload_test(state: St<'_>) -> AppResult<String> {
+    crate::upload::test(&state).await
+}

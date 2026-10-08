@@ -74,6 +74,12 @@ pub async fn list(ctx: &Ctx<'_>, url: &str, limit: usize) -> AppResult<ListResul
     if let Some(c) = PIXIV_USER.captures(url) {
         return pixiv_user(ctx, &c[1], limit).await;
     }
+    if super::rss::looks_like_feed_url(url) {
+        match super::rss::list(ctx, url, limit).await {
+            Ok(r) => return Ok(r),
+            Err(e) => log::info!("not a usable feed ({e}), listing with yt-dlp"),
+        }
+    }
     ytdlp_list(ctx, &normalize_url(url), limit).await
 }
 

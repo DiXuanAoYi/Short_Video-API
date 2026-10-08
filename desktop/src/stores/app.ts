@@ -5,7 +5,7 @@ import type { AppInfo, ErrorKind, HistoryItem, MediaInfo, Settings, TaskSnapshot
 
 export type ViewName = 'parse' | 'queue' | 'subs' | 'live' | 'library' | 'tools' | 'settings'
 export type LibraryTab = 'files' | 'inbox' | 'history'
-export type SettingsTab = 'download' | 'parse' | 'network' | 'accounts' | 'phone' | 'ai' | 'components' | 'diagnostics' | 'general'
+export type SettingsTab = 'download' | 'parse' | 'network' | 'accounts' | 'phone' | 'ai' | 'automation' | 'components' | 'diagnostics' | 'general'
 
 /** 设置、主题与当前页面。 */
 export const useAppStore = defineStore('app', () => {
