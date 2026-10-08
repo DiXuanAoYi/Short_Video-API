@@ -47,6 +47,12 @@ pub struct LibraryItem {
     pub platform_name: String,
     /// 本地缓存的封面
     pub cover_path: Option<String>,
+    pub favorite: bool,
+    /// 评分 0–5，0 表示未评分
+    pub rating: i64,
+    pub note: String,
+    pub tags: Vec<String>,
+    pub duration_ms: Option<i64>,
 }
 
 /// 媒体库筛选条件。
@@ -61,6 +67,11 @@ pub struct LibraryFilter {
     pub since: Option<i64>,
     /// 只看文件已丢失的
     pub missing_only: bool,
+    pub tag: Option<String>,
+    pub favorite_only: bool,
+    pub min_rating: i64,
+    /// finished（默认）/ size / title / rating
+    pub sort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -151,6 +162,12 @@ impl Db {
             ("source_url", "TEXT NOT NULL DEFAULT ''"),
             ("platform_name", "TEXT NOT NULL DEFAULT ''"),
             ("cover_path", "TEXT"),
+            ("favorite", "INTEGER NOT NULL DEFAULT 0"),
+            ("rating", "INTEGER NOT NULL DEFAULT 0"),
+            ("note", "TEXT NOT NULL DEFAULT ''"),
+            ("duration_ms", "INTEGER"),
+            ("phash", "TEXT"),
+            ("quick_hash", "TEXT"),
         ] {
             if !cols.iter().any(|c| c == name) {
                 conn.execute_batch(&format!("ALTER TABLE downloads ADD COLUMN {name} {def}"))?;
@@ -159,6 +176,7 @@ impl Db {
         conn.execute_batch(crate::subs::SCHEMA)?;
         conn.execute_batch(crate::live::SCHEMA)?;
         conn.execute_batch(crate::inbox::SCHEMA)?;
+        conn.execute_batch(crate::library::SCHEMA)?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_downloads_platform ON downloads(platform);
              CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);",
@@ -280,26 +298,48 @@ impl Db {
     }
 
     pub fn search_library(&self, f: &LibraryFilter, limit: i64) -> AppResult<Vec<LibraryItem>> {
-        let mut sql = format!("SELECT {LIB_COLS} FROM downloads WHERE (title LIKE ?1 OR author LIKE ?1)");
+        let mut sql = format!(
+            "SELECT {LIB_COLS} FROM downloads WHERE (title LIKE ?1 OR author LIKE ?1 OR note LIKE ?1 \
+             OR EXISTS (SELECT 1 FROM item_tags it JOIN tags t ON t.id = it.tag_id WHERE it.item_id = downloads.id AND t.name LIKE ?1))"
+        );
         let mut args: Vec<rusqlite::types::Value> = vec![format!("%{}%", f.query.trim()).into()];
-        let mut push = |cond: &str, v: rusqlite::types::Value, sql: &mut String| {
+        fn push(args: &mut Vec<rusqlite::types::Value>, sql: &mut String, cond: &str, v: rusqlite::types::Value) {
             args.push(v);
             sql.push_str(&format!(" AND {cond}?{}", args.len()));
-        };
+        }
         if let Some(p) = f.platform.as_ref().filter(|p| !p.is_empty()) {
-            push("platform=", p.clone().into(), &mut sql);
+            push(&mut args, &mut sql, "platform=", p.clone().into());
         }
         if let Some(k) = f.kind.as_ref().filter(|k| !k.is_empty()) {
-            push("kind=", k.clone().into(), &mut sql);
+            push(&mut args, &mut sql, "kind=", k.clone().into());
         }
         if let Some(s) = f.source.as_ref().filter(|s| !s.is_empty()) {
-            push("source=", s.clone().into(), &mut sql);
+            push(&mut args, &mut sql, "source=", s.clone().into());
         }
         if let Some(t) = f.since {
-            push("finished_at>=", t.into(), &mut sql);
+            push(&mut args, &mut sql, "finished_at>=", t.into());
         }
+        if let Some(tag) = f.tag.as_ref().filter(|t| !t.is_empty()) {
+            args.push(tag.clone().into());
+            sql.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM item_tags it JOIN tags t ON t.id = it.tag_id WHERE it.item_id = downloads.id AND t.name = ?{} COLLATE NOCASE)",
+                args.len()
+            ));
+        }
+        if f.favorite_only {
+            sql.push_str(" AND favorite = 1");
+        }
+        if f.min_rating > 0 {
+            push(&mut args, &mut sql, "rating>=", f.min_rating.into());
+        }
+        let order = match f.sort.as_deref() {
+            Some("size") => "size DESC, id DESC",
+            Some("title") => "title COLLATE NOCASE ASC, id DESC",
+            Some("rating") => "rating DESC, finished_at DESC, id DESC",
+            _ => "finished_at DESC, id DESC",
+        };
         args.push(if f.missing_only { 20_000i64 } else { limit }.into());
-        sql.push_str(&format!(" ORDER BY finished_at DESC, id DESC LIMIT ?{}", args.len()));
+        sql.push_str(&format!(" ORDER BY {order} LIMIT ?{}", args.len()));
         let conn = self.conn();
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), lib_row)?;
@@ -351,11 +391,14 @@ impl Db {
         let conn = self.conn();
         let path: Option<String> = conn.query_row("SELECT path FROM downloads WHERE id=?1", params![id], |r| r.get(0)).optional()?;
         conn.execute("DELETE FROM downloads WHERE id=?1", params![id])?;
+        conn.execute("DELETE FROM item_tags WHERE item_id=?1", params![id])?;
+        conn.execute("DELETE FROM cues WHERE sub_item=?1", params![id])?;
         Ok(path)
     }
 }
 
-const LIB_COLS: &str = "id, platform, media_id, asset_id, title, author, cover, path, size, finished_at, kind, source, source_url, platform_name, cover_path";
+const LIB_COLS: &str = "id, platform, media_id, asset_id, title, author, cover, path, size, finished_at, kind, source, source_url, platform_name, cover_path, favorite, rating, note, duration_ms, \
+    (SELECT GROUP_CONCAT(t.name, char(31)) FROM item_tags it JOIN tags t ON t.id = it.tag_id WHERE it.item_id = downloads.id)";
 
 fn lib_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryItem> {
     let path: String = r.get(7)?;
@@ -376,6 +419,11 @@ fn lib_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryItem> {
         source_url: r.get(12)?,
         platform_name: r.get(13)?,
         cover_path: r.get::<_, Option<String>>(14)?.filter(|p| Path::new(p).exists()),
+        favorite: r.get::<_, i64>(15)? != 0,
+        rating: r.get(16)?,
+        note: r.get(17)?,
+        duration_ms: r.get(18)?,
+        tags: r.get::<_, Option<String>>(19)?.map(|t| t.split('\u{1f}').map(String::from).collect()).unwrap_or_default(),
     })
 }
 

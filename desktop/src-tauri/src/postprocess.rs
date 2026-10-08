@@ -28,7 +28,7 @@ pub fn ffmpeg_missing() -> AppError {
     AppError::new(ErrorKind::NeedUpdate, "需要 ffmpeg 才能合并音视频。请在“设置 → 组件”中安装 ffmpeg 后重试。")
 }
 
-fn base_args() -> Vec<String> {
+pub(crate) fn base_args() -> Vec<String> {
     vec!["-hide_banner".into(), "-loglevel".into(), "error".into(), "-y".into()]
 }
 
@@ -515,6 +515,26 @@ pub async fn run_ffmpeg_in(ffmpeg: &Path, args: &[String], cwd: Option<&Path>) -
         Ok(())
     } else {
         let err = String::from_utf8_lossy(&out.stderr);
+        let tail: String = err.lines().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" ");
+        Err(AppError::msg(format!("ffmpeg 处理失败：{tail}")))
+    }
+}
+
+/// 运行 ffmpeg 并取回标准输出和标准错误（用于读取帧数据、分析结果）。超时后强制结束。
+pub async fn run_ffmpeg_capture(ffmpeg: &Path, args: &[String], timeout: std::time::Duration) -> AppResult<(Vec<u8>, String)> {
+    let mut cmd = tokio::process::Command::new(ffmpeg);
+    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    let child = cmd.spawn().map_err(|e| AppError::new(ErrorKind::NeedUpdate, format!("无法运行 ffmpeg：{e}")))?;
+    let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(r) => r.map_err(|e| AppError::msg(format!("ffmpeg 运行失败：{e}")))?,
+        Err(_) => return Err(AppError::msg("ffmpeg 处理超时。")),
+    };
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    if out.status.success() {
+        Ok((out.stdout, err))
+    } else {
         let tail: String = err.lines().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" ");
         Err(AppError::msg(format!("ffmpeg 处理失败：{tail}")))
     }

@@ -160,6 +160,12 @@ export interface LibraryItem {
   sourceUrl: string
   platformName: string
   coverPath: string | null
+  favorite: boolean
+  /** 0–5，0 表示未评分 */
+  rating: number
+  note: string
+  tags: string[]
+  durationMs: number | null
 }
 
 export interface LibraryFilter {
@@ -169,6 +175,96 @@ export interface LibraryFilter {
   source: string | null
   since: number | null
   missingOnly: boolean
+  tag: string | null
+  favoriteOnly: boolean
+  minRating: number
+  sort: 'finished' | 'size' | 'title' | 'rating' | null
+}
+
+export interface TagCount {
+  name: string
+  count: number
+}
+
+export interface Bucket {
+  key: string
+  name: string
+  count: number
+  size: number
+}
+
+export interface LibraryStats {
+  count: number
+  totalSize: number
+  missing: number
+  byKind: Bucket[]
+  byPlatform: Bucket[]
+  byAuthor: Bucket[]
+  byMonth: Bucket[]
+  largest: { id: number; title: string; path: string; size: number; exists: boolean }[]
+}
+
+export interface TrashItem {
+  id: number
+  title: string
+  originalPath: string
+  size: number
+  deletedAt: number
+}
+
+export interface CueHit {
+  itemId: number | null
+  title: string
+  path: string
+  lang: string
+  startMs: number
+  text: string
+}
+
+export interface MovePlan {
+  id: number
+  from: string
+  to: string
+}
+
+export interface MoveReport {
+  moved: number
+  skipped: string[]
+}
+
+export interface ImportReport {
+  added: number
+  subtitles: number
+  skipped: number
+}
+
+export interface DupGroup {
+  kind: 'exact' | 'similar'
+  items: LibraryItem[]
+}
+
+export interface DeleteReport {
+  removed: number
+  trashed: number
+  failed: string[]
+}
+
+export interface SceneList {
+  durationMs: number
+  scenes: Chapter[]
+}
+
+export interface BackupInfo {
+  appVersion: string
+  createdAt: number
+  size: number
+}
+
+export interface LibrarySettings {
+  useTrash: boolean
+  trashKeepDays: number
+  reorganizeTemplate: string
+  probeNewFiles: boolean
 }
 
 export interface PlatformCount {
@@ -316,6 +412,7 @@ export interface Settings {
   subtitleConvert: boolean
   danmakuAss: boolean
   verifyDownloads: boolean
+  library: LibrarySettings
 }
 
 export interface LiveSettings {

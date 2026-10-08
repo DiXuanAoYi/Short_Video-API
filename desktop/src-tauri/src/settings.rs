@@ -286,6 +286,28 @@ pub struct Settings {
     pub danmaku_ass: bool,
     /// 下载完成后用 ffmpeg 检查文件能否正常读取，损坏时自动重新下载一次
     pub verify_downloads: bool,
+    /// 媒体库：回收站、整理规则
+    pub library: LibrarySettings,
+}
+
+/// 媒体库设置。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LibrarySettings {
+    /// 删除文件时先放进回收站（下载目录里的隐藏文件夹），可以还原
+    pub use_trash: bool,
+    /// 回收站里的文件保留多少天后自动清空（0 表示不自动清空）
+    pub trash_keep_days: u32,
+    /// “整理目录”使用的子目录规则；变量：{platform} {author} {year} {month} {day} {date} {kind}
+    pub reorganize_template: String,
+    /// 下载完成后给没有封面的视频截一张图，并记录时长
+    pub probe_new_files: bool,
+}
+
+impl Default for LibrarySettings {
+    fn default() -> Self {
+        LibrarySettings { use_trash: true, trash_keep_days: 30, reorganize_template: "{platform}/{author}".into(), probe_new_files: true }
+    }
 }
 
 /// 收到的链接的记录与保留。
@@ -396,6 +418,7 @@ impl Default for Settings {
             subtitle_convert: true,
             danmaku_ass: true,
             verify_downloads: true,
+            library: LibrarySettings::default(),
         }
     }
 }
@@ -462,6 +485,11 @@ impl Settings {
             self.filename_template = Settings::default().filename_template;
         }
         self.remote_endpoint = self.remote_endpoint.trim().to_string();
+        self.library.trash_keep_days = self.library.trash_keep_days.min(3650);
+        self.library.reorganize_template = self.library.reorganize_template.trim().to_string();
+        if self.library.reorganize_template.is_empty() {
+            self.library.reorganize_template = LibrarySettings::default().reorganize_template;
+        }
     }
 
     pub fn download_root(&self) -> PathBuf {

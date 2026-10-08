@@ -710,16 +710,11 @@ pub fn is_portable() -> bool {
 
 #[tauri::command]
 pub async fn delete_library(state: St<'_>, id: i64, delete_file: bool) -> AppResult<()> {
-    if let Some(path) = state.db.delete_library(id)? {
-        if delete_file {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(AppError::new(crate::error::ErrorKind::Disk, format!("记录已删除，但文件删除失败：{e}"))),
-            }
-        }
+    let rep = crate::library_cmds::delete_items(&state, &[id], delete_file);
+    match rep.failed.into_iter().next() {
+        Some(msg) => Err(AppError::new(crate::error::ErrorKind::Disk, msg)),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// 写入剪贴板，并让监听忽略这次变化。

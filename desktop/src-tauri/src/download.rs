@@ -1204,6 +1204,7 @@ fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
 fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>, part: &Path, final_path: &Path, inputs: &[PathBuf], settings: &Settings) {
     let mut notify: Option<(String, String)> = None;
     let mut done_file: Option<(PathBuf, Arc<MediaInfo>)> = None;
+    let mut done_key: Option<(String, String, String)> = None;
     let mut sub_touched = false;
     let leftovers: Vec<PathBuf> = inputs.iter().cloned().chain(std::iter::once(part.to_path_buf())).collect();
     let found = with_entry(st, id, |e| {
@@ -1249,6 +1250,7 @@ fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>
                             crate::organize::write_sidecars(settings, &e.media, e.spec.primary(), &dest);
                         }
                         done_file = Some((dest.clone(), e.media.clone()));
+                        done_key = Some((e.snap.platform.clone(), e.snap.media_id.clone(), e.snap.asset_id.clone()));
                     }
                     Err(err) => {
                         e.snap.status = TaskStatus::Failed;
@@ -1300,6 +1302,9 @@ fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>
     }
     if let Some((_, media)) = &done_file {
         spawn_cover_cache(app, media.clone());
+    }
+    if let Some((platform, media_id, asset_id)) = done_key {
+        tauri::async_runtime::spawn(crate::library_cmds::after_download(app.clone(), platform, media_id, asset_id));
     }
     if let Some((file, media)) = &done_file {
         if settings.post_script_enabled && !settings.post_script.trim().is_empty() {

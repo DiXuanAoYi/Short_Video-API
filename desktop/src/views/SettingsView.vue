@@ -463,6 +463,26 @@ function insertVar(v: string) {
             <small v-if="portable" class="mute">便携模式：设置、数据库和日志保存在程序目录下的 data 文件夹。</small>
           </section>
           <section class="group card">
+            <h3>媒体库</h3>
+            <div class="kv">
+              <span>删除文件时先放进回收站<small class="mute block">在媒体库里删除文件时移到下载目录里的隐藏文件夹，可以还原</small></span>
+              <el-switch v-model="form.library.useTrash" />
+            </div>
+            <div v-if="form.library.useTrash" class="kv">
+              <span>回收站保留天数<small class="mute block">超过天数的文件在启动时永久删除，0 表示不自动清空</small></span>
+              <el-input-number v-model="form.library.trashKeepDays" size="small" :min="0" :max="3650" controls-position="right" />
+            </div>
+            <div class="kv">
+              <span>下载完成后记录时长并截取封面<small class="mute block">用 ffmpeg 读取视频时长；没有封面的视频会截一张图</small></span>
+              <el-switch v-model="form.library.probeNewFiles" />
+            </div>
+            <div class="field">
+              <span>“整理文件夹”的默认规则</span>
+              <el-input v-model="form.library.reorganizeTemplate" size="small" class="mono" placeholder="{platform}/{author}" />
+              <small class="mute">变量：{platform} {author} {year} {month} {day} {date} {kind}</small>
+            </div>
+          </section>
+          <section class="group card">
             <h3>关于</h3>
             <div class="kv">
               <span>清影 ClearClip v{{ app.info?.version }}</span>

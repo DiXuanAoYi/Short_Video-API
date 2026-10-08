@@ -1,3 +1,4 @@
+pub mod backup;
 mod clipboard;
 mod commands;
 pub mod cookies;
@@ -7,6 +8,9 @@ pub mod download;
 pub mod engine;
 pub mod error;
 pub mod inbox;
+pub mod library;
+pub mod library_cmds;
+pub mod library_media;
 pub mod live;
 pub mod model;
 pub mod naming;
@@ -174,6 +178,10 @@ pub fn run() {
             };
             let default_dl = app.path().download_dir().or_else(|_| app.path().home_dir()).unwrap_or_else(|_| PathBuf::from(".")).join("ClearClip");
             let settings_path = config_dir.join("settings.json");
+            // 上次选择了“还原备份”：在打开数据库之前替换数据库和设置
+            if backup::apply_pending(&data_dir, &settings_path) {
+                log::info!("restored a backup");
+            }
             let mut settings = Settings::load(&settings_path, &default_dl);
             let db = Db::open(&data_dir.join("clearclip.db")).map_err(|e| e.to_string())?;
             let log_dir = if portable_dir().is_some() { data_dir.join("logs") } else { app.path().app_log_dir().unwrap_or_else(|_| data_dir.join("logs")) };
@@ -219,6 +227,9 @@ pub fn run() {
             let covers = data_dir.join("covers");
             let _ = std::fs::create_dir_all(&covers);
             let _ = app.asset_protocol_scope().allow_directory(&covers, false);
+            let previews = data_dir.join("previews");
+            let _ = std::fs::create_dir_all(&previews);
+            let _ = app.asset_protocol_scope().allow_directory(&previews, false);
             download::restore(&handle);
             if let Ok(n) = app.state::<Arc<AppState>>().db.inbox_prune(settings.inbox.keep_days, settings.inbox.max_items) {
                 if n > 0 {
@@ -226,6 +237,7 @@ pub fn run() {
                 }
             }
             download::spawn_timer(&handle);
+            library_cmds::spawn_maintenance(&handle);
             spawn_account_reminders(handle.clone());
 
             tray::create(&handle)?;
@@ -341,6 +353,32 @@ pub fn run() {
             commands::clear_history,
             commands::list_library,
             commands::delete_library,
+            library_cmds::library_set_meta,
+            library_cmds::library_set_tags,
+            library_cmds::library_bulk_tags,
+            library_cmds::library_bulk_favorite,
+            library_cmds::library_tags,
+            library_cmds::library_delete,
+            library_cmds::library_remove_missing,
+            library_cmds::library_import,
+            library_cmds::library_stats,
+            library_cmds::library_preview,
+            library_cmds::library_scenes,
+            library_cmds::library_split_scenes,
+            library_cmds::library_export,
+            library_cmds::trash_list,
+            library_cmds::trash_restore,
+            library_cmds::trash_purge,
+            library_cmds::trash_empty,
+            library_cmds::reorganize_plan,
+            library_cmds::reorganize_apply,
+            library_cmds::duplicates_exact,
+            library_cmds::duplicates_similar,
+            library_cmds::cues_search,
+            library_cmds::cues_reindex,
+            library_cmds::backup_export,
+            library_cmds::backup_import,
+            library_cmds::restart_app,
             commands::list_orphan_parts,
             commands::delete_orphan_parts,
             commands::list_accounts,

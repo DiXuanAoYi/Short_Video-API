@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "主窗口与迷你窗可用的权限。平台登录窗口不在此列，无法调用任何命令。",
   "windows": ["main", "mini"],
-  "permissions": ["core:default", "dialog:allow-open"]
+  "permissions": ["core:default", "dialog:allow-open", "dialog:allow-save"]
 }
