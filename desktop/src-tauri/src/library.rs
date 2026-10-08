@@ -204,6 +204,13 @@ impl Db {
         Ok(conn.query_row("SELECT id FROM tags WHERE name=?1 COLLATE NOCASE", params![name], |r| r.get(0))?)
     }
 
+    pub fn set_item_tags_by_key(&self, platform: &str, media_id: &str, asset_id: &str, tags: &[String]) -> AppResult<()> {
+        match self.id_by_key(platform, media_id, asset_id)? {
+            Some(id) => self.bulk_tags(&[id], tags, false),
+            None => Ok(()),
+        }
+    }
+
     pub fn set_item_tags(&self, id: i64, tags: &[String]) -> AppResult<()> {
         let tags = clean_tags(tags);
         let conn = self.conn();
@@ -755,7 +762,7 @@ fn walk(dir: &Path, recursive: bool, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn path_key(path: &Path) -> String {
+pub fn path_key(path: &Path) -> String {
     let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     hex::encode(&Sha256::digest(canon.to_string_lossy().as_bytes())[..8])
 }

@@ -320,6 +320,28 @@ function insertVar(v: string) {
               <span>B站弹幕转成 ASS<small class="mute block">播放器（PotPlayer、VLC、mpv 等）可以直接显示滚动弹幕；关闭则保存 XML 原文</small></span>
               <el-switch v-model="form.danmakuAss" />
             </div>
+            <template v-if="form.danmakuAss">
+              <div class="kv">
+                <span>弹幕字号<small class="mute block">以 1080 高度的画面为准</small></span>
+                <el-input-number v-model="form.danmaku.fontSize" size="small" :min="18" :max="80" controls-position="right" />
+              </div>
+              <div class="kv">
+                <span>弹幕不透明度（%）</span>
+                <el-slider v-model="form.danmaku.opacity" :min="20" :max="100" :step="5" size="small" class="slim" />
+              </div>
+              <div class="kv">
+                <span>滚动一屏的时间（秒）<small class="mute block">越小越快</small></span>
+                <el-input-number v-model="form.danmaku.scrollSecs" size="small" :min="3" :max="20" controls-position="right" />
+              </div>
+              <div class="kv">
+                <span>弹幕占画面高度（%）<small class="mute block">留出底部给字幕</small></span>
+                <el-slider v-model="form.danmaku.area" :min="10" :max="100" :step="5" size="small" class="slim" />
+              </div>
+              <div class="field">
+                <label>弹幕字体</label>
+                <el-input v-model="form.danmaku.font" size="small" placeholder="留空使用微软雅黑（没有时播放器自动换用其他中文字体）" />
+              </div>
+            </template>
           </section>
           <section class="group card">
             <h3>解析方式</h3>
@@ -351,6 +373,14 @@ function insertVar(v: string) {
                 <el-option value="small" label="省空间（≤720P）" />
                 <el-option value="audio" label="只要音频" />
               </el-select>
+            </div>
+            <div class="kv">
+              <span>大小上限（MB）<small class="mute block">默认选中的格式预估超过上限时，改选不超过的最高清晰度；0 表示不限制。网站没给出大小时按码率和时长估算</small></span>
+              <el-input-number v-model="form.maxSizeMb" size="small" :min="0" :max="1000000" :step="50" controls-position="right" />
+            </div>
+            <div class="kv">
+              <span>失败时自动降级<small class="mute block">网络、文件损坏等原因下载失败时，自动改用低一档的清晰度重新下载（最多 3 次）</small></span>
+              <el-switch v-model="form.autoDowngrade" />
             </div>
             <div class="kv">
               <span>同等清晰度优先 H.264<small class="mute block">兼容性最好；AV1、H.265 体积更小，但老设备可能播不了</small></span>
@@ -504,6 +534,9 @@ function insertVar(v: string) {
 </template>
 
 <style scoped>
+.slim {
+  width: 180px;
+}
 .page {
   padding: 20px 24px;
   max-width: 1040px;

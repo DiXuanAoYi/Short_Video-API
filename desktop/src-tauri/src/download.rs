@@ -102,6 +102,9 @@ pub struct JobSpec {
     /// 来自订阅时对应的条目（订阅 ID，条目 ID），完成后更新条目状态
     #[serde(default)]
     pub sub_item: Option<(i64, String)>,
+    /// 已经试过的视频格式（自动降级时避免重复）
+    #[serde(default)]
+    pub tried: Vec<String>,
 }
 
 impl JobSpec {
@@ -254,6 +257,7 @@ fn parse_spec(json: &str) -> Option<JobSpec> {
             start_at: None,
             origin: None,
             sub_item: None,
+            tried: vec![],
         })
     })
 }
@@ -368,7 +372,7 @@ pub fn build_specs(media: &MediaInfo, asset_ids: &[String]) -> Vec<JobSpec> {
                     inputs.push(audio.clone());
                 }
             }
-            JobSpec { inputs, post: PostOptions::default(), priority: 0, start_at: None, origin: None, sub_item: None }
+            JobSpec { inputs, post: PostOptions::default(), priority: 0, start_at: None, origin: None, sub_item: None, tried: vec![] }
         })
         .collect()
 }
@@ -392,6 +396,8 @@ pub struct EnqueueExtra {
     pub origin: Option<String>,
     /// 对应的订阅条目（订阅 ID，条目 ID）
     pub sub_item: Option<(i64, String)>,
+    /// 已经试过的视频格式（自动降级时使用）
+    pub tried: Vec<String>,
 }
 
 /// 这个任务适用的后处理选项：字幕转换、内嵌、裁剪、章节只对相应类型的资源有意义。
@@ -431,8 +437,11 @@ pub fn enqueue_ext(app: &AppHandle, media: MediaInfo, asset_ids: &[String], post
     let is_sub = |id: &String| media.asset(id).is_some_and(|a| a.kind == AssetKind::Subtitle);
     let has_video = asset_ids.iter().any(|id| media.asset(id).is_some_and(|a| a.kind == AssetKind::Video));
     match (post.sub_mode.as_deref(), has_video) {
-        (Some("soft" | "burn"), true) if asset_ids.iter().any(is_sub) => {
-            post.embed_subs = asset_ids.iter().filter(|id| is_sub(id)).filter_map(|id| media.asset(id).cloned()).collect();
+        (Some("soft" | "burn"), true) if asset_ids.iter().any(is_sub) || !post.embed_subs.is_empty() => {
+            let picked: Vec<Asset> = asset_ids.iter().filter(|id| is_sub(id)).filter_map(|id| media.asset(id).cloned()).collect();
+            if !picked.is_empty() {
+                post.embed_subs = picked;
+            }
             asset_ids.retain(|id| !is_sub(id));
         }
         _ => {
@@ -460,6 +469,7 @@ pub fn enqueue_ext(app: &AppHandle, media: MediaInfo, asset_ids: &[String], post
             spec.post = post_for(&post, spec.primary(), &settings);
             spec.origin = extra.origin.clone();
             spec.sub_item = extra.sub_item.clone();
+            spec.tried = extra.tried.clone();
             let primary = spec.primary().clone();
             let in_queue = list.iter().any(|e| {
                 e.snap.platform == media.platform
@@ -1205,6 +1215,7 @@ fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>
     let mut notify: Option<(String, String)> = None;
     let mut done_file: Option<(PathBuf, Arc<MediaInfo>)> = None;
     let mut done_key: Option<(String, String, String)> = None;
+    let mut downgrade: Option<(Arc<MediaInfo>, JobSpec, ErrorKind)> = None;
     let mut sub_touched = false;
     let leftovers: Vec<PathBuf> = inputs.iter().cloned().chain(std::iter::once(part.to_path_buf())).collect();
     let found = with_entry(st, id, |e| {
@@ -1272,6 +1283,9 @@ fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>
             }
             Err(err) => {
                 log::warn!("job {} failed: {err}", e.snap.id);
+                if settings.auto_downgrade {
+                    downgrade = Some((e.media.clone(), e.spec.clone(), err.kind()));
+                }
                 e.snap.status = TaskStatus::Failed;
                 e.snap.error_kind = Some(err.kind());
                 e.snap.error = Some(err.to_string());
@@ -1293,6 +1307,9 @@ fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>
     });
     if sub_touched {
         let _ = app.emit(crate::subs::EVT_SUBS, ());
+    }
+    if let (Some((media, spec, kind)), Some(_)) = (downgrade, found) {
+        try_downgrade(app, id, &media, &spec, kind);
     }
     if found.is_none() {
         // 任务已被移除：清理残留
@@ -1323,6 +1340,37 @@ fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>
     }
     crate::inbox::sync_tasks(app);
     schedule(app);
+}
+
+/// 下载失败后自动改用低一档的视频格式重新加入队列。成功加入时去掉失败的旧任务，返回 true。
+/// 只处理网络、资源不存在、文件损坏等“换个格式可能就好”的失败；订阅任务不处理（保存位置由订阅决定）。
+fn try_downgrade(app: &AppHandle, failed_id: i64, media: &MediaInfo, spec: &JobSpec, kind: ErrorKind) -> bool {
+    let primary = spec.primary();
+    if primary.kind != AssetKind::Video || spec.sub_item.is_some() || !matches!(kind, ErrorKind::Network | ErrorKind::NotFound | ErrorKind::Other) {
+        return false;
+    }
+    let mut tried = spec.tried.clone();
+    if !tried.contains(&primary.id) {
+        tried.push(primary.id.clone());
+    }
+    if tried.len() > 3 {
+        return false;
+    }
+    let Some(next) = crate::quality::next_lower(media, primary, &tried) else { return false };
+    let describe = |a: &Asset| a.quality.clone().unwrap_or_else(|| a.label.clone());
+    let note = format!("{} 下载失败，已自动改用 {}", describe(primary), describe(next));
+    let extra = EnqueueExtra { origin: spec.origin.clone(), tried, ..Default::default() };
+    let result = enqueue_ext(app, media.clone(), std::slice::from_ref(&next.id), spec.post.clone(), extra);
+    match result {
+        Ok(r) if !r.tasks.is_empty() => {
+            let st = state(app);
+            with_entry(&st, r.tasks[0].id, |e| e.snap.warning = Some(note));
+            log::info!("job {failed_id}: downgraded to {}", next.id);
+            remove(app, failed_id);
+            true
+        }
+        _ => false,
+    }
 }
 
 fn kind_str(k: AssetKind) -> &'static str {

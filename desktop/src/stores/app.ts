@@ -3,7 +3,7 @@ import { computed, ref } from 'vue'
 import { api, errorKind, errorText, events } from '../api'
 import type { AppInfo, ErrorKind, HistoryItem, MediaInfo, Settings, TaskSnapshot } from '../types'
 
-export type ViewName = 'parse' | 'queue' | 'subs' | 'live' | 'library' | 'settings'
+export type ViewName = 'parse' | 'queue' | 'subs' | 'live' | 'library' | 'tools' | 'settings'
 export type LibraryTab = 'files' | 'inbox' | 'history'
 export type SettingsTab = 'download' | 'parse' | 'network' | 'accounts' | 'phone' | 'components' | 'diagnostics' | 'general'
 
@@ -19,10 +19,17 @@ export const useAppStore = defineStore('app', () => {
   const inboxUnhandled = ref(0)
   /** 请求账号页打开某个网站的登录（内置平台 ID 或域名）；处理后清空 */
   const loginRequest = ref<string | null>(null)
+  /** 请求工具箱打开并预选文件（媒体库里的“用工具箱处理”）；处理后清空 */
+  const toolboxRequest = ref<{ paths: string[]; tool?: string } | null>(null)
 
   function goSettings(tab: SettingsTab) {
     settingsTab.value = tab
     view.value = 'settings'
+  }
+
+  function goToolbox(paths: string[], tool?: string) {
+    toolboxRequest.value = { paths, tool }
+    view.value = 'tools'
   }
 
   function goLibrary(tab: LibraryTab) {
@@ -64,7 +71,7 @@ export const useAppStore = defineStore('app', () => {
   }
   media.addEventListener('change', applyTheme)
 
-  return { settings, info, view, settingsTab, shortcutError, libraryTab, inboxUnhandled, loginRequest, goSettings, goLibrary, goLogin, load, save, patch, applyTheme }
+  return { settings, info, view, settingsTab, shortcutError, libraryTab, inboxUnhandled, loginRequest, toolboxRequest, goSettings, goLibrary, goToolbox, goLogin, load, save, patch, applyTheme }
 })
 
 /** 下载队列，监听后端事件保持同步。 */

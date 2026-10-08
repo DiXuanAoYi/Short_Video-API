@@ -7,6 +7,7 @@ import { useAppStore, useParseStore, useQueueStore, type ViewName } from './stor
 import ParseView from './views/ParseView.vue'
 import QueueView from './views/QueueView.vue'
 import LibraryView from './views/LibraryView.vue'
+import ToolboxView from './views/ToolboxView.vue'
 import SubsView from './views/SubsView.vue'
 import LiveView from './views/LiveView.vue'
 import SettingsView from './views/SettingsView.vue'
@@ -51,6 +52,7 @@ const navs: { id: ViewName; label: string }[] = [
   { id: 'subs', label: '订阅' },
   { id: 'live', label: '直播' },
   { id: 'library', label: '媒体库' },
+  { id: 'tools', label: '工具箱' },
   { id: 'settings', label: '设置' },
 ]
 
@@ -197,6 +199,7 @@ onMounted(async () => {
       <SubsView v-if="app.view === 'subs'" />
       <LiveView v-if="app.view === 'live'" />
       <LibraryView v-if="app.view === 'library'" />
+      <ToolboxView v-if="app.view === 'tools'" />
       <SettingsView v-if="app.view === 'settings'" />
     </main>
     <DisclaimerDialog />

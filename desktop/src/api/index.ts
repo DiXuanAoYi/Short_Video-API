@@ -18,7 +18,11 @@ import type {
   DeleteReport,
   DupGroup,
   ImportReport,
+  JobSnap,
   LibraryStats,
+  MediaInfoLite,
+  SubJob,
+  ToolJob,
   MovePlan,
   MoveReport,
   SceneList,
@@ -161,6 +165,13 @@ export const api = {
   backupImport: (src: string) => invoke<BackupInfo>('backup_import', { src }),
   restartApp: () => invoke<void>('restart_app'),
 
+  mediaJobStart: (job: ToolJob) => invoke<number>('media_job_start', { job }),
+  mediaJobs: () => invoke<JobSnap[]>('media_jobs'),
+  mediaJobCancel: (id: number) => invoke<void>('media_job_cancel', { id }),
+  mediaJobsClear: () => invoke<void>('media_jobs_clear'),
+  mediaInfo: (path: string) => invoke<MediaInfoLite>('media_info', { path }),
+  subtitleTool: (job: SubJob) => invoke<{ output: string; count: number }>('subtitle_tool', { job }),
+
   copyText: (text: string) => invoke<void>('copy_text', { text }),
   openFile: (path: string) => invoke<void>('open_file', { path }),
   revealFile: (path: string) => invoke<void>('reveal_file', { path }),
@@ -200,6 +211,7 @@ export const events = {
   onInbox: (cb: (c: InboxCounts) => void): Promise<UnlistenFn> => listen<InboxCounts>('inbox://changed', (e) => cb(e.payload)),
   onLibraryProgress: (cb: (p: { task: string; done: number; total: number }) => void): Promise<UnlistenFn> =>
     listen<{ task: string; done: number; total: number }>('library://progress', (e) => cb(e.payload)),
+  onMediaJobs: (cb: (jobs: JobSnap[]) => void): Promise<UnlistenFn> => listen<JobSnap[]>('media://jobs', (e) => cb(e.payload)),
   onLibraryChanged: (cb: () => void): Promise<UnlistenFn> => listen('library://changed', () => cb()),
   onAccounts: (cb: () => void): Promise<UnlistenFn> => listen('accounts://updated', () => cb()),
   onParseRequest: (cb: (text: string) => void): Promise<UnlistenFn> => listen<string>('app://parse-request', (e) => cb(e.payload)),

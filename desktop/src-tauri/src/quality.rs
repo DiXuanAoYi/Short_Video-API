@@ -26,7 +26,29 @@ fn rank(a: &Asset, preset: QualityPreset, prefer_h264: bool) -> (bool, i64, bool
     }
 }
 
+/// 预估一个视频格式（含需要合并的音频轨）下载后的大小（字节）；无法估算时为 None。
+pub fn estimated_size(info: &MediaInfo, a: &Asset) -> Option<u64> {
+    let own = |x: &Asset| -> Option<u64> {
+        x.filesize.filter(|s| *s > 0).or_else(|| match (x.bitrate, info.duration_ms) {
+            (Some(kbps), Some(ms)) if kbps > 0 && ms > 0 => Some(kbps * 1000 / 8 * ms / 1000),
+            _ => None,
+        })
+    };
+    let video = own(a)?;
+    let audio = a.pair_audio.as_deref().and_then(|id| info.asset(id)).and_then(own).unwrap_or(0);
+    Some(video + audio)
+}
+
+/// 失败后改用哪个视频格式：按当前排序（偏好最优在前）取在失败格式之后、没有试过、且清晰度不高于它的第一个。
+pub fn next_lower<'a>(info: &'a MediaInfo, failed: &Asset, tried: &[String]) -> Option<&'a Asset> {
+    let videos: Vec<&Asset> = info.assets.iter().filter(|a| a.kind == AssetKind::Video).collect();
+    let at = videos.iter().position(|a| a.id == failed.id)?;
+    let side = failed.short_side().unwrap_or(u32::MAX);
+    videos.into_iter().skip(at + 1).find(|a| !tried.contains(&a.id) && a.id != failed.id && a.short_side().unwrap_or(0) <= side)
+}
+
 /// 按预设给视频格式排序，其他资源保持原有顺序并排在视频之后。
+/// 设置了“大小上限”时，默认格式（第一个）预估超过上限就换成不超过上限的最高偏好格式。
 pub fn sort_videos(info: &mut MediaInfo, settings: &Settings) {
     let (preset, h264) = (settings.quality_preset, settings.prefer_h264);
     let mut videos: Vec<Asset> = info.assets.iter().filter(|a| a.kind == AssetKind::Video).cloned().collect();
@@ -35,6 +57,18 @@ pub fn sort_videos(info: &mut MediaInfo, settings: &Settings) {
     }
     // 稳定排序：同等条件下保留平台给出的顺序
     videos.sort_by_key(|a| std::cmp::Reverse(rank(a, preset, h264)));
+    if settings.max_size_mb > 0 {
+        let limit = settings.max_size_mb * 1024 * 1024;
+        let sizes: Vec<Option<u64>> = videos.iter().map(|a| estimated_size(info, a)).collect();
+        if sizes[0].is_some_and(|s| s > limit) {
+            let pick =
+                sizes.iter().position(|s| s.is_some_and(|s| s <= limit)).or_else(|| (0..sizes.len()).filter(|i| sizes[*i].is_some()).min_by_key(|i| sizes[*i]));
+            if let Some(i) = pick {
+                let chosen = videos.remove(i);
+                videos.insert(0, chosen);
+            }
+        }
+    }
     let others = info.assets.iter().filter(|a| a.kind != AssetKind::Video).cloned();
     info.assets = videos.into_iter().chain(others).collect();
 }
@@ -145,6 +179,59 @@ mod tests {
         sort_videos(&mut i, &s);
         assert_eq!(i.assets.len(), 7);
         i.assets[0].id.clone()
+    }
+
+    #[test]
+    fn size_limit_picks_the_best_format_that_fits() {
+        let mut i = info();
+        // 给每个格式一个预估大小：2160P 800 MB、1080P 300 MB / 250 MB、720P 120 MB、360P 40 MB
+        for a in &mut i.assets {
+            a.filesize = match a.id.as_str() {
+                "v2160" => Some(800 << 20),
+                "v1080h" => Some(300 << 20),
+                "v1080v" => Some(250 << 20),
+                "v720" => Some(120 << 20),
+                "v360" => Some(40 << 20),
+                _ => None,
+            };
+        }
+        let first = |mb: u64| {
+            let mut x = i.clone();
+            sort_videos(&mut x, &Settings { max_size_mb: mb, ..Settings::default() });
+            x.assets[0].id.clone()
+        };
+        assert_eq!(first(0), "v2160", "no limit");
+        assert_eq!(first(1000), "v2160", "already fits");
+        assert_eq!(first(500), "v1080h", "best preference that fits");
+        assert_eq!(first(150), "v720");
+        assert_eq!(first(10), "v360", "nothing fits: the smallest one");
+        // 没有大小信息时不改变排序
+        let mut x = info();
+        sort_videos(&mut x, &Settings { max_size_mb: 1, ..Settings::default() });
+        assert_eq!(x.assets[0].id, "v2160");
+        // 用码率和时长估算
+        let mut y = info();
+        y.duration_ms = Some(100_000);
+        let a = y.asset("v720").unwrap().clone();
+        assert_eq!(estimated_size(&y, &a), Some(1500 * 1000 / 8 * 100));
+    }
+
+    #[test]
+    fn downgrade_goes_down_never_up() {
+        let mut i = info();
+        sort_videos(&mut i, &Settings { quality_preset: QualityPreset::Max1080, ..Settings::default() });
+        // 排序：v1080h, v1080v, v720, v360, v2160
+        let ids: Vec<&str> = i.assets.iter().filter(|a| a.kind == AssetKind::Video).map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, ["v1080h", "v1080v", "v720", "v360", "v2160"]);
+        let f = i.asset("v1080h").unwrap().clone();
+        assert_eq!(next_lower(&i, &f, &[]).unwrap().id, "v1080v", "another codec at the same height first");
+        assert_eq!(next_lower(&i, &f, &["v1080v".into()]).unwrap().id, "v720");
+        let f = i.asset("v360").unwrap().clone();
+        assert!(next_lower(&i, &f, &[]).is_none(), "2160P comes later in the list but is higher, so it is not a downgrade");
+        let f = i.asset("v720").unwrap().clone();
+        assert_eq!(next_lower(&i, &f, &[]).unwrap().id, "v360");
+        let cover = i.assets.iter().find(|a| a.kind == AssetKind::Cover).unwrap().clone();
+        assert!(next_lower(&i, &cover, &[]).is_none());
     }
 
     #[test]

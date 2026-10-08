@@ -3,6 +3,7 @@ import { computed, ref, watch } from 'vue'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { ElMessage } from 'element-plus'
 import { api, errorText } from '../../api'
+import { useAppStore } from '../../stores/app'
 import type { Chapter, LibraryItem, TagCount } from '../../types'
 import { formatBytes, formatDateTime, formatDuration } from '../../utils/format'
 import { formatClock } from '../../utils/time'
@@ -10,6 +11,7 @@ import { formatClock } from '../../utils/time'
 const props = defineProps<{ modelValue: boolean; item: LibraryItem | null; tags: TagCount[] }>()
 const emit = defineEmits<{ 'update:modelValue': [v: boolean]; changed: [] }>()
 
+const app = useAppStore()
 const favorite = ref(false)
 const rating = ref(0)
 const note = ref('')
@@ -121,6 +123,12 @@ async function copyUrl() {
   })
 }
 
+function toTools() {
+  if (!props.item) return
+  emit('update:modelValue', false)
+  app.goToolbox([props.item.path])
+}
+
 function cover(i: LibraryItem) {
   return i.coverPath ? convertFileSrc(i.coverPath) : i.cover
 }
@@ -140,6 +148,7 @@ function cover(i: LibraryItem) {
         <el-button size="small" type="primary" :disabled="!item.exists" @click="api.openFile(item.path)">打开</el-button>
         <el-button size="small" :disabled="!item.exists" @click="api.revealFile(item.path)">所在文件夹</el-button>
         <el-button v-if="item.sourceUrl" size="small" @click="copyUrl">复制原链接</el-button>
+        <el-button v-if="item.exists && (item.kind === 'video' || item.kind === 'audio')" size="small" @click="toTools">用工具箱处理…</el-button>
       </div>
 
       <el-divider />

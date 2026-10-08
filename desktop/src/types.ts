@@ -260,6 +260,63 @@ export interface BackupInfo {
   size: number
 }
 
+export interface DanmakuStyle {
+  fontSize: number
+  opacity: number
+  scrollSecs: number
+  area: number
+  font: string
+}
+
+export type ToolOp =
+  | { op: 'compress'; quality: 'small' | 'balanced' | 'high'; maxHeight: number | null }
+  | { op: 'gif'; startMs: number; durationMs: number; width: number; fps: number }
+  | { op: 'landscape'; width: number; height: number; mode: 'blur' | 'black' }
+  | { op: 'speed'; factor: number }
+  | { op: 'loudness'; target: number }
+  | { op: 'rotate'; mode: 'cw' | 'ccw' | 'flip180' | 'hflip' | 'vflip' }
+  | { op: 'convert'; format: string; reencode: boolean }
+  | { op: 'frame'; atMs: number; format: 'jpg' | 'png' }
+  | { op: 'frames'; everySecs: number; format: 'jpg' | 'png' }
+  | { op: 'concat'; reencode: boolean }
+  | { op: 'trim'; startMs: number; endMs: number | null; precise: boolean }
+  | { op: 'mute' }
+  | { op: 'tags'; title?: string | null; artist?: string | null; album?: string | null; year?: string | null; genre?: string | null; comment?: string | null; cover?: string | null }
+
+export type ToolJob = ToolOp & { inputs: string[]; outputDir?: string | null }
+
+export interface JobSnap {
+  id: number
+  title: string
+  op: string
+  status: 'queued' | 'running' | 'done' | 'failed' | 'canceled'
+  percent: number
+  output: string | null
+  error: string | null
+  note: string | null
+  finishedAt: number | null
+}
+
+export interface MediaInfoLite {
+  durationMs: number | null
+  width: number | null
+  height: number | null
+  hasVideo: boolean
+  hasAudio: boolean
+  tags: Record<string, string>
+}
+
+export type SubOp =
+  | { op: 'shift'; offsetMs: number }
+  | { op: 'rescale'; factor: number }
+  | { op: 'align'; aFrom: number; aTo: number; bFrom: number; bTo: number }
+  | { op: 'merge'; second: string }
+  | { op: 'clean'; dropHearing: boolean }
+  | { op: 'convert' }
+  | { op: 'danmaku'; width?: number | null; height?: number | null }
+
+export type SubJob = SubOp & { input: string; format?: string | null }
+
 export interface LibrarySettings {
   useTrash: boolean
   trashKeepDays: number
@@ -413,6 +470,9 @@ export interface Settings {
   danmakuAss: boolean
   verifyDownloads: boolean
   library: LibrarySettings
+  danmaku: DanmakuStyle
+  maxSizeMb: number
+  autoDowngrade: boolean
 }
 
 export interface LiveSettings {

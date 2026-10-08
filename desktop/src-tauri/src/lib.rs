@@ -12,6 +12,8 @@ pub mod library;
 pub mod library_cmds;
 pub mod library_media;
 pub mod live;
+pub mod media_cmds;
+pub mod media_tools;
 pub mod model;
 pub mod naming;
 pub mod net;
@@ -26,6 +28,7 @@ pub mod settings;
 pub mod subs;
 pub mod subtitle;
 pub mod subtitle_io;
+pub mod subtitle_tools;
 pub mod tools;
 mod tray;
 
@@ -69,6 +72,8 @@ pub struct AppState {
     pub after_all_done: Mutex<String>,
     pub subs: subs::SubsState,
     pub live: live::LiveState,
+    /// 媒体工具箱的后台任务
+    pub media_jobs: media_tools::MediaJobs,
 }
 
 impl AppState {
@@ -222,6 +227,7 @@ pub fn run() {
                 after_all_done: Mutex::new("none".into()),
                 subs: subs::SubsState::default(),
                 live: live::LiveState::default(),
+                media_jobs: media_tools::MediaJobs::default(),
             }));
             // 媒体库封面缓存通过 asset 协议显示
             let covers = data_dir.join("covers");
@@ -379,6 +385,12 @@ pub fn run() {
             library_cmds::backup_export,
             library_cmds::backup_import,
             library_cmds::restart_app,
+            media_cmds::media_job_start,
+            media_cmds::media_jobs,
+            media_cmds::media_job_cancel,
+            media_cmds::media_jobs_clear,
+            media_cmds::media_info,
+            media_cmds::subtitle_tool,
             commands::list_orphan_parts,
             commands::delete_orphan_parts,
             commands::list_accounts,

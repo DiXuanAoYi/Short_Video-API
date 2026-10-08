@@ -288,6 +288,44 @@ pub struct Settings {
     pub verify_downloads: bool,
     /// 媒体库：回收站、整理规则
     pub library: LibrarySettings,
+    /// 弹幕转 ASS 时的样式
+    pub danmaku: DanmakuStyle,
+    /// 默认选中的视频格式预估超过这个大小（MB）时，改选不超过的最高清晰度；0 表示不限
+    pub max_size_mb: u64,
+    /// 下载失败（网络、文件损坏等）时自动改用更低一档的清晰度重新下载
+    pub auto_downgrade: bool,
+}
+
+/// 弹幕样式（B站弹幕 XML 转成 ASS 时使用）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DanmakuStyle {
+    /// 字号（以 1080 高度的画面为准）
+    pub font_size: u32,
+    /// 不透明度 20–100（%）
+    pub opacity: u32,
+    /// 滚动弹幕从右到左穿过屏幕的大致秒数，越小越快
+    pub scroll_secs: u32,
+    /// 弹幕占画面高度的比例（%），避免挡住底部字幕
+    pub area: u32,
+    /// 字体名；留空使用微软雅黑（没有时播放器会自动换用其他中文字体）
+    pub font: String,
+}
+
+impl Default for DanmakuStyle {
+    fn default() -> Self {
+        DanmakuStyle { font_size: 40, opacity: 100, scroll_secs: 7, area: 75, font: String::new() }
+    }
+}
+
+impl DanmakuStyle {
+    pub fn normalize(&mut self) {
+        self.font_size = self.font_size.clamp(18, 80);
+        self.opacity = self.opacity.clamp(20, 100);
+        self.scroll_secs = self.scroll_secs.clamp(3, 20);
+        self.area = self.area.clamp(10, 100);
+        self.font = self.font.trim().chars().filter(|c| !matches!(c, ',' | '\n' | '\r')).take(60).collect();
+    }
 }
 
 /// 媒体库设置。
@@ -419,6 +457,9 @@ impl Default for Settings {
             danmaku_ass: true,
             verify_downloads: true,
             library: LibrarySettings::default(),
+            danmaku: DanmakuStyle::default(),
+            max_size_mb: 0,
+            auto_downgrade: true,
         }
     }
 }
@@ -485,6 +526,8 @@ impl Settings {
             self.filename_template = Settings::default().filename_template;
         }
         self.remote_endpoint = self.remote_endpoint.trim().to_string();
+        self.danmaku.normalize();
+        self.max_size_mb = self.max_size_mb.min(1_000_000);
         self.library.trash_keep_days = self.library.trash_keep_days.min(3650);
         self.library.reorganize_template = self.library.reorganize_template.trim().to_string();
         if self.library.reorganize_template.is_empty() {
