@@ -294,6 +294,95 @@ pub struct Settings {
     pub max_size_mb: u64,
     /// 下载失败（网络、文件损坏等）时自动改用更低一档的清晰度重新下载
     pub auto_downgrade: bool,
+    /// AI：语音转文字、字幕翻译、摘要与章节
+    pub ai: AiSettings,
+}
+
+/// AI 功能的设置。API 密钥不在这里，保存在加密的保险箱里（`ai.api_key`、`stt.api_key`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AiSettings {
+    /// 兼容 OpenAI 接口的地址（OpenAI、DeepSeek、通义、月之暗面、本机 Ollama 等），如 `https://api.openai.com/v1`
+    pub base_url: String,
+    pub model: String,
+    /// 翻译成什么语言（直接写进提示词，如“简体中文”“English”）
+    pub target_lang: String,
+    /// 翻译结果同时保留原文（原文在上，译文在下）
+    pub bilingual: bool,
+    /// 每次请求翻译多少条字幕
+    pub batch_size: usize,
+    /// 语音转文字：`api`（兼容 OpenAI 的 `/audio/transcriptions`）或 `local`（本机的 whisper.cpp）
+    pub stt_engine: String,
+    /// 语音转文字接口地址；留空与上面相同
+    pub stt_base_url: String,
+    pub stt_model: String,
+    /// 音频语言代码（zh / en / ja…），留空自动识别
+    pub stt_language: String,
+    /// whisper.cpp 可执行文件（whisper-cli），留空时在 PATH 里找
+    pub whisper_bin: String,
+    /// whisper.cpp 的 ggml 模型文件
+    pub whisper_model: String,
+    /// 下载到的字幕不是目标语言时自动翻译
+    pub auto_translate: bool,
+    /// 下载的视频没有字幕时自动转写
+    pub auto_transcribe: bool,
+}
+
+impl Default for AiSettings {
+    fn default() -> Self {
+        AiSettings {
+            base_url: "https://api.openai.com/v1".into(),
+            model: "gpt-4o-mini".into(),
+            target_lang: "简体中文".into(),
+            bilingual: true,
+            batch_size: 40,
+            stt_engine: "api".into(),
+            stt_base_url: String::new(),
+            stt_model: "whisper-1".into(),
+            stt_language: String::new(),
+            whisper_bin: String::new(),
+            whisper_model: String::new(),
+            auto_translate: false,
+            auto_transcribe: false,
+        }
+    }
+}
+
+impl AiSettings {
+    pub fn normalize(&mut self) {
+        let clean = |u: &str| -> String {
+            let u = u.trim().trim_end_matches('/').to_string();
+            if u.starts_with("http://") || u.starts_with("https://") {
+                u
+            } else {
+                String::new()
+            }
+        };
+        self.base_url = clean(&self.base_url);
+        self.stt_base_url = clean(&self.stt_base_url);
+        self.model = self.model.trim().to_string();
+        self.stt_model = self.stt_model.trim().to_string();
+        self.target_lang = self.target_lang.trim().chars().filter(|c| !c.is_control()).take(40).collect();
+        if self.target_lang.is_empty() {
+            self.target_lang = AiSettings::default().target_lang;
+        }
+        self.batch_size = self.batch_size.clamp(5, 100);
+        if !matches!(self.stt_engine.as_str(), "api" | "local") {
+            self.stt_engine = "api".into();
+        }
+        self.stt_language = self.stt_language.trim().to_ascii_lowercase();
+        self.whisper_bin = self.whisper_bin.trim().to_string();
+        self.whisper_model = self.whisper_model.trim().to_string();
+    }
+
+    /// 语音转文字用的接口地址。
+    pub fn stt_url(&self) -> &str {
+        if self.stt_base_url.is_empty() {
+            &self.base_url
+        } else {
+            &self.stt_base_url
+        }
+    }
 }
 
 /// 弹幕样式（B站弹幕 XML 转成 ASS 时使用）。
@@ -460,6 +549,7 @@ impl Default for Settings {
             danmaku: DanmakuStyle::default(),
             max_size_mb: 0,
             auto_downgrade: true,
+            ai: AiSettings::default(),
         }
     }
 }
@@ -527,6 +617,7 @@ impl Settings {
         }
         self.remote_endpoint = self.remote_endpoint.trim().to_string();
         self.danmaku.normalize();
+        self.ai.normalize();
         self.max_size_mb = self.max_size_mb.min(1_000_000);
         self.library.trash_keep_days = self.library.trash_keep_days.min(3650);
         self.library.reorganize_template = self.library.reorganize_template.trim().to_string();

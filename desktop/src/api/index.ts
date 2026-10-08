@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type {
   AccountStatus,
+  AiStatus,
   AccountSummary,
   RouteTest,
   AppErrorPayload,
@@ -165,6 +166,14 @@ export const api = {
   backupImport: (src: string) => invoke<BackupInfo>('backup_import', { src }),
   restartApp: () => invoke<void>('restart_app'),
 
+  secretSet: (name: string, value: string) => invoke<void>('secret_set', { name, value }),
+  secretHas: (name: string) => invoke<boolean>('secret_has', { name }),
+  aiStatus: () => invoke<AiStatus>('ai_status'),
+  aiTest: () => invoke<string>('ai_test'),
+  aiTranslate: (path: string) => invoke<number>('ai_translate', { path }),
+  aiSummarize: (path: string) => invoke<number>('ai_summarize', { path }),
+  aiTranscribe: (path: string, language?: string) => invoke<number>('ai_transcribe', { path, language }),
+  mediaJobText: (id: number, which?: 'chapters') => invoke<string>('media_job_text', { id, which }),
   mediaJobStart: (job: ToolJob) => invoke<number>('media_job_start', { job }),
   mediaJobs: () => invoke<JobSnap[]>('media_jobs'),
   mediaJobCancel: (id: number) => invoke<void>('media_job_cancel', { id }),

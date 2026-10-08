@@ -10,6 +10,7 @@ import AccountsPanel from '../components/AccountsPanel.vue'
 import NetworkPanel from '../components/NetworkPanel.vue'
 import ComponentsPanel from '../components/ComponentsPanel.vue'
 import PhonePanel from '../components/PhonePanel.vue'
+import AiPanel from '../components/AiPanel.vue'
 import type { HealthResult } from '../types'
 import { copyDiagnostics } from '../composables/diagnostics'
 
@@ -433,6 +434,10 @@ function insertVar(v: string) {
 
       <el-tab-pane label="手机与浏览器扩展" name="phone">
         <PhonePanel />
+      </el-tab-pane>
+
+      <el-tab-pane label="AI" name="ai">
+        <AiPanel v-model="form.ai" />
       </el-tab-pane>
 
       <el-tab-pane label="组件" name="components">

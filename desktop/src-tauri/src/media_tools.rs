@@ -74,6 +74,10 @@ pub enum ToolOp {
         precise: bool,
     },
     Mute,
+    /// 把章节写进视频（MP4 / MKV，不重新编码）
+    Chapters {
+        chapters: Vec<crate::model::Chapter>,
+    },
     /// 写入标签。None 表示不改，Some("") 表示清除
     Tags {
         title: Option<String>,
@@ -101,6 +105,7 @@ impl ToolOp {
             ToolOp::Concat { .. } => "拼接",
             ToolOp::Trim { .. } => "裁剪",
             ToolOp::Mute => "去除音轨",
+            ToolOp::Chapters { .. } => "写入章节",
             ToolOp::Tags { .. } => "音频标签",
         }
     }
@@ -648,6 +653,30 @@ pub fn plan(job: &ToolJob, inputs: &[Input], enc: &Encoders) -> AppResult<Plan> 
             p.args = s(&["-i", &inp, "-map", "0:v:0", "-c:v", "copy", "-an"]);
             p.args.extend(muxer_args(ext, &p.output));
         }
+        ToolOp::Chapters { chapters } => {
+            require_video(first).or_else(|e| if first.probe.has_audio { Ok(()) } else { Err(e) })?;
+            if chapters.is_empty() {
+                return Err(AppError::invalid("没有章节。"));
+            }
+            let ext = if first.probe.has_video {
+                if matches!(in_ext.as_str(), "mp4" | "mkv" | "mov") {
+                    in_ext.as_str()
+                } else {
+                    "mp4"
+                }
+            } else if matches!(in_ext.as_str(), "m4a" | "mp3") {
+                in_ext.as_str()
+            } else {
+                "m4a"
+            };
+            p.kind = if first.probe.has_video { "video" } else { "audio" };
+            p.output = out_path(&first.path, dir, "章节", ext);
+            let meta = std::env::temp_dir().join(format!("clearclip-chapters-{}-{}.txt", std::process::id(), crate::db::now()));
+            std::fs::write(&meta, ffmetadata(chapters, dur))?;
+            p.temp_files.push(meta.clone());
+            p.args = s(&["-i", &inp, "-i", &path_arg(&meta), "-map", "0", "-map_metadata", "0", "-map_chapters", "1", "-c", "copy"]);
+            p.args.extend(muxer_args(ext, &p.output));
+        }
         ToolOp::Tags { title, artist, album, year, genre, comment, cover } => {
             if !first.probe.has_audio {
                 return Err(AppError::invalid("文件里没有音频。"));
@@ -696,6 +725,31 @@ pub fn plan(job: &ToolJob, inputs: &[Input], enc: &Encoders) -> AppResult<Plan> 
         }
     }
     Ok(p)
+}
+
+fn meta_escape(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        match c {
+            '=' | ';' | '#' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\n' | '\r' => out.push(' '),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// ffmpeg 的章节元数据文件。每章的结束时间取下一章的开始；最后一章到视频结尾。
+pub fn ffmetadata(chapters: &[crate::model::Chapter], total_ms: Option<u64>) -> String {
+    let mut out = String::from(";FFMETADATA1\n");
+    for (i, c) in chapters.iter().enumerate() {
+        let end = chapters.get(i + 1).map(|n| n.start_ms).or(total_ms).unwrap_or(c.start_ms + 1000).max(c.start_ms + 1);
+        out.push_str(&format!("[CHAPTER]\nTIMEBASE=1/1000\nSTART={}\nEND={}\ntitle={}\n", c.start_ms, end, meta_escape(&c.title)));
+    }
+    out
 }
 
 fn trim_float(f: f64) -> String {
@@ -815,13 +869,13 @@ pub fn parse_progress_line(line: &str) -> Option<u64> {
     }
 }
 
-enum RunEnd {
+pub(crate) enum RunEnd {
     Ok,
     Canceled,
     Failed(String),
 }
 
-async fn run_ffmpeg_progress(
+pub(crate) async fn run_ffmpeg_progress(
     ffmpeg: &Path,
     args: &[String],
     out_ms: Option<u64>,
@@ -891,31 +945,66 @@ async fn run_ffmpeg_progress(
     }
 }
 
-/// 创建任务并在后台运行，返回任务编号。
-pub fn start(app: &tauri::AppHandle, job: ToolJob) -> AppResult<u64> {
-    use tauri::{Emitter, Manager};
-    if job.inputs.is_empty() {
-        return Err(AppError::invalid("请先选择文件。"));
+/// 后台任务的上下文：更新进度和说明，检查是否被取消。
+#[derive(Clone)]
+pub struct JobCtx {
+    pub app: tauri::AppHandle,
+    pub st: Arc<crate::AppState>,
+    pub id: u64,
+    pub cancel: Arc<AtomicBool>,
+    pub wake: Arc<Notify>,
+    last_emit: Arc<Mutex<std::time::Instant>>,
+}
+
+impl JobCtx {
+    pub fn emit(&self) {
+        use tauri::Emitter;
+        let _ = self.app.emit(EVT_JOBS, self.st.media_jobs.snapshot());
     }
-    for i in &job.inputs {
-        if !Path::new(i).is_file() {
-            return Err(AppError::invalid(format!("找不到文件：{i}")));
+
+    /// 更新进度（0–100）；界面刷新限制在每 0.4 秒一次。
+    pub fn percent(&self, p: f64) {
+        self.st.media_jobs.update(self.id, |s| s.percent = p.clamp(0.0, 100.0));
+        let mut t = self.last_emit.lock().unwrap_or_else(|e| e.into_inner());
+        if t.elapsed() > std::time::Duration::from_millis(400) {
+            *t = std::time::Instant::now();
+            drop(t);
+            self.emit();
         }
     }
+
+    pub fn note(&self, note: impl Into<String>) {
+        let note = note.into();
+        self.st.media_jobs.update(self.id, |s| s.note = Some(note));
+        self.emit();
+    }
+
+    pub fn canceled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// 已取消时返回错误，用在长流程的各个步骤之间。
+    pub fn check(&self) -> AppResult<()> {
+        if self.canceled() {
+            Err(AppError::msg("canceled"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// 创建后台任务（和工具箱的 ffmpeg 任务共用任务列表、进度和取消），返回任务编号。
+/// `f` 返回输出文件的路径；返回错误消息 `canceled` 表示用户取消。
+pub fn spawn_job<F, Fut>(app: &tauri::AppHandle, title: String, label: &str, f: F) -> u64
+where
+    F: FnOnce(JobCtx) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = AppResult<PathBuf>> + Send + 'static,
+{
+    use tauri::Manager;
     let st = app.state::<Arc<crate::AppState>>().inner().clone();
-    find_ffmpeg(&st).ok_or_else(|| AppError::new(crate::error::ErrorKind::NeedUpdate, "需要 ffmpeg。请在“设置 → 组件”中安装 ffmpeg 后重试。"))?;
-    let title = if job.inputs.len() > 1 {
-        format!("{} 等 {} 个文件", stem_of(Path::new(&job.inputs[0])), job.inputs.len())
-    } else {
-        stem_of(Path::new(&job.inputs[0]))
-    };
-    let (id, cancel, wake) = st.media_jobs.add(title, job.op.label());
-    let app2 = app.clone();
-    let emit = move |st: &crate::AppState| {
-        let _ = app2.emit(EVT_JOBS, st.media_jobs.snapshot());
-    };
-    emit(&st);
-    let app3 = app.clone();
+    let (id, cancel, wake) = st.media_jobs.add(title, label);
+    let ctx = JobCtx { app: app.clone(), st: st.clone(), id, cancel: cancel.clone(), wake, last_emit: Arc::new(Mutex::new(std::time::Instant::now())) };
+    ctx.emit();
     tauri::async_runtime::spawn(async move {
         let permit = st.media_jobs.sem.clone().acquire_owned().await;
         if cancel.load(Ordering::Relaxed) {
@@ -923,12 +1012,12 @@ pub fn start(app: &tauri::AppHandle, job: ToolJob) -> AppResult<u64> {
                 s.status = "canceled".into();
                 s.finished_at = Some(crate::db::now());
             });
-            emit(&st);
+            ctx.emit();
             return;
         }
         st.media_jobs.update(id, |s| s.status = "running".into());
-        emit(&st);
-        let result = run_job(&app3, &st, id, &job, &cancel, &wake, &emit).await;
+        ctx.emit();
+        let result = f(ctx.clone()).await;
         st.media_jobs.update(id, |s| {
             s.finished_at = Some(crate::db::now());
             match &result {
@@ -944,24 +1033,40 @@ pub fn start(app: &tauri::AppHandle, job: ToolJob) -> AppResult<u64> {
                 }
             }
         });
-        emit(&st);
+        ctx.emit();
         drop(permit);
-        if let Ok(out) = result {
-            register_output(&app3, &st, &job, &out).await;
-        }
     });
-    Ok(id)
+    id
 }
 
-async fn run_job(
-    _app: &tauri::AppHandle,
-    st: &Arc<crate::AppState>,
-    id: u64,
-    job: &ToolJob,
-    cancel: &AtomicBool,
-    wake: &Notify,
-    emit: &(dyn Fn(&crate::AppState) + Send + Sync),
-) -> AppResult<PathBuf> {
+/// 创建 ffmpeg 处理任务并在后台运行，返回任务编号。
+pub fn start(app: &tauri::AppHandle, job: ToolJob) -> AppResult<u64> {
+    use tauri::Manager;
+    if job.inputs.is_empty() {
+        return Err(AppError::invalid("请先选择文件。"));
+    }
+    for i in &job.inputs {
+        if !Path::new(i).is_file() {
+            return Err(AppError::invalid(format!("找不到文件：{i}")));
+        }
+    }
+    let st = app.state::<Arc<crate::AppState>>().inner().clone();
+    find_ffmpeg(&st).ok_or_else(|| AppError::new(crate::error::ErrorKind::NeedUpdate, "需要 ffmpeg。请在“设置 → 组件”中安装 ffmpeg 后重试。"))?;
+    let title = if job.inputs.len() > 1 {
+        format!("{} 等 {} 个文件", stem_of(Path::new(&job.inputs[0])), job.inputs.len())
+    } else {
+        stem_of(Path::new(&job.inputs[0]))
+    };
+    let label = job.op.label();
+    Ok(spawn_job(app, title, label, move |ctx| async move {
+        let out = run_job(&ctx, &job).await?;
+        register_output(&ctx.app, &ctx.st, &job, &out).await;
+        Ok(out)
+    }))
+}
+
+async fn run_job(ctx: &JobCtx, job: &ToolJob) -> AppResult<PathBuf> {
+    let st = &ctx.st;
     let ffmpeg = find_ffmpeg(st).ok_or_else(crate::postprocess::ffmpeg_missing)?;
     let mut inputs = vec![];
     for i in &job.inputs {
@@ -975,27 +1080,14 @@ async fn run_job(
     let enc = detect_encoders(&ffmpeg).await;
     let plan = plan(job, &inputs, &enc)?;
     if let Some(n) = &plan.note {
-        st.media_jobs.update(id, |s| s.note = Some(n.clone()));
+        ctx.note(n.clone());
     }
-    let st2 = st.clone();
-    let on_percent = move |p: f64| {
-        st2.media_jobs.update(id, |s| s.percent = p);
-    };
-    let last_emit = Mutex::new(std::time::Instant::now());
-    let throttled = |p: f64| {
-        on_percent(p);
-        let mut t = last_emit.lock().unwrap_or_else(|e| e.into_inner());
-        if t.elapsed() > std::time::Duration::from_millis(400) {
-            *t = std::time::Instant::now();
-            emit(st);
-        }
-    };
-    let mut end = run_ffmpeg_progress(&ffmpeg, &plan.args, plan.out_ms, cancel, wake, &throttled).await;
+    let on_percent = |p: f64| ctx.percent(p);
+    let mut end = run_ffmpeg_progress(&ffmpeg, &plan.args, plan.out_ms, &ctx.cancel, &ctx.wake, &on_percent).await;
     if let (RunEnd::Failed(_), Some(fb)) = (&end, &plan.fallback) {
         let _ = std::fs::remove_file(&plan.output);
-        st.media_jobs.update(id, |s| s.note = Some("两个文件的编码参数不一致，无法直接拼接，已改为重新编码。".into()));
-        emit(st);
-        end = run_ffmpeg_progress(&ffmpeg, fb, plan.out_ms, cancel, wake, &throttled).await;
+        ctx.note("两个文件的编码参数不一致，无法直接拼接，已改为重新编码。");
+        end = run_ffmpeg_progress(&ffmpeg, fb, plan.out_ms, &ctx.cancel, &ctx.wake, &on_percent).await;
     }
     for t in &plan.temp_files {
         let _ = std::fs::remove_file(t);
@@ -1427,6 +1519,35 @@ mod tests {
                 assert!(p.note.is_some());
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chapter_metadata_is_escaped_and_closed() {
+        use crate::model::Chapter;
+        let ch = vec![Chapter { title: "开场=介绍;#1\\".into(), start_ms: 0, end_ms: 0 }, Chapter { title: "正片".into(), start_ms: 3000, end_ms: 0 }];
+        let m = ffmetadata(&ch, Some(10_000));
+        assert!(m.starts_with(";FFMETADATA1\n"));
+        assert!(m.contains("START=0\nEND=3000\ntitle=开场\\=介绍\\;\\#1\\\\\n"), "{m}");
+        assert!(m.contains("START=3000\nEND=10000\ntitle=正片"), "{m}");
+        assert!(ffmetadata(&ch[1..], None).contains("END=4000"), "last chapter without a known length gets 1 s");
+    }
+
+    #[tokio::test]
+    async fn chapters_are_written_into_the_file() {
+        let Some(ff) = ffmpeg_bin() else { return };
+        let dir = temp_dir("chapters");
+        let v = dir.join("v.mp4");
+        make(&ff, &v, "testsrc", 6, "160x120", true).await;
+        let ch = vec![
+            crate::model::Chapter { title: "开场".into(), start_ms: 0, end_ms: 3000 },
+            crate::model::Chapter { title: "正片".into(), start_ms: 3000, end_ms: 6000 },
+        ];
+        let (out, _) = exec(&ff, &job(&[&v.to_string_lossy()], ToolOp::Chapters { chapters: ch })).await;
+        let info = std::process::Command::new("ffmpeg").args(["-hide_banner", "-i"]).arg(&out).output().unwrap();
+        let text = String::from_utf8_lossy(&info.stderr).into_owned();
+        assert!(text.contains("Chapter #0:0") && text.contains("Chapter #0:1"), "{text}");
+        assert!(text.contains("开场") && text.contains("正片"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

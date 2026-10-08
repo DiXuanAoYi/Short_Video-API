@@ -216,7 +216,11 @@ pub async fn after_download(app: AppHandle, platform: String, media_id: String, 
     let Ok(Some(item)) = st.db.library_item(id) else { return };
     if item.kind == "subtitle" {
         let _ = library::index_subtitle_item(&st.db, &item);
+        crate::ai::auto_translate(&app, &st, &item);
         return;
+    }
+    if item.kind == "video" {
+        crate::ai::auto_transcribe(&app, &st, &item);
     }
     if !st.settings().library.probe_new_files {
         return;

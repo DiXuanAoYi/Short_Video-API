@@ -1,3 +1,5 @@
+pub mod ai;
+pub mod ai_cmds;
 pub mod backup;
 mod clipboard;
 mod commands;
@@ -31,6 +33,7 @@ pub mod subtitle_io;
 pub mod subtitle_tools;
 pub mod tools;
 mod tray;
+pub mod vault;
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -74,6 +77,8 @@ pub struct AppState {
     pub live: live::LiveState,
     /// 媒体工具箱的后台任务
     pub media_jobs: media_tools::MediaJobs,
+    /// 加密保存的密钥（API 密钥、密码等）
+    pub vault: vault::Vault,
 }
 
 impl AppState {
@@ -228,6 +233,7 @@ pub fn run() {
                 subs: subs::SubsState::default(),
                 live: live::LiveState::default(),
                 media_jobs: media_tools::MediaJobs::default(),
+                vault: vault::Vault::open(data_dir.join("vault.bin"), key.key),
             }));
             // 媒体库封面缓存通过 asset 协议显示
             let covers = data_dir.join("covers");
@@ -385,6 +391,14 @@ pub fn run() {
             library_cmds::backup_export,
             library_cmds::backup_import,
             library_cmds::restart_app,
+            ai_cmds::secret_set,
+            ai_cmds::secret_has,
+            ai_cmds::ai_status,
+            ai_cmds::ai_test,
+            ai_cmds::ai_translate,
+            ai_cmds::ai_summarize,
+            ai_cmds::ai_transcribe,
+            ai_cmds::media_job_text,
             media_cmds::media_job_start,
             media_cmds::media_jobs,
             media_cmds::media_job_cancel,

@@ -281,6 +281,7 @@ export type ToolOp =
   | { op: 'concat'; reencode: boolean }
   | { op: 'trim'; startMs: number; endMs: number | null; precise: boolean }
   | { op: 'mute' }
+  | { op: 'chapters'; chapters: Chapter[] }
   | { op: 'tags'; title?: string | null; artist?: string | null; album?: string | null; year?: string | null; genre?: string | null; comment?: string | null; cover?: string | null }
 
 export type ToolJob = ToolOp & { inputs: string[]; outputDir?: string | null }
@@ -316,6 +317,30 @@ export type SubOp =
   | { op: 'danmaku'; width?: number | null; height?: number | null }
 
 export type SubJob = SubOp & { input: string; format?: string | null }
+
+export interface AiSettings {
+  baseUrl: string
+  model: string
+  targetLang: string
+  bilingual: boolean
+  batchSize: number
+  sttEngine: 'api' | 'local'
+  sttBaseUrl: string
+  sttModel: string
+  sttLanguage: string
+  whisperBin: string
+  whisperModel: string
+  autoTranslate: boolean
+  autoTranscribe: boolean
+}
+
+export interface AiStatus {
+  chatReady: boolean
+  chatKey: boolean
+  sttReady: boolean
+  sttKey: boolean
+  whisperFound: boolean
+}
 
 export interface LibrarySettings {
   useTrash: boolean
@@ -473,6 +498,7 @@ export interface Settings {
   danmaku: DanmakuStyle
   maxSizeMb: number
   autoDowngrade: boolean
+  ai: AiSettings
 }
 
 export interface LiveSettings {

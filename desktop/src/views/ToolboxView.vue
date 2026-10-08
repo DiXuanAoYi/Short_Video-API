@@ -4,19 +4,22 @@ import { useAppStore } from '../stores/app'
 import VideoTools from '../components/toolbox/VideoTools.vue'
 import SubtitleTools from '../components/toolbox/SubtitleTools.vue'
 import TagTools from '../components/toolbox/TagTools.vue'
+import AiTools from '../components/toolbox/AiTools.vue'
 import JobList from '../components/toolbox/JobList.vue'
 
 const app = useAppStore()
-const tab = ref<'video' | 'subtitle' | 'tags'>('video')
+const tab = ref<'video' | 'subtitle' | 'tags' | 'ai'>('video')
 const preset = ref<string[] | undefined>()
 const tool = ref<string | undefined>()
+const aiMode = ref<'transcribe' | 'translate' | 'summarize' | undefined>()
 
 function consume() {
   const r = app.toolboxRequest
   if (!r) return
   preset.value = r.paths
   tool.value = r.tool
-  tab.value = 'video'
+  aiMode.value = r.aiMode
+  tab.value = r.tab ?? 'video'
   app.toolboxRequest = null
 }
 onMounted(consume)
@@ -31,12 +34,14 @@ watch(() => app.toolboxRequest, consume)
         <el-radio-button value="video">视频与音频</el-radio-button>
         <el-radio-button value="subtitle">字幕</el-radio-button>
         <el-radio-button value="tags">音频标签</el-radio-button>
+        <el-radio-button value="ai">AI</el-radio-button>
       </el-radio-group>
     </div>
     <p class="mute note">所有处理都在本机完成，会生成新文件并登记到媒体库，不会修改原文件。需要 ffmpeg（在“设置 → 组件”里安装）。</p>
     <VideoTools v-if="tab === 'video'" :preset="preset" :tool="tool" />
     <SubtitleTools v-else-if="tab === 'subtitle'" />
-    <TagTools v-else />
+    <TagTools v-else-if="tab === 'tags'" />
+    <AiTools v-else :preset="preset" :mode="aiMode" />
     <JobList v-if="tab !== 'subtitle'" class="joblist" />
   </div>
 </template>

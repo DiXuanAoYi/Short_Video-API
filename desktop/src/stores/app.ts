@@ -5,7 +5,7 @@ import type { AppInfo, ErrorKind, HistoryItem, MediaInfo, Settings, TaskSnapshot
 
 export type ViewName = 'parse' | 'queue' | 'subs' | 'live' | 'library' | 'tools' | 'settings'
 export type LibraryTab = 'files' | 'inbox' | 'history'
-export type SettingsTab = 'download' | 'parse' | 'network' | 'accounts' | 'phone' | 'components' | 'diagnostics' | 'general'
+export type SettingsTab = 'download' | 'parse' | 'network' | 'accounts' | 'phone' | 'ai' | 'components' | 'diagnostics' | 'general'
 
 /** 设置、主题与当前页面。 */
 export const useAppStore = defineStore('app', () => {
@@ -20,15 +20,15 @@ export const useAppStore = defineStore('app', () => {
   /** 请求账号页打开某个网站的登录（内置平台 ID 或域名）；处理后清空 */
   const loginRequest = ref<string | null>(null)
   /** 请求工具箱打开并预选文件（媒体库里的“用工具箱处理”）；处理后清空 */
-  const toolboxRequest = ref<{ paths: string[]; tool?: string } | null>(null)
+  const toolboxRequest = ref<{ paths: string[]; tool?: string; tab?: 'video' | 'subtitle' | 'tags' | 'ai'; aiMode?: 'transcribe' | 'translate' | 'summarize' } | null>(null)
 
   function goSettings(tab: SettingsTab) {
     settingsTab.value = tab
     view.value = 'settings'
   }
 
-  function goToolbox(paths: string[], tool?: string) {
-    toolboxRequest.value = { paths, tool }
+  function goToolbox(paths: string[], tool?: string, extra?: { tab?: 'video' | 'subtitle' | 'tags' | 'ai'; aiMode?: 'transcribe' | 'translate' | 'summarize' }) {
+    toolboxRequest.value = { paths, tool, ...extra }
     view.value = 'tools'
   }
 

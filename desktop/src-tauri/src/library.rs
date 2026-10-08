@@ -448,6 +448,22 @@ impl Db {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// 同一个作品下已有的字幕资源 ID（下载的、导入的、AI 生成的）。
+    pub fn subtitle_assets_for(&self, platform: &str, media_id: &str) -> AppResult<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT asset_id FROM downloads WHERE platform=?1 AND media_id=?2 AND kind='subtitle'")?;
+        let rows = stmt.query_map(params![platform, media_id], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn item_by_path(&self, path: &str) -> AppResult<Option<LibraryItem>> {
+        let id: Option<i64> = self.conn().query_row("SELECT id FROM downloads WHERE path=?1 ORDER BY id LIMIT 1", params![path], |r| r.get(0)).optional()?;
+        match id {
+            Some(id) => self.library_item(id),
+            None => Ok(None),
+        }
+    }
+
     pub fn phash_of(&self, id: i64) -> AppResult<Option<String>> {
         Ok(self
             .conn()
