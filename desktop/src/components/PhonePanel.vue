@@ -104,6 +104,18 @@ onUnmounted(() => {
       </div>
     </section>
 
+    <section v-if="info.running && info.url" class="card block">
+      <h3>网页控制台与命令行</h3>
+      <p class="mute small">
+        在同一局域网的手机或其他电脑上，用浏览器打开控制台，可以查看下载进度、暂停 / 继续 / 取消任务、添加链接、搜索媒体库。
+        也可以用命令行控制（先在终端里进入清影的安装目录，或把它加入 PATH）：
+        <span class="mono">clearclip add 链接</span>、<span class="mono">clearclip list</span>、<span class="mono">clearclip pause</span>、<span class="mono">clearclip help</span>。
+        开发者可以直接调用 <span class="mono">/api/v1/…</span> 接口（需要令牌）。
+      </p>
+      <div class="kvline"><span class="mute">控制台地址</span><span class="mono selectable">{{ info.url.replace('/?t=', '/console?t=').replace(info.token, showToken ? info.token : '••••••') }}</span><el-button size="small" link @click="copy(info.url!.replace('/?t=', '/console?t='))">复制</el-button></div>
+      <p class="mute small">控制台和接口都用同一个令牌保护，只接受局域网内的访问，网络上是明文传输，请不要在不信任的 Wi-Fi 下开启。接口不会返回你电脑上的文件路径，也不能删除文件。</p>
+    </section>
+
     <section class="card block">
       <h3>浏览器扩展</h3>
       <p class="mute small">

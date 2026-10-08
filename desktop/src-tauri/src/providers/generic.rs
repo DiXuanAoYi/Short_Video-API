@@ -144,7 +144,9 @@ pub async fn resolve(ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo> {
         let mut clean = base.clone();
         clean.set_fragment(None);
         let clean = clean.to_string();
-        let referer = format!("{}://{host}/", base.scheme());
+        // 浏览器扩展嗅探到的媒体地址会带上所在网页，作为 Referer（很多 CDN 要求）
+        let page_referer = hints.get("cc-referer").filter(|r| Url::parse(r).is_ok()).cloned();
+        let referer = page_referer.clone().unwrap_or_else(|| format!("{}://{host}/", base.scheme()));
         info.title = hints.get("cc-title").cloned().unwrap_or_else(|| name_from_path().trim_end_matches(&format!(".{e}")).to_string());
         info.id = if hints.is_empty() {
             info.title.clone()
@@ -155,10 +157,15 @@ pub async fn resolve(ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo> {
             info.author = a.clone();
         }
         info.published_at = hints.get("cc-date").and_then(|d| d.parse().ok());
-        if !hints.is_empty() {
+        if hints.contains_key("cc-pod") {
             // 播客附件：按“播客”归类，避免被当成某个 CDN 站点
             info.platform = "rss".into();
             info.platform_name = "播客".into();
+        } else if let Some(page_host) = page_referer.as_deref().and_then(|r| Url::parse(r).ok()).and_then(|u| u.host_str().map(String::from)) {
+            // 扩展嗅探到的：按视频所在的网站归类，而不是 CDN
+            let site = crate::cookies::registrable_domain(&page_host);
+            info.platform = site.clone();
+            info.platform_name = site;
         }
         if AUDIO_EXTS.contains(&e) {
             info.kind = MediaKind::Audio;
@@ -269,7 +276,7 @@ mod tests {
         let settings = crate::settings::Settings::default();
         let store = crate::cookies::CookieStore::in_memory();
         let ctx = Ctx::new(&client, &settings, &store);
-        let url = "https://media.example.com/dl?id=9#cc-title=%E7%AC%AC1%E6%9C%9F&cc-ext=m4a&cc-author=%E8%80%81%E7%8E%8B&cc-cover=https%3A%2F%2Fc.example.com%2Fx.jpg&cc-date=1759824000";
+        let url = "https://media.example.com/dl?id=9#cc-pod=1&cc-title=%E7%AC%AC1%E6%9C%9F&cc-ext=m4a&cc-author=%E8%80%81%E7%8E%8B&cc-cover=https%3A%2F%2Fc.example.com%2Fx.jpg&cc-date=1759824000";
         assert_eq!(direct_media_ext(url), Some("m4a"));
         let info = resolve(&ctx, url).await.unwrap();
         assert_eq!((info.title.as_str(), info.author.as_str(), info.platform.as_str()), ("第1期", "老王", "rss"));
@@ -285,6 +292,14 @@ mod tests {
         let plain = resolve(&ctx, "https://x.example.com/a/song.mp3").await.unwrap();
         assert_eq!((plain.title.as_str(), plain.kind), ("song", MediaKind::Audio));
         assert!(!is_direct_media("https://x.example.com/watch?v=1"));
+        // 浏览器扩展嗅探到的 m3u8：带网页地址和标题
+        let sniffed = "https://cdn.video-site.net/hls/abc/index.m3u8?sig=1#cc-referer=https%3A%2F%2Fwww.video-site.com%2Fplay%2F9&cc-title=%E4%B8%80%E4%B8%AA%E8%A7%86%E9%A2%91";
+        let info = resolve(&ctx, sniffed).await.unwrap();
+        assert_eq!((info.title.as_str(), info.platform.as_str()), ("一个视频", "video-site.com"));
+        let v = &info.assets[0];
+        assert_eq!(v.protocol, Protocol::Hls);
+        assert_eq!(v.url, "https://cdn.video-site.net/hls/abc/index.m3u8?sig=1");
+        assert!(v.headers.iter().any(|(k, val)| k == "Referer" && val == "https://www.video-site.com/play/9"), "{:?}", v.headers);
     }
 
     #[test]

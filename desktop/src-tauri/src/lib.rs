@@ -1,8 +1,11 @@
 pub mod ai;
 pub mod ai_cmds;
+pub mod api;
 pub mod backup;
+pub mod cli;
 mod clipboard;
 mod commands;
+pub mod console;
 pub mod cookies;
 pub mod db;
 pub mod diagnostics;
@@ -154,14 +157,24 @@ pub fn portable_dir() -> Option<PathBuf> {
 }
 
 pub fn run() {
+    // 命令行子命令（list / status / pause …）：执行完就退出，不启动界面
+    if let Some(code) = cli::try_run() {
+        std::process::exit(code);
+    }
     let portable = portable_dir();
     let log_target = match &portable {
         Some(p) => tauri_plugin_log::TargetKind::Folder { path: p.join("logs"), file_name: Some("clearclip".into()) },
         None => tauri_plugin_log::TargetKind::LogDir { file_name: Some("clearclip".into()) },
     };
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            tray::show_main(app);
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            // `clearclip add <链接>` 交给已经在运行的这一个
+            match cli::add_text(&args) {
+                Some(text) => {
+                    let _ = phone::receive_trusted(app, "cli", "cli", "命令行", text);
+                }
+                None => tray::show_main(app),
+            }
         }))
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_notification::init())
@@ -263,6 +276,14 @@ pub fn run() {
             phone::restore(&handle);
             subs::spawn_scheduler(&handle);
             live::spawn_monitor(&handle);
+            // `clearclip add <链接>` 启动的：等界面和任务恢复好后加入下载
+            if let Some(text) = cli::add_text(&std::env::args().collect::<Vec<_>>()) {
+                let h = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    let _ = phone::receive_trusted(&h, "cli", "cli", "命令行", text);
+                });
+            }
             // 开机自启时只在托盘运行
             if std::env::args().any(|a| a == "--autostart") {
                 if let Some(w) = app.get_webview_window("main") {

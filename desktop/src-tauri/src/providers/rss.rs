@@ -194,7 +194,7 @@ pub fn parse_feed(xml: &str, base: &Url) -> Option<Feed> {
 pub fn entry_url(e: &FeedEntry, author: &str, feed_title: &str) -> String {
     let enc = |s: &str| url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
     let sep = if e.url.contains('#') { '&' } else { '#' };
-    let mut out = format!("{}{sep}cc-title={}&cc-ext={}", e.url, enc(&e.title), e.ext);
+    let mut out = format!("{}{sep}cc-pod=1&cc-title={}&cc-ext={}", e.url, enc(&e.title), e.ext);
     let who = if author.is_empty() { feed_title } else { author };
     if !who.is_empty() {
         out.push_str(&format!("&cc-author={}", enc(who)));
@@ -394,7 +394,7 @@ mod tests {
         let base = Url::parse("https://pod.example.com/feed.xml").unwrap();
         let f = parse_feed(RSS, &base).unwrap();
         let u = entry_url(&f.entries[0], &f.author, &f.title);
-        assert!(u.starts_with("https://media.example.com/ep2.mp3?token=a&b=1#cc-title="), "{u}");
+        assert!(u.starts_with("https://media.example.com/ep2.mp3?token=a&b=1#cc-pod=1&cc-title="), "{u}");
         let h = fragment_hints(&u);
         assert_eq!(h["cc-title"], "第 2 期：\"聊聊 AI\"");
         assert_eq!(h["cc-author"], "老王");
@@ -403,7 +403,7 @@ mod tests {
         assert!(h["cc-cover"].ends_with("cover.jpg"));
         // 原地址已经带片段
         let e = FeedEntry { url: "https://a.example.com/x#t=1".into(), ..f.entries[0].clone() };
-        assert!(entry_url(&e, "", "").contains("#t=1&cc-title="));
+        assert!(entry_url(&e, "", "").contains("#t=1&cc-pod=1&cc-title="));
         assert_eq!(parse_duration("59:30"), Some(3_570_000));
         assert_eq!(parse_duration("abc"), None);
     }

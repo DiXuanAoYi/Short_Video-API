@@ -823,7 +823,7 @@ export interface AutoResult {
   message: string
 }
 
-export type InboxSource = 'clipboard' | 'phone' | 'extension' | 'manual'
+export type InboxSource = 'clipboard' | 'phone' | 'extension' | 'manual' | 'api' | 'cli'
 export type InboxStatus = 'pending_pair' | 'rejected' | 'confirm' | 'playlist' | 'resolving' | 'queued' | 'downloading' | 'done' | 'failed' | 'ignored'
 
 /** 收到的链接 */

@@ -19,7 +19,7 @@ const fSource = ref<InboxSource | ''>('')
 const fStatus = ref<NonNullable<InboxFilter['status']>>('all')
 const expanded = ref<number | null>(null)
 
-const SOURCE: Record<InboxSource, string> = { clipboard: '剪贴板', phone: '手机', extension: '浏览器扩展', manual: '手动粘贴' }
+const SOURCE: Record<InboxSource, string> = { clipboard: '剪贴板', phone: '手机', extension: '浏览器扩展', manual: '手动粘贴', api: '接口', cli: '命令行' }
 const STATUS: Record<InboxStatus, string> = {
   pending_pair: '等待配对',
   rejected: '已拒绝配对',
