@@ -104,6 +104,7 @@ pub async fn resolve(ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo> {
         assets: vec![],
         entries: vec![],
         series: None,
+        chapters: vec![],
         extractor: Some("generic".into()),
     };
     let name_from_path = || base.path_segments().and_then(|mut s| s.rfind(|x| !x.is_empty())).map(|s| s.to_string()).unwrap_or_else(|| host.clone());

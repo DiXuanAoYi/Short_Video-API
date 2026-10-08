@@ -59,6 +59,21 @@ export interface MediaInfo {
   entries: PlaylistEntry[]
   series: SeriesInfo | null
   extractor: string | null
+  chapters: Chapter[]
+}
+
+export interface Chapter {
+  title: string
+  startMs: number
+  endMs: number
+}
+
+/** 只下载 / 保留的时间段 */
+export interface Clip {
+  startMs: number
+  endMs: number | null
+  /** 重新编码，起点精确到帧 */
+  precise: boolean
 }
 
 export type TaskStatus = 'queued' | 'running' | 'paused' | 'done' | 'failed' | 'canceled'
@@ -104,6 +119,8 @@ export interface TaskSnapshot {
   error: string | null
   errorKind: ErrorKind | null
   note: string | null
+  /** 下载成功但有附带问题（如字幕没有处理成功） */
+  warning: string | null
   resumable: boolean | null
   step: 'download' | 'merge' | 'post' | null
   inputs: number
@@ -293,6 +310,12 @@ export interface Settings {
   liveMaxRecordings: number
   liveCleanupDays: number
   inbox: InboxSettings
+  subtitleLangs: string[]
+  subtitleAuto: boolean
+  subtitleMode: 'off' | 'file' | 'embed' | 'burn'
+  subtitleConvert: boolean
+  danmakuAss: boolean
+  verifyDownloads: boolean
 }
 
 export interface LiveSettings {
@@ -433,6 +456,11 @@ export type QualityPreset = 'best' | 'max1080' | 'small' | 'audio'
 export interface PostOptions {
   extractAudio: string | null
   embedMetadata: boolean
+  /** 选中的字幕：soft 内嵌为字幕轨 / burn 烧录进画面；为空时字幕单独保存为文件 */
+  subMode?: 'soft' | 'burn' | null
+  clip?: Clip | null
+  /** 按这些章节另外拆分成多个文件 */
+  splitChapters?: Chapter[]
 }
 
 export type ToolId = 'yt-dlp' | 'ffmpeg'

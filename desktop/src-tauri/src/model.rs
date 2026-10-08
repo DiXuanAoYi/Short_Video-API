@@ -239,6 +239,35 @@ pub struct MediaInfo {
     /// 解析来源：native / yt-dlp / remote
     #[serde(default)]
     pub extractor: Option<String>,
+    /// 视频章节（YouTube 等），用于按章节拆分或选择片段
+    #[serde(default)]
+    pub chapters: Vec<Chapter>,
+}
+
+/// 只下载 / 保留的时间段（毫秒）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Clip {
+    pub start_ms: u64,
+    /// 为空表示到结尾
+    pub end_ms: Option<u64>,
+    /// 重新编码，起点精确到帧；默认不重新编码，起点落在前一个关键帧
+    pub precise: bool,
+}
+
+impl Clip {
+    pub fn range(&self) -> (u64, Option<u64>) {
+        (self.start_ms, self.end_ms)
+    }
+}
+
+/// 视频章节（时间单位毫秒）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Chapter {
+    pub title: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
 }
 
 impl MediaInfo {

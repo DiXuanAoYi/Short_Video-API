@@ -141,6 +141,19 @@ pub async fn resolve_link(app: AppHandle, state: St<'_>, text: String) -> AppRes
     Ok(info)
 }
 
+/// 解析页默认勾选的字幕（按偏好语言）。
+#[tauri::command]
+pub fn preferred_subtitles(state: St<'_>, media: MediaInfo) -> Vec<String> {
+    quality::preferred_subtitles(&media, &state.settings())
+}
+
+/// 播放列表里已经下载过的条目（条目 ID）。
+#[tauri::command]
+pub fn downloaded_entries(state: St<'_>, platform: String, entries: Vec<PlaylistEntry>) -> AppResult<Vec<String>> {
+    let pairs: Vec<(String, String)> = entries.into_iter().map(|e| (e.id, e.url)).collect();
+    state.db.downloaded_entry_ids(&platform, &pairs)
+}
+
 #[tauri::command]
 pub async fn resolve_and_enqueue(app: AppHandle, text: String) -> AppResult<String> {
     clipboard::resolve_and_enqueue(&app, &text).await
@@ -781,10 +794,7 @@ pub fn open_login(app: AppHandle, site: String, url: Option<String>, label: Opti
     let (name, target) = login_target(&site, url.as_deref())?;
     let auto = cookies::login_cookie_names(&site).is_some();
     let hint = if auto { "登录完成后会自动保存并关闭窗口" } else { "登录完成后回到清影点击“保存登录状态”" };
-    WebviewWindowBuilder::new(&app, label_win, WebviewUrl::External(target))
-        .title(format!("登录{name}：{hint}"))
-        .inner_size(1100.0, 780.0)
-        .build()?;
+    WebviewWindowBuilder::new(&app, label_win, WebviewUrl::External(target)).title(format!("登录{name}：{hint}")).inner_size(1100.0, 780.0).build()?;
     if auto {
         let app = app.clone();
         tauri::async_runtime::spawn(async move { watch_login(app, site, label).await });
@@ -807,7 +817,8 @@ fn window_cookies(window: &tauri::WebviewWindow, site: &str) -> Vec<cookies::Sto
 }
 
 fn login_cookie_values(list: &[cookies::StoredCookie], names: &[&str]) -> Vec<(String, String)> {
-    let mut v: Vec<(String, String)> = list.iter().filter(|c| names.contains(&c.name.as_str()) && !c.value.is_empty()).map(|c| (c.name.clone(), c.value.clone())).collect();
+    let mut v: Vec<(String, String)> =
+        list.iter().filter(|c| names.contains(&c.name.as_str()) && !c.value.is_empty()).map(|c| (c.name.clone(), c.value.clone())).collect();
     v.sort();
     v
 }
@@ -837,7 +848,9 @@ async fn watch_login(app: AppHandle, site: String, label: Option<String>) {
                 let _ = app.emit(EVT_LOGIN_SAVED, &site);
                 let _ = app.emit("accounts://updated", ());
                 // 顺便检查一次登录状态（拿到用户名）
-                if let Some(id) = state.cookies.summaries().into_iter().find(|a| a.site == site && a.label == label.clone().unwrap_or_else(|| "默认".into())).map(|a| a.id) {
+                if let Some(id) =
+                    state.cookies.summaries().into_iter().find(|a| a.site == site && a.label == label.clone().unwrap_or_else(|| "默认".into())).map(|a| a.id)
+                {
                     if verify_account(&state, &id).await.is_ok() {
                         let _ = app.emit("accounts://updated", ());
                     }

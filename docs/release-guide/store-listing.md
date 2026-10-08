@@ -1,10 +1,10 @@
 # 扩展商店上架材料
 
-这份文案可直接复制到 Chrome 网上应用店、Microsoft Edge 加载项和 Firefox 附加组件的后台。操作步骤见 [docs/release-setup.md](../../../docs/release-setup.md)。
+这份文案可直接复制到 Chrome 网上应用店、Microsoft Edge 加载项和 Firefox 附加组件的后台。操作步骤见 [2-extension-store.md](2-extension-store.md)。
 
 - 打包文件：每个 Release 里的 `ClearClip-extension-<版本>.zip`
-- 隐私政策链接：`https://github.com/DiXuanAoYi/Short_Video-API/blob/main/docs/privacy.md`
-- 图标：`icons/128.png`
+- 隐私政策链接：`https://github.com/DiXuanAoYi/Short_Video-API/blob/main/docs/release-guide/privacy-policy.md`
+- 图标：`desktop/extension/icons/128.png`
 - 类别：生产力（Productivity）
 - 语言：简体中文
 

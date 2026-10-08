@@ -45,7 +45,10 @@
 - 收到的链接（“媒体库 → 收到的链接”）：剪贴板识别、手机和浏览器扩展发来的链接、手动解析失败的链接都会记录下来（重启后仍在），可按来源 / 状态筛选、搜索，一键重试、忽略；播放列表提示去选择条目；需要登录的失败链接显示“登录 XX”，登录保存后自动重试；可设保留天数和条数
 - 账号与登录：每个网站有登录说明（不登录能做什么、什么时候需要、推荐方式，见 [login-guide.md](../docs/login-guide.md)）；内置登录窗口对常见网站自动识别登录完成；账号显示登录是否有效并定期检查，失效时通知并给出“重新登录”
 - 浏览器扩展“发送到清影”（[`extension/`](./extension/)）：网页右键发送链接，一键同步当前网站的登录 Cookie，可对勾选的网站在登录状态变化时自动同步；弹窗显示与清影的连接状态
-- 字幕与弹幕：下载 yt-dlp 提供的各语言字幕（与视频同名，播放器自动加载）、B站弹幕 XML
+- 字幕与弹幕：人工字幕、YouTube 自动生成字幕和偏好语言的自动翻译、B站 CC / AI 字幕和弹幕；VTT 转 SRT（自动字幕的滚动重复会整理）、弹幕转 ASS；可以单独保存、内嵌到视频或烧录进画面；偏好语言决定排序和自动选择（[说明](../docs/subtitles-and-clips.md)）
+- 片段与章节：只下载视频的一段（可精确到帧），字幕同步裁剪；有章节的视频可以另存为每章一个文件
+- 播放列表：条目带封面和时长，标出已下载的，可搜索、反选、只选没下载过的、按序号选范围
+- 下载后用 ffmpeg 检查文件，损坏时自动重新下载一次
 - 图集合成视频：选中的图片按设定时长合成 MP4，可配背景音乐
 - 全局快捷键（默认 `Ctrl+Shift+D`）解析剪贴板；关闭窗口后驻留系统托盘
 - 媒体库：已下载文件和解析历史；本地封面缓存、列表 / 网格视图，按平台、类型、时间筛选；文件被移动或删除时可一键重新下载；上千条记录也不卡；已下载过的内容自动跳过
@@ -79,7 +82,7 @@ cargo test                                      # 解析器、下载器、数据
 
 在 GitHub 的 Actions 页面手动运行 `desktop-release`（选 `main` 分支），或推送 `desktop-v*` 标签（例如 `desktop-v0.1.1`），`.github/workflows/desktop-release.yml` 会构建 Windows（msi / nsis、便携版 zip）、macOS（Apple Silicon 与 Intel 的 dmg）、Linux（AppImage / deb / rpm）和浏览器扩展 zip，并发布 Release。发布前先把 `tauri.conf.json`、`Cargo.toml`、`package.json` 的版本号改成一致。
 
-更新签名密钥、macOS / Windows 代码签名和扩展上架的完整步骤见 [docs/release-setup.md](../docs/release-setup.md)。
+更新签名密钥、macOS / Windows 代码签名和扩展上架的完整步骤见 [docs/release-guide/](../docs/release-guide/README.md)。
 
 macOS 签名和公证需要在仓库 Secrets 中配置 `APPLE_CERTIFICATE`、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_SIGNING_IDENTITY`、`APPLE_ID`、`APPLE_PASSWORD`、`APPLE_TEAM_ID`。不配置时生成未签名的安装包。
 

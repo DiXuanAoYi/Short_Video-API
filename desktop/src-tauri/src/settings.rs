@@ -274,6 +274,18 @@ pub struct Settings {
     pub live_cleanup_days: u32,
     /// 收到的链接（收件箱）
     pub inbox: InboxSettings,
+    /// 字幕偏好语言，靠前的优先（`zh` 同时匹配简体、繁体等变体）
+    pub subtitle_langs: Vec<String>,
+    /// 解析时包含自动生成和自动翻译的字幕（YouTube）
+    pub subtitle_auto: bool,
+    /// 自动下载时的字幕处理：off 不下载 / file 单独保存字幕文件 / embed 内嵌到视频 / burn 烧录进画面
+    pub subtitle_mode: String,
+    /// VTT 字幕转成 SRT（播放器和剪辑软件通用）
+    pub subtitle_convert: bool,
+    /// B站弹幕 XML 转成 ASS（播放器可直接显示滚动弹幕）
+    pub danmaku_ass: bool,
+    /// 下载完成后用 ffmpeg 检查文件能否正常读取，损坏时自动重新下载一次
+    pub verify_downloads: bool,
 }
 
 /// 收到的链接的记录与保留。
@@ -378,6 +390,12 @@ impl Default for Settings {
             live_max_recordings: 3,
             live_cleanup_days: 0,
             inbox: InboxSettings::default(),
+            subtitle_langs: vec!["zh".into(), "en".into()],
+            subtitle_auto: true,
+            subtitle_mode: "off".into(),
+            subtitle_convert: true,
+            danmaku_ass: true,
+            verify_downloads: true,
         }
     }
 }
@@ -418,6 +436,10 @@ impl Settings {
         self.inbox.keep_days = self.inbox.keep_days.min(3650);
         if self.inbox.max_items > 0 {
             self.inbox.max_items = self.inbox.max_items.clamp(50, 100_000);
+        }
+        self.subtitle_langs = self.subtitle_langs.iter().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).take(12).collect();
+        if !matches!(self.subtitle_mode.as_str(), "off" | "file" | "embed" | "burn") {
+            self.subtitle_mode = "off".into();
         }
         if !matches!(self.merge_container.as_str(), "mp4" | "mkv") {
             self.merge_container = "mp4".into();

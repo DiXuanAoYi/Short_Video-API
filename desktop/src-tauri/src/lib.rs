@@ -20,6 +20,8 @@ pub mod quality;
 pub mod secret;
 pub mod settings;
 pub mod subs;
+pub mod subtitle;
+pub mod subtitle_io;
 pub mod tools;
 mod tray;
 
@@ -325,6 +327,8 @@ pub fn run() {
             commands::pause_all,
             commands::resume_all,
             commands::login_site,
+            commands::preferred_subtitles,
+            commands::downloaded_entries,
             commands::inbox_list,
             commands::inbox_counts,
             commands::inbox_retry,

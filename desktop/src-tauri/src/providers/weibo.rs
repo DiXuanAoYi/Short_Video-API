@@ -150,6 +150,7 @@ pub fn parse_status(status: &Value, id: &str, source_url: &str) -> AppResult<Med
         assets,
         entries: vec![],
         series: None,
+        chapters: vec![],
         extractor: Some("native".into()),
     })
 }

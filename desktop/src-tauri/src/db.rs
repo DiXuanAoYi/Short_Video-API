@@ -320,6 +320,28 @@ impl Db {
         Ok(path.filter(|p| Path::new(p).exists()))
     }
 
+    /// 列表条目里已经下载过的：同一平台、同一作品 ID，或原始链接相同。返回条目 ID。
+    /// 只统计视频和音频（字幕、封面不算）。
+    pub fn downloaded_entry_ids(&self, platform: &str, entries: &[(String, String)]) -> AppResult<Vec<String>> {
+        let conn = self.conn();
+        let mut ids = std::collections::HashSet::new();
+        let mut urls = std::collections::HashSet::new();
+        let mut stmt = conn.prepare("SELECT media_id, source_url FROM downloads WHERE platform=?1 AND kind IN ('video','audio')")?;
+        for row in stmt.query_map(params![platform], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+            let (id, url) = row?;
+            ids.insert(id);
+            if !url.is_empty() {
+                urls.insert(url);
+            }
+        }
+        // 平台标识不同但链接相同的（例如内置解析器和 yt-dlp 解析同一个网站）
+        let mut stmt = conn.prepare("SELECT source_url FROM downloads WHERE source_url<>'' AND kind IN ('video','audio')")?;
+        for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
+            urls.insert(row?);
+        }
+        Ok(entries.iter().filter(|(id, url)| ids.contains(id) || urls.contains(url)).map(|(id, _)| id.clone()).collect())
+    }
+
     pub fn list_library(&self, query: &str, limit: i64) -> AppResult<Vec<LibraryItem>> {
         self.search_library(&LibraryFilter { query: query.to_string(), ..Default::default() }, limit)
     }
@@ -466,6 +488,7 @@ fn placeholder_info() -> MediaInfo {
         assets: vec![],
         entries: vec![],
         series: None,
+        chapters: vec![],
         extractor: None,
     }
 }
@@ -524,6 +547,42 @@ mod tests {
         assert_eq!(hit.len(), 1);
         assert_eq!(hit[0].title, "板栗焖鸡（更新）");
         assert_eq!(hit[0].info.assets.len(), 1);
+    }
+
+    #[test]
+    fn downloaded_entries_by_id_or_url() {
+        let db = Db::open_in_memory().unwrap();
+        let rec = |platform: &str, media_id: &str, kind: &str, source_url: &str| {
+            db.record_download(&NewDownload {
+                platform,
+                media_id,
+                asset_id: &format!("a-{kind}"),
+                title: "t",
+                author: "",
+                cover: None,
+                path: "/x",
+                size: 1,
+                kind,
+                source: "manual",
+                source_url,
+                platform_name: platform,
+            })
+            .unwrap();
+        };
+        rec("youtube", "aaa", "video", "https://www.youtube.com/watch?v=aaa");
+        rec("youtube", "sub-only", "subtitle", "https://www.youtube.com/watch?v=sub-only");
+        rec("other", "zzz", "video", "https://v.example.com/p/9");
+        let entries: Vec<(String, String)> = [
+            ("aaa", "https://www.youtube.com/watch?v=aaa"),
+            ("bbb", "https://www.youtube.com/watch?v=bbb"),
+            ("sub-only", "https://www.youtube.com/watch?v=sub-only"),
+            ("n9", "https://v.example.com/p/9"),
+        ]
+        .iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect();
+        let got = db.downloaded_entry_ids("youtube", &entries).unwrap();
+        assert_eq!(got, vec!["aaa", "n9"], "subtitle-only downloads do not count; same URL under another platform does");
     }
 
     #[test]

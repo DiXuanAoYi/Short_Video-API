@@ -159,6 +159,7 @@ pub fn parse(body: &Value, pages: Option<&Value>, ugoira: Option<&Value>, source
         assets,
         entries: vec![],
         series: None,
+        chapters: vec![],
         extractor: Some("native".into()),
     })
 }

@@ -21,7 +21,7 @@ Chrome、Edge、Firefox 扩展：把当前网页、链接或视频发送到电�
 
 ## 商店安装
 
-商店审核通过后可直接从 Chrome 网上应用店、Edge 加载项或 Firefox 附加组件安装。上架步骤和材料见 [docs/release-setup.md](../../docs/release-setup.md) 和 [store/listing.md](./store/listing.md)；每个 Release 里的 `ClearClip-extension-<版本>.zip` 就是可上传的包。
+商店审核通过后可直接从 Chrome 网上应用店、Edge 加载项或 Firefox 附加组件安装。上架步骤和材料见 [docs/release-guide/](../../docs/release-guide/README.md)；每个 Release 里的 `ClearClip-extension-<版本>.zip` 就是可上传的包。
 
 ## 安全
 

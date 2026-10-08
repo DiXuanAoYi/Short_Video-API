@@ -254,8 +254,7 @@ async function remove(a: AccountSummary) {
         <div><span class="mute">不登录：</span>{{ guide.anonymous }}</div>
         <div><span class="mute">需要登录：</span>{{ guide.needLogin }}</div>
         <div>
-          <span class="mute">推荐方式：</span>{{ methodsText }}
-          <template v-if="guide.loginTip">。{{ guide.loginTip }}</template>
+          <span class="mute">推荐方式：</span>{{ methodsText }}<template v-if="guide.loginTip">。{{ guide.loginTip }}</template>
         </div>
         <a class="link" @click="api.openUrl(`https://github.com/${app.info?.repo ?? 'DiXuanAoYi/Short_Video-API'}/blob/main/docs/login-guide.md`)">各网站登录说明</a>
       </div>

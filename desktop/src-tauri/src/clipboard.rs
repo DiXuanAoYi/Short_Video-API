@@ -80,7 +80,11 @@ pub(crate) fn on_links(app: &AppHandle, text: String, links: Vec<DetectedLink>, 
                             Some(i) if i.status == "playlist" => AutoResult { url: link.url, ok: false, message: i.message.unwrap_or_default() },
                             Some(i) => {
                                 let title = i.title.unwrap_or_default();
-                                AutoResult { url: link.url, ok: true, message: format!("已加入下载：{}", i.message.map(|m| format!("{title}（{m}）")).unwrap_or(title)) }
+                                AutoResult {
+                                    url: link.url,
+                                    ok: true,
+                                    message: format!("已加入下载：{}", i.message.map(|m| format!("{title}（{m}）")).unwrap_or(title)),
+                                }
                             }
                             None => return,
                         }
@@ -148,7 +152,13 @@ pub async fn resolve_and_enqueue_full(app: &AppHandle, text: &str) -> crate::mod
         return Ok(AutoEnqueued { title, task_ids: vec![], already_downloaded: 0, already_queued: 0, playlist: Some(info.entries.len()) });
     }
     let r = download::enqueue_with(app, info, &ids, post)?;
-    Ok(AutoEnqueued { title, task_ids: r.tasks.iter().map(|t| t.id).collect(), already_downloaded: r.already_downloaded, already_queued: r.already_queued, playlist: None })
+    Ok(AutoEnqueued {
+        title,
+        task_ids: r.tasks.iter().map(|t| t.id).collect(),
+        already_downloaded: r.already_downloaded,
+        already_queued: r.already_queued,
+        playlist: None,
+    })
 }
 
 /// 全局快捷键 / 托盘菜单：打开主窗口并解析当前剪贴板。

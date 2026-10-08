@@ -381,9 +381,17 @@ pub async fn process(app: &AppHandle, id: i64) {
             } else {
                 ("done", Some("之前已下载过".to_string()))
             };
-            patch(app, id, Patch { status: Some(status), title: Some(r.title.clone()), message: Some(message), task_ids: Some(&r.task_ids), ..Default::default() });
+            patch(
+                app,
+                id,
+                Patch { status: Some(status), title: Some(r.title.clone()), message: Some(message), task_ids: Some(&r.task_ids), ..Default::default() },
+            );
         }
-        Err(e) => patch(app, id, Patch { status: Some("failed"), message: Some(Some(e.message.clone())), error_kind: Some(Some(kind_str(e.kind))), ..Default::default() }),
+        Err(e) => patch(
+            app,
+            id,
+            Patch { status: Some("failed"), message: Some(Some(e.message.clone())), error_kind: Some(Some(kind_str(e.kind))), ..Default::default() },
+        ),
     }
 }
 
@@ -396,7 +404,8 @@ pub fn retry(app: &AppHandle, id: i64) -> AppResult<()> {
     // 失败的下载任务直接继续，不用重新解析
     let state = st(app);
     let tasks = state.downloads.snapshots();
-    let failed: Vec<i64> = tasks.iter().filter(|t| item.task_ids.contains(&t.id) && matches!(t.status, TaskStatus::Failed | TaskStatus::Canceled)).map(|t| t.id).collect();
+    let failed: Vec<i64> =
+        tasks.iter().filter(|t| item.task_ids.contains(&t.id) && matches!(t.status, TaskStatus::Failed | TaskStatus::Canceled)).map(|t| t.id).collect();
     if !failed.is_empty() {
         for t in &failed {
             crate::download::resume(app, *t);
@@ -472,7 +481,7 @@ pub fn retry_after_login(app: &AppHandle, site: &str, automatic: bool) -> usize 
         if t.status == TaskStatus::Failed
             && matches!(t.error_kind, Some(ErrorKind::NeedLogin))
             && same_site(&t.site, site)
-            && t.finished_at.is_none_or(|f| f < settled)
+            && t.finished_at.map_or(true, |f| f < settled)
         {
             crate::download::resume(app, t.id);
             n += 1;
@@ -513,7 +522,11 @@ pub fn record_manual_failure(app: &AppHandle, text: &str, err: &AppError) {
             Err(_) => return,
         },
     };
-    patch(app, id, Patch { status: Some("failed"), message: Some(Some(err.message.clone())), error_kind: Some(Some(kind_str(err.kind))), ..Default::default() });
+    patch(
+        app,
+        id,
+        Patch { status: Some("failed"), message: Some(Some(err.message.clone())), error_kind: Some(Some(kind_str(err.kind))), ..Default::default() },
+    );
 }
 
 /// 剪贴板识别到链接：记录下来。返回各链接对应的记录编号。

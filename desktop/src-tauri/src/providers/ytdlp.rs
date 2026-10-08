@@ -15,8 +15,9 @@ use url::Url;
 
 use super::Ctx;
 use crate::cookies::{self, CookieStore};
-use crate::model::{quality_label, AppError, AppResult, Asset, AssetKind, ErrorKind, MediaInfo, MediaKind, PlaylistEntry, Protocol, SeriesInfo};
-use crate::settings::Route;
+use crate::model::{quality_label, AppError, AppResult, Asset, AssetKind, Chapter, ErrorKind, MediaInfo, MediaKind, PlaylistEntry, Protocol, SeriesInfo};
+use crate::settings::{Route, Settings};
+use crate::subtitle;
 
 /// 解析超时：播放列表较大时 yt-dlp 也需要一些时间
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -127,7 +128,7 @@ pub async fn resolve(ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo> {
     }
     let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| AppError::parser(format!("yt-dlp 输出无法解析：{e}")))?;
     ctx.record("ytdlp", "info", url, &String::from_utf8_lossy(&out.stdout));
-    from_json(&v, url)
+    from_json_with(&v, url, &SubPrefs::from_settings(ctx.settings))
 }
 
 /// 把 yt-dlp 的报错转换成带类型的错误，界面据此给出下一步操作。
@@ -290,8 +291,56 @@ fn platform_of(v: &Value, url: &str) -> (String, String) {
     (name.to_ascii_lowercase(), name)
 }
 
+/// 字幕偏好：哪些语言排在前面、是否包含自动生成 / 自动翻译的字幕。
+#[derive(Debug, Clone)]
+pub struct SubPrefs {
+    pub langs: Vec<String>,
+    pub auto: bool,
+}
+
+impl Default for SubPrefs {
+    fn default() -> Self {
+        SubPrefs { langs: vec!["zh".into(), "en".into()], auto: true }
+    }
+}
+
+impl SubPrefs {
+    pub fn from_settings(s: &Settings) -> Self {
+        SubPrefs { langs: s.subtitle_langs.clone(), auto: s.subtitle_auto }
+    }
+}
+
 /// 把 yt-dlp 的 JSON 转换成统一结构。
 pub fn from_json(v: &Value, source_url: &str) -> AppResult<MediaInfo> {
+    from_json_with(v, source_url, &SubPrefs::default())
+}
+
+fn chapters_of(v: &Value) -> Vec<Chapter> {
+    let list: Vec<Chapter> = v
+        .get("chapters")
+        .and_then(|c| c.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| {
+                    let (start, end) = (f(c, "start_time")?, f(c, "end_time")?);
+                    (end > start).then(|| Chapter {
+                        title: s(c, "title").unwrap_or_default(),
+                        start_ms: (start * 1000.0).round() as u64,
+                        end_ms: (end * 1000.0).round() as u64,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // 只有一个章节（覆盖整个视频）没有意义
+    if list.len() >= 2 {
+        list
+    } else {
+        vec![]
+    }
+}
+
+pub fn from_json_with(v: &Value, source_url: &str, prefs: &SubPrefs) -> AppResult<MediaInfo> {
     let (platform, platform_name) = platform_of(v, source_url);
     let id = s(v, "id").unwrap_or_default();
     let title = s(v, "title").or_else(|| s(v, "fulltitle")).unwrap_or_else(|| id.clone());
@@ -313,6 +362,7 @@ pub fn from_json(v: &Value, source_url: &str) -> AppResult<MediaInfo> {
         assets: vec![],
         entries: vec![],
         series: None,
+        chapters: vec![],
         extractor: Some(format!("yt-dlp:{}", s(v, "extractor_key").unwrap_or_else(|| "Generic".into()))),
     };
     if let Some(series) = s(v, "series") {
@@ -327,7 +377,7 @@ pub fn from_json(v: &Value, source_url: &str) -> AppResult<MediaInfo> {
     {
         let mut assets = vec![];
         for (i, e) in list.iter().enumerate() {
-            let Ok(sub) = from_json(e, source_url) else { continue };
+            let Ok(sub) = from_json_with(e, source_url, prefs) else { continue };
             let prefix = format!("e{}-", i + 1);
             let name = s(e, "title").unwrap_or_else(|| format!("第 {} 个", i + 1));
             for mut a in sub.assets.into_iter().filter(|a| a.kind != AssetKind::Cover) {
@@ -402,7 +452,7 @@ pub fn from_json(v: &Value, source_url: &str) -> AppResult<MediaInfo> {
     if !assets.iter().any(|a| a.kind == AssetKind::Video) {
         info.kind = MediaKind::Audio;
     }
-    assets.extend(subtitle_assets(v));
+    assets.extend(subtitle_assets(v, prefs));
     if let Some(c) = cover {
         let mut cv = Asset::cover(c);
         if !["jpg", "png", "webp", "gif"].contains(&cv.ext.as_str()) {
@@ -411,21 +461,74 @@ pub fn from_json(v: &Value, source_url: &str) -> AppResult<MediaInfo> {
         assets.push(cv);
     }
     info.assets = assets;
+    info.chapters = chapters_of(v);
     Ok(info)
 }
 
-/// 字幕轨：每种语言一个，优先 SRT，其次 VTT、ASS（不含直播聊天记录等非字幕内容）。
-fn subtitle_assets(v: &Value) -> Vec<Asset> {
-    let Some(subs) = v.get("subtitles").and_then(|x| x.as_object()) else { return vec![] };
+/// 字幕轨：人工上传的字幕每种语言一个（偏好语言排前面），优先 SRT，其次 VTT、ASS；
+/// 再加上自动生成的原语言字幕和偏好语言的自动翻译（只取 VTT，下载时转成 SRT）。
+/// 不含直播聊天记录等非字幕内容。原始语言代码保存在 `format_id`，用于 yt-dlp 回退下载。
+fn subtitle_assets(v: &Value, prefs: &SubPrefs) -> Vec<Asset> {
     let mut out = vec![];
-    for (lang, tracks) in subs.iter().filter(|(l, _)| !l.contains("live_chat") && l.as_str() != "danmaku").take(30) {
-        let Some(list) = tracks.as_array() else { continue };
-        let pick = ["srt", "vtt", "ass"].iter().find_map(|ext| list.iter().find(|t| s(t, "ext").as_deref() == Some(*ext)));
-        let Some(t) = pick else { continue };
-        let (Some(url), Some(ext)) = (s(t, "url"), s(t, "ext")) else { continue };
-        let name = s(t, "name").unwrap_or_else(|| lang.clone());
-        let mut a = Asset::subtitle(lang, &name, url, &ext);
-        a.protocol = Protocol::Http;
+    let mut manual: Vec<String> = vec![];
+    if let Some(subs) = v.get("subtitles").and_then(|x| x.as_object()) {
+        let mut items: Vec<(&String, &Value)> = subs.iter().filter(|(l, _)| !l.contains("live_chat") && l.as_str() != "danmaku").collect();
+        // 稳定排序：偏好语言靠前，其余保持原有顺序
+        items.sort_by_key(|(l, _)| subtitle::lang_rank(l, &prefs.langs).unwrap_or(usize::MAX));
+        for (lang, tracks) in items.into_iter().take(30) {
+            let Some(list) = tracks.as_array() else { continue };
+            let pick = ["srt", "vtt", "ass"].iter().find_map(|ext| list.iter().find(|t| s(t, "ext").as_deref() == Some(*ext)));
+            let Some(t) = pick else { continue };
+            let (Some(url), Some(ext)) = (s(t, "url"), s(t, "ext")) else { continue };
+            let name = s(t, "name").unwrap_or_else(|| subtitle::lang_name(lang));
+            let mut a = Asset::subtitle(lang, &name, url, &ext);
+            a.protocol = Protocol::Http;
+            a.format_id = Some(lang.clone());
+            manual.push(subtitle::normalize_lang(lang));
+            out.push(a);
+        }
+    }
+    if prefs.auto {
+        out.extend(auto_caption_assets(v, prefs, &manual));
+    }
+    out
+}
+
+fn auto_caption_assets(v: &Value, prefs: &SubPrefs, manual: &[String]) -> Vec<Asset> {
+    let Some(auto) = v.get("automatic_captions").and_then(|x| x.as_object()).filter(|a| !a.is_empty()) else { return vec![] };
+    // (语言代码, 是否原语言)：先是视频原语言的自动字幕，再是偏好语言的自动翻译
+    let mut picks: Vec<(&String, bool)> = vec![];
+    let original = auto.keys().find(|k| k.ends_with("-orig")).or_else(|| {
+        let lang = subtitle::normalize_lang(&s(v, "language")?);
+        auto.keys().find(|k| subtitle::normalize_lang(k) == lang)
+    });
+    if let Some(k) = original {
+        picks.push((k, true));
+    }
+    for pref in &prefs.langs {
+        let exact = auto.keys().find(|k| !k.ends_with("-orig") && subtitle::normalize_lang(k) == subtitle::normalize_lang(pref));
+        let variant = || auto.keys().find(|k| !k.ends_with("-orig") && subtitle::lang_matches(k, pref));
+        if let Some(k) = exact.or_else(variant) {
+            if !picks.iter().any(|(p, _)| subtitle::normalize_lang(p) == subtitle::normalize_lang(k)) {
+                picks.push((k, false));
+            }
+        }
+    }
+    let mut out = vec![];
+    for (lang, is_original) in picks.into_iter().take(6) {
+        // 已有同语言的人工字幕时，自动字幕没有必要
+        if manual.contains(&subtitle::normalize_lang(lang)) {
+            continue;
+        }
+        let Some(list) = auto[lang].as_array() else { continue };
+        let Some(t) = list.iter().find(|t| s(t, "ext").as_deref() == Some("vtt")) else { continue };
+        let Some(url) = s(t, "url") else { continue };
+        let base = subtitle::normalize_lang(lang);
+        let name = format!("{}（{}）", subtitle::lang_name(&base), if is_original { "自动生成" } else { "自动翻译" });
+        let mut a = Asset::base(format!("auto-{lang}"), AssetKind::Subtitle, url, format!("字幕 · {name}"), "vtt");
+        // 文件名里保留语言代码原来的大小写（zh-Hans.auto）
+        a.quality = Some(format!("{}.auto", lang.strip_suffix("-orig").unwrap_or(lang)));
+        a.format_id = Some(lang.clone());
         out.push(a);
     }
     out
@@ -584,6 +687,53 @@ mod tests {
         assert_eq!((sub.ext.as_str(), sub.kind), ("vtt", AssetKind::Subtitle));
         assert!(info.asset("sub-live_chat").is_none());
         assert_eq!(info.default_asset_ids(), vec!["f-137"]);
+    }
+
+    #[test]
+    fn subtitles_follow_language_preferences() {
+        let mut v = sample();
+        v["subtitles"] = serde_json::json!({
+            "ja": [{"ext": "vtt", "url": "https://s/ja.vtt"}],
+            "zh-Hans": [{"ext": "vtt", "url": "https://s/zh.vtt", "name": "简体中文"}],
+            "en": [{"ext": "srt", "url": "https://s/en.srt"}],
+        });
+        v["language"] = serde_json::json!("de");
+        v["automatic_captions"] = serde_json::json!({
+            "de-orig": [{"ext": "json3", "url": "https://a/de.json3"}, {"ext": "vtt", "url": "https://a/de.vtt"}],
+            "de": [{"ext": "vtt", "url": "https://a/de2.vtt"}],
+            "en": [{"ext": "vtt", "url": "https://a/en.vtt"}],
+            "zh-Hans": [{"ext": "vtt", "url": "https://a/zh.vtt&tlang=zh-Hans"}],
+            "zh-Hant": [{"ext": "vtt", "url": "https://a/zht.vtt"}],
+            "fr": [{"ext": "vtt", "url": "https://a/fr.vtt"}]
+        });
+        v["chapters"] = serde_json::json!([{"start_time": 0.0, "end_time": 10.5, "title": "开场"}, {"start_time": 10.5, "end_time": 61.5, "title": "正文"}]);
+        let info = from_json_with(&v, "https://www.youtube.com/watch?v=abc", &SubPrefs { langs: vec!["zh".into(), "en".into()], auto: true }).unwrap();
+        let subs: Vec<&Asset> = info.assets.iter().filter(|a| a.kind == AssetKind::Subtitle).collect();
+        let ids: Vec<&str> = subs.iter().map(|a| a.id.as_str()).collect();
+        // 人工字幕：偏好语言（中文、英文）在前；自动：原语言 de-orig，翻译只有偏好语言里没有人工字幕的语言（中文、英文都已有人工字幕，所以没有）
+        assert_eq!(ids, vec!["sub-zh-Hans", "sub-en", "sub-ja", "auto-de-orig"]);
+        assert_eq!(subs[0].label, "字幕 · 简体中文");
+        assert_eq!(subs[3].quality.as_deref(), Some("de.auto"));
+        assert_eq!(info.assets.iter().find(|a| a.id == "auto-de-orig").unwrap().quality.as_deref(), Some("de.auto"));
+        assert_eq!(subs[3].format_id.as_deref(), Some("de-orig"));
+        assert!(subs[3].label.contains("自动生成"));
+        assert_eq!(subs[3].url, "https://a/de.vtt");
+        assert_eq!(info.chapters.len(), 2);
+        assert_eq!((info.chapters[1].start_ms, info.chapters[1].end_ms), (10_500, 61_500));
+
+        // 没有人工字幕时：自动翻译出现，并按偏好语言取变体
+        v["subtitles"] = serde_json::json!({});
+        let info = from_json_with(&v, "https://www.youtube.com/watch?v=abc", &SubPrefs { langs: vec!["zh".into(), "en".into()], auto: true }).unwrap();
+        let ids: Vec<&str> = info.assets.iter().filter(|a| a.kind == AssetKind::Subtitle).map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["auto-de-orig", "auto-zh-Hans", "auto-en"]);
+        let tr = info.asset("auto-zh-Hans").unwrap();
+        assert!(tr.label.contains("自动翻译") && tr.label.contains("简体"), "{}", tr.label);
+        // 关闭自动字幕
+        let info = from_json_with(&v, "https://www.youtube.com/watch?v=abc", &SubPrefs { langs: vec!["zh".into()], auto: false }).unwrap();
+        assert!(info.assets.iter().all(|a| a.kind != AssetKind::Subtitle));
+        // 单个章节无意义
+        v["chapters"] = serde_json::json!([{"start_time": 0.0, "end_time": 61.5, "title": "全部"}]);
+        assert!(from_json(&v, "https://www.youtube.com/watch?v=abc").unwrap().chapters.is_empty());
     }
 
     #[test]

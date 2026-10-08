@@ -161,6 +161,7 @@ async function run<A extends unknown[]>(fn: (...args: A) => Promise<unknown>, ..
         <div class="name ellipsis" :title="t.title">{{ t.title }} <span class="mute">· {{ t.assetLabel }}</span></div>
         <div class="bar"><i :style="{ width: percent(t) + '%' }" /></div>
         <small class="mono detail ellipsis selectable" :title="detail(t)">{{ detail(t) }}</small>
+        <small v-if="t.warning" class="warn-line selectable" :title="t.warning">⚠ {{ t.warning }}</small>
         <div class="tags">
           <span v-if="t.resumable === false && t.status !== 'done'" class="chip">服务器不支持续传</span>
           <span v-else-if="t.resumable && (t.status === 'paused' || t.status === 'running')" class="chip">可续传</span>
@@ -208,6 +209,11 @@ async function run<A extends unknown[]>(fn: (...args: A) => Promise<unknown>, ..
 </template>
 
 <style scoped>
+.warn-line {
+  color: #d9a441;
+  font-size: 11.5px;
+  white-space: normal;
+}
 .page {
   padding: 20px 24px;
   display: flex;

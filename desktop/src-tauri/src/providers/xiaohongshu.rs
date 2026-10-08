@@ -124,6 +124,7 @@ pub fn parse_note(note: &Value, id: &str, source_url: &str) -> AppResult<MediaIn
         assets,
         entries: vec![],
         series: None,
+        chapters: vec![],
         extractor: Some("native".into()),
     })
 }

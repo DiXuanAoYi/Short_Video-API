@@ -161,6 +161,7 @@ mod tests {
             assets: vec![],
             entries: vec![],
             series: None,
+            chapters: vec![],
             extractor: None,
         }
     }
