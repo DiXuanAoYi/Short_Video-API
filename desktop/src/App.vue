@@ -11,6 +11,7 @@ import SubsView from './views/SubsView.vue'
 import LiveView from './views/LiveView.vue'
 import SettingsView from './views/SettingsView.vue'
 import DisclaimerDialog from './components/DisclaimerDialog.vue'
+import type { PairRequest } from './types'
 
 const app = useAppStore()
 const queue = useQueueStore()
@@ -79,9 +80,13 @@ onMounted(async () => {
     else ElMessage.error(r.message)
   })
   // 手机发送：新设备请求配对
-  await events.onPairRequest(async (p) => {
+  const asking = new Set<string>()
+  async function askPair(p: PairRequest) {
+    if (asking.has(p.deviceId)) return
+    asking.add(p.deviceId)
+    const from = p.ip ? `“${p.name}”（${p.ip}）` : `“${p.name}”`
     try {
-      await ElMessageBox.confirm(`“${p.name}”（${p.ip}）想要向清影发送链接。允许后这台设备以后可以直接发送，可在“设置 → 手机与浏览器扩展”中撤销。`, '新设备请求配对', {
+      await ElMessageBox.confirm(`${from}想要向清影发送链接。允许后这台设备以后可以直接发送，配对前发来的链接也会继续处理。可在“设置 → 手机与浏览器扩展”中撤销。`, '新设备请求配对', {
         confirmButtonText: '允许',
         cancelButtonText: '拒绝',
         type: 'info',
@@ -91,11 +96,25 @@ onMounted(async () => {
     } catch (e) {
       if (e === 'cancel' || e === 'close') await api.phonePairRespond(p.deviceId, false).catch(() => {})
       else ElMessage.error(errorText(e))
+    } finally {
+      asking.delete(p.deviceId)
     }
-  })
+  }
+  await events.onPairRequest(askPair)
+  // 上次关闭前还没处理的配对请求
+  api
+    .phoneInfo()
+    .then((info) => info.pending.forEach(askPair))
+    .catch(() => {})
+  // 收到的链接：侧栏角标
+  await events.onInbox((c) => (app.inboxUnhandled = c.unhandled))
+  api
+    .inboxCounts()
+    .then((c) => (app.inboxUnhandled = c.unhandled))
+    .catch(() => {})
   await events.onPhoneReceived((text) => {
     const url = text.match(/https?:\/\/\S+/)?.[0] ?? text
-    ElNotification({ title: '收到发送到清影的链接', message: url.slice(0, 80), type: 'info', duration: 3000 })
+    ElNotification({ title: '收到发送到清影的链接', message: `${url.slice(0, 80)}（可在“媒体库 → 收到的链接”查看）`, type: 'info', duration: 3000, onClick: () => app.goLibrary('inbox') })
   })
   // 全部完成后睡眠 / 关机的倒计时
   await events.onPowerCountdown((p) => {
@@ -161,10 +180,11 @@ onMounted(async () => {
         class="nav"
         :class="{ on: app.view === n.id }"
         type="button"
-        @click="app.view = n.id"
+        @click="n.id === 'library' && app.inboxUnhandled > 0 ? app.goLibrary('inbox') : (app.view = n.id)"
       >
         <span>{{ n.label }}</span>
         <em v-if="n.id === 'queue' && queue.active > 0">{{ queue.active }}</em>
+        <em v-if="n.id === 'library' && app.inboxUnhandled > 0" class="warn" :title="`收到的链接里有 ${app.inboxUnhandled} 条需要处理`">{{ app.inboxUnhandled }}</em>
       </button>
       <div class="foot">
         <div>{{ footer }}</div>
@@ -241,6 +261,10 @@ onMounted(async () => {
   color: #1a1208;
   border-radius: 9px;
   padding: 0 7px;
+}
+.nav em.warn {
+  background: var(--cc-err);
+  color: #fff;
 }
 .nav:focus-visible {
   outline: 2px solid var(--cc-acc);

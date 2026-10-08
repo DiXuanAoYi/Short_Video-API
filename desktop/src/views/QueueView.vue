@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import { siteName } from '../utils/siteGuides'
 import VirtualList from '../components/VirtualList.vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api, errorText } from '../api'
@@ -163,7 +164,7 @@ async function run<A extends unknown[]>(fn: (...args: A) => Promise<unknown>, ..
         <div class="tags">
           <span v-if="t.resumable === false && t.status !== 'done'" class="chip">服务器不支持续传</span>
           <span v-else-if="t.resumable && (t.status === 'paused' || t.status === 'running')" class="chip">可续传</span>
-          <el-button v-if="t.status === 'failed' && (t.errorKind === 'need_login' || t.errorKind === 'rate_limited')" link size="small" type="primary" @click="app.goSettings('accounts')">添加 Cookie 后重试</el-button>
+          <el-button v-if="t.status === 'failed' && (t.errorKind === 'need_login' || t.errorKind === 'rate_limited')" link size="small" type="primary" @click="app.goLogin(t.site)">{{ t.site ? `登录${siteName(t.site, app.info?.providers)}后自动重试` : '添加 Cookie 后重试' }}</el-button>
         </div>
       </div>
       <div class="st">

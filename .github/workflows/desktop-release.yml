@@ -1,6 +1,6 @@
 name: desktop-release
 
-# 推送 desktop-v* 标签（例如 desktop-v0.1.0）时构建三平台安装包，并创建草稿 Release。
+# 推送 desktop-v* 标签（例如 desktop-v0.1.0）或手动运行时，构建三平台安装包和浏览器扩展，并发布 Release。
 on:
   push:
     tags: ['desktop-v*']
@@ -105,6 +105,7 @@ jobs:
             | macOS（M 系列芯片） | `ClearClip_<版本>_aarch64.dmg` |
             | macOS（Intel 芯片） | `ClearClip_<版本>_x64.dmg` |
             | Linux | `.AppImage`（赋予执行权限后直接运行）或 `.deb` |
+            | 浏览器扩展（Chrome / Edge / Firefox） | `ClearClip-extension-<版本>.zip`，解压后按 [扩展说明](https://github.com/DiXuanAoYi/Short_Video-API/tree/main/desktop/extension) 加载 |
 
             首次运行说明：
             - Windows：安装包未做代码签名，如出现“Windows 已保护你的电脑”，点“更多信息 → 仍要运行”。
@@ -130,3 +131,15 @@ jobs:
           Set-Content -Path "$dir/portable" -Value "设置、数据和日志保存在本目录的 data 文件夹。删除此文件则改用系统应用数据目录。"
           Compress-Archive -Path $dir -DestinationPath "$dir-windows-x64.zip" -Force
           gh release upload "desktop-v$version" "$dir-windows-x64.zip" --clobber
+
+      # 浏览器扩展：打包为 zip，可直接上传到扩展商店，或解压后以开发者模式加载
+      - name: Upload browser extension zip
+        if: matrix.platform == 'ubuntu-22.04'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(jq -r .version desktop/src-tauri/tauri.conf.json)
+          ext=$(jq -r .version desktop/extension/manifest.json)
+          (cd desktop/extension && zip -r -X "$GITHUB_WORKSPACE/ClearClip-extension-$ext.zip" . -x README.md)
+          gh release upload "desktop-v$version" "ClearClip-extension-$ext.zip" --clobber

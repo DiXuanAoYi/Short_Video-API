@@ -113,6 +113,8 @@ pub struct TaskSnapshot {
     pub id: i64,
     pub platform: String,
     pub platform_name: String,
+    /// 登录用的网站（内置平台 ID 或域名），出现“需要登录”时用来打开对应的登录窗口
+    pub site: String,
     pub media_id: String,
     pub title: String,
     pub author: String,
@@ -314,6 +316,7 @@ fn snapshot_for(id: i64, media: &MediaInfo, spec: &JobSpec, path: &str, status: 
         id,
         platform: media.platform.clone(),
         platform_name: media.platform_name.clone(),
+        site: crate::inbox::site_for(&media.source_url),
         media_id: media.id.clone(),
         title: media.title.clone(),
         author: media.author.clone(),
@@ -461,6 +464,11 @@ pub fn enqueue_ext(app: &AppHandle, media: MediaInfo, asset_ids: &[String], post
             let meta = JobMeta { inputs: vec![ResumeMeta::default(); spec.inputs.len()] };
             list.push(Entry { snap, spec, media: media.clone(), ctrl, meta });
         }
+    }
+    // 收到的链接里等待处理的同一作品，关联到这些任务
+    let ids: Vec<i64> = result.tasks.iter().map(|t| t.id).collect();
+    if st.db.inbox_link_tasks(&media.platform, &media.id, &ids).unwrap_or(false) {
+        crate::inbox::emit_changed(app);
     }
     schedule(app);
     Ok(result)
@@ -1097,6 +1105,7 @@ fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>
     if all_done && done_file.is_some() {
         on_all_done(app, st, settings, done_file.as_ref().map(|(f, _)| f.as_path()));
     }
+    crate::inbox::sync_tasks(app);
     schedule(app);
 }
 

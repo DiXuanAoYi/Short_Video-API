@@ -272,6 +272,26 @@ pub struct Settings {
     pub live_max_recordings: usize,
     /// 自动删除多少天前的直播录像（0 表示不删除）
     pub live_cleanup_days: u32,
+    /// 收到的链接（收件箱）
+    pub inbox: InboxSettings,
+}
+
+/// 收到的链接的记录与保留。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct InboxSettings {
+    /// 记录剪贴板识别到的链接（关闭后只记录手机和浏览器扩展发送的链接）
+    pub record_clipboard: bool,
+    /// 保留多少天（0 表示不按时间清理）
+    pub keep_days: u32,
+    /// 最多保留多少条（0 表示不限）
+    pub max_items: usize,
+}
+
+impl Default for InboxSettings {
+    fn default() -> Self {
+        InboxSettings { record_clipboard: true, keep_days: 30, max_items: 1000 }
+    }
 }
 
 /// 已配对的手机。
@@ -357,6 +377,7 @@ impl Default for Settings {
             launch_at_login: false,
             live_max_recordings: 3,
             live_cleanup_days: 0,
+            inbox: InboxSettings::default(),
         }
     }
 }
@@ -394,6 +415,10 @@ impl Settings {
         }
         self.network.rules.retain(|r| !r.pattern.is_empty());
         self.hls_concurrency = self.hls_concurrency.clamp(1, 16);
+        self.inbox.keep_days = self.inbox.keep_days.min(3650);
+        if self.inbox.max_items > 0 {
+            self.inbox.max_items = self.inbox.max_items.clamp(50, 100_000);
+        }
         if !matches!(self.merge_container.as_str(), "mp4" | "mkv") {
             self.merge_container = "mp4".into();
         }

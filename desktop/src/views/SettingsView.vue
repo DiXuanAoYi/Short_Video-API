@@ -263,6 +263,22 @@ function insertVar(v: string) {
             </div>
           </section>
           <section class="group card">
+            <h3>收到的链接</h3>
+            <small class="mute">手机、浏览器扩展发来的链接和手动解析失败的链接会记录在“媒体库 → 收到的链接”，可以随时重试。</small>
+            <div class="kv">
+              <span>记录剪贴板识别到的链接<small class="mute block">关闭后不再记录剪贴板里的链接</small></span>
+              <el-switch v-model="form.inbox.recordClipboard" />
+            </div>
+            <div class="kv">
+              <span>保留天数<small class="mute block">0 表示不按时间清理；进行中的不会被清理</small></span>
+              <el-input-number v-model="form.inbox.keepDays" :min="0" :max="3650" size="small" />
+            </div>
+            <div class="kv">
+              <span>最多保留条数<small class="mute block">0 表示不限</small></span>
+              <el-input-number v-model="form.inbox.maxItems" :min="0" :max="100000" :step="100" size="small" />
+            </div>
+          </section>
+          <section class="group card">
             <h3>解析方式</h3>
             <div class="field">
               <label>解析模式</label>

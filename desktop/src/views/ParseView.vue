@@ -311,7 +311,7 @@ function sizeText(a: Asset) {
       </el-button>
     </div>
 
-    <ErrorAlert v-if="parse.error" :message="parse.error" :kind="parse.errorKind" />
+    <ErrorAlert v-if="parse.error" :message="parse.error" :kind="parse.errorKind" :site="parse.errorSite" />
 
     <div v-if="parse.loading && !result" class="result card skeleton">
       <el-skeleton animated :rows="5" />

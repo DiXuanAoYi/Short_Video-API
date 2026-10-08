@@ -63,20 +63,42 @@ pub fn start_watcher(app: AppHandle) {
 }
 
 pub(crate) fn on_links(app: &AppHandle, text: String, links: Vec<DetectedLink>, auto_download: bool) {
-    let _ = app.emit(EVT_CLIPBOARD, ClipboardLink { text, links: links.clone() });
+    notify_links(app, text, links.clone());
+    let urls: Vec<String> = links.iter().map(|l| l.url.clone()).collect();
+    let ids = crate::inbox::record_clipboard(app, &urls, auto_download);
     if auto_download {
-        for link in links {
+        for (link, id) in links.into_iter().zip(ids) {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
-                let result = resolve_and_enqueue(&app, &link.url).await;
-                let payload = match result {
-                    Ok(title) => AutoResult { url: link.url, ok: true, message: format!("已加入下载：{title}") },
-                    Err(e) => AutoResult { url: link.url, ok: false, message: e.to_string() },
+                let payload = match id {
+                    // 记录下来时由收件箱处理，结果写回记录
+                    Some(id) => {
+                        crate::inbox::process(&app, id).await;
+                        let item = app.state::<Arc<AppState>>().db.inbox_get(id).ok().flatten();
+                        match item {
+                            Some(i) if i.status == "failed" => AutoResult { url: link.url, ok: false, message: i.message.unwrap_or_default() },
+                            Some(i) if i.status == "playlist" => AutoResult { url: link.url, ok: false, message: i.message.unwrap_or_default() },
+                            Some(i) => {
+                                let title = i.title.unwrap_or_default();
+                                AutoResult { url: link.url, ok: true, message: format!("已加入下载：{}", i.message.map(|m| format!("{title}（{m}）")).unwrap_or(title)) }
+                            }
+                            None => return,
+                        }
+                    }
+                    None => match resolve_and_enqueue(&app, &link.url).await {
+                        Ok(title) => AutoResult { url: link.url, ok: true, message: format!("已加入下载：{title}") },
+                        Err(e) => AutoResult { url: link.url, ok: false, message: e.to_string() },
+                    },
                 };
                 let _ = app.emit(EVT_AUTO_RESULT, payload);
             });
         }
     }
+}
+
+/// 通知前端识别到链接；主窗口不在前台时弹出迷你窗。
+pub(crate) fn notify_links(app: &AppHandle, text: String, links: Vec<DetectedLink>) {
+    let _ = app.emit(EVT_CLIPBOARD, ClipboardLink { text, links });
     if !tray::main_is_focused(app) {
         tray::show_mini(app);
     }
@@ -85,6 +107,9 @@ pub(crate) fn on_links(app: &AppHandle, text: String, links: Vec<DetectedLink>, 
 /// 解析并把默认资源加入下载队列，返回作品标题。
 pub async fn resolve_and_enqueue(app: &AppHandle, text: &str) -> crate::model::AppResult<String> {
     let r = resolve_and_enqueue_full(app, text).await?;
+    if let Some(n) = r.playlist {
+        return Err(crate::model::AppError::invalid(format!("“{}”是一个列表（{n} 条），请在电脑上选择要下载的条目。", r.title)));
+    }
     Ok(r.message())
 }
 
@@ -94,6 +119,8 @@ pub struct AutoEnqueued {
     pub task_ids: Vec<i64>,
     pub already_downloaded: usize,
     pub already_queued: usize,
+    /// 是列表（合集、播放列表）时的条目数：不自动下载，需要用户选择
+    pub playlist: Option<usize>,
 }
 
 impl AutoEnqueued {
@@ -114,13 +141,14 @@ pub async fn resolve_and_enqueue_full(app: &AppHandle, text: &str) -> crate::mod
     let settings = st.settings();
     let info = providers::resolve_text(&st.parse_ctx(&settings), text).await?;
     let _ = st.db.upsert_history(&info);
+    let _ = st.db.inbox_mark_parsed(text, &info);
     let (ids, post) = crate::quality::auto_selection(&info, &settings);
     let title = info.title.clone();
     if info.kind == crate::model::MediaKind::Playlist {
-        return Err(crate::model::AppError::invalid(format!("“{title}”是一个列表（{} 条），请在电脑上选择要下载的条目。", info.entries.len())));
+        return Ok(AutoEnqueued { title, task_ids: vec![], already_downloaded: 0, already_queued: 0, playlist: Some(info.entries.len()) });
     }
     let r = download::enqueue_with(app, info, &ids, post)?;
-    Ok(AutoEnqueued { title, task_ids: r.tasks.iter().map(|t| t.id).collect(), already_downloaded: r.already_downloaded, already_queued: r.already_queued })
+    Ok(AutoEnqueued { title, task_ids: r.tasks.iter().map(|t| t.id).collect(), already_downloaded: r.already_downloaded, already_queued: r.already_queued, playlist: None })
 }
 
 /// 全局快捷键 / 托盘菜单：打开主窗口并解析当前剪贴板。

@@ -58,3 +58,14 @@ export function previewFilename(template: string, sample: { author: string; titl
   const clean = raw.replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').trim()
   return (clean || sample.id) + '.mp4'
 }
+
+/** 相对时间：刚刚、5 分钟前、3 小时前、2 天前；超过 30 天显示日期。 */
+export function formatRelative(unixSecs: number | null | undefined): string {
+  if (!unixSecs) return ''
+  const d = Math.floor(Date.now() / 1000) - unixSecs
+  if (d < 60) return '刚刚'
+  if (d < 3600) return `${Math.floor(d / 60)} 分钟前`
+  if (d < 86400) return `${Math.floor(d / 3600)} 小时前`
+  if (d < 30 * 86400) return `${Math.floor(d / 86400)} 天前`
+  return formatDate(unixSecs)
+}

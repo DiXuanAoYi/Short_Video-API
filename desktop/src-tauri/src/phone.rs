@@ -15,8 +15,8 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::download::TaskStatus;
 use crate::error::{AppError, AppResult};
+use crate::inbox::{self, InboxItem, Patch};
 use crate::settings::PairedDevice;
 use crate::{clipboard, db, providers, tray, AppState};
 
@@ -27,15 +27,12 @@ const MAX_HEADER: usize = 8 * 1024;
 const MAX_BODY: usize = 16 * 1024;
 /// 每个地址每分钟最多请求数
 const RATE_PER_MIN: u32 = 60;
-const MAX_SENDS: usize = 200;
 
 #[derive(Default)]
 pub struct PhoneState {
     server: Mutex<Option<Server>>,
-    sends: Mutex<Vec<Sent>>,
     pending: Mutex<Vec<PairRequest>>,
     rate: Mutex<HashMap<IpAddr, (Instant, u32)>>,
-    next_id: Mutex<u64>,
     last_error: Mutex<Option<String>>,
 }
 
@@ -52,20 +49,22 @@ pub struct PairRequest {
     pub ip: String,
 }
 
+/// 手机网页显示的一条发送记录。
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct Sent {
-    id: u64,
-    #[serde(skip)]
-    device: String,
+    id: i64,
     text: String,
     title: Option<String>,
-    /// pending_pair / rejected / resolving / confirm / queued / downloading / done / failed
+    /// pending_pair / rejected / resolving / confirm / playlist / queued / downloading / done / failed / ignored
     state: String,
     message: Option<String>,
-    #[serde(skip)]
-    task_ids: Vec<i64>,
     at: i64,
+}
+
+impl From<InboxItem> for Sent {
+    fn from(i: InboxItem) -> Self {
+        Sent { id: i.id, text: i.text, title: i.title, state: i.status, message: i.message, at: i.created_at }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -206,23 +205,13 @@ pub fn respond_pair(app: &AppHandle, device_id: &str, accept: bool) -> AppResult
             p.devices.push(PairedDevice { id: req.device_id.clone(), name: req.name.clone(), added_at: now, last_seen: now });
         })?;
     }
-    let waiting: Vec<(u64, String)> = {
-        let mut sends = state.phone.sends.lock().unwrap_or_else(|e| e.into_inner());
-        sends
-            .iter_mut()
-            .filter(|s| s.device == device_id && s.state == "pending_pair")
-            .map(|s| {
-                if !accept {
-                    s.state = "rejected".into();
-                    s.message = Some("电脑上拒绝了配对".into());
-                }
-                (s.id, s.text.clone())
-            })
-            .collect()
-    };
-    if accept {
-        for (id, text) in waiting {
-            process(app.clone(), id, text);
+    // 配对前发来的链接：允许后继续处理（重启后也在）
+    let waiting: Vec<i64> = state.db.inbox_for_device(device_id, 200)?.into_iter().filter(|i| i.status == "pending_pair").map(|i| i.id).collect();
+    for id in waiting {
+        if accept {
+            process(app.clone(), id);
+        } else {
+            inbox::patch(app, id, Patch { status: Some("rejected"), message: Some(Some("电脑上拒绝了配对".into())), ..Default::default() });
         }
     }
     Ok(info(app))
@@ -268,11 +257,12 @@ pub fn stop(app: &AppHandle) {
     }
 }
 
-/// 启动时按设置恢复服务。
+/// 启动时按设置恢复服务，并恢复一天内还在等待配对的请求。
 pub fn restore(app: &AppHandle) {
     if !st(app).settings().phone.enabled {
         return;
     }
+    restore_pending(app);
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         if let Err(e) = start(&app).await {
@@ -280,6 +270,18 @@ pub fn restore(app: &AppHandle) {
             *st(&app).phone.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("服务启动失败：{e}"));
         }
     });
+}
+
+fn restore_pending(app: &AppHandle) {
+    let state = st(app);
+    let Ok(rows) = state.db.inbox_with_status("('pending_pair')") else { return };
+    let since = db::now() - 86400;
+    let mut pending = state.phone.pending.lock().unwrap_or_else(|e| e.into_inner());
+    for r in rows.into_iter().filter(|r| r.created_at > since && !r.device.is_empty()) {
+        if !pending.iter().any(|p| p.device_id == r.device) {
+            pending.push(PairRequest { device_id: r.device, name: r.device_name, ip: String::new() });
+        }
+    }
 }
 
 // ---------- HTTP ----------
@@ -433,8 +435,10 @@ async fn handle(app: AppHandle, mut sock: TcpStream, peer: SocketAddr) {
                 json(&mut sock, "400 Bad Request", serde_json::json!({"error": "没有找到链接，请粘贴分享文案或链接"})).await;
                 return;
             }
-            let (id, state_name) = receive(&app, &device, &name, &peer, text);
-            json(&mut sock, "200 OK", serde_json::json!({"id": id, "state": state_name})).await;
+            match receive(&app, &device, &name, &peer, text) {
+                Some((id, state_name)) => json(&mut sock, "200 OK", serde_json::json!({"id": id, "state": state_name})).await,
+                None => json(&mut sock, "500 Internal Server Error", serde_json::json!({"error": "电脑上保存记录失败，请稍后再试"})).await,
+            }
         }
         ("GET", "/api/status") => {
             let device = clean_device(req.query.get("device").map(String::as_str).unwrap_or(""));
@@ -457,8 +461,9 @@ async fn handle(app: AppHandle, mut sock: TcpStream, peer: SocketAddr) {
                 return;
             }
             match import_cookies(&state.cookies, &req.body) {
-                Ok((site, n)) => {
+                Ok((site, n, automatic)) => {
                     let _ = app.emit("accounts://updated", ());
+                    inbox::retry_after_login(&app, &site, automatic);
                     json(&mut sock, "200 OK", serde_json::json!({"site": site, "count": n})).await
                 }
                 Err(e) => json(&mut sock, "400 Bad Request", serde_json::json!({"error": e.message})).await,
@@ -468,31 +473,13 @@ async fn handle(app: AppHandle, mut sock: TcpStream, peer: SocketAddr) {
     }
 }
 
-/// 收到一条链接：已配对的设备直接处理，新设备先请求配对。返回编号和状态。
-fn receive(app: &AppHandle, device: &str, name: &str, peer: &SocketAddr, text: String) -> (u64, String) {
+/// 收到一条链接：记录到收件箱；已配对的设备直接处理，新设备先请求配对。返回编号和状态。
+fn receive(app: &AppHandle, device: &str, name: &str, peer: &SocketAddr, text: String) -> Option<(i64, String)> {
     let state = st(app);
     let paired = state.settings().phone.devices.iter().any(|d| d.id == device);
-    let id = {
-        let mut n = state.phone.next_id.lock().unwrap_or_else(|e| e.into_inner());
-        *n += 1;
-        *n
-    };
     let initial = if paired { "resolving" } else { "pending_pair" };
-    {
-        let mut sends = state.phone.sends.lock().unwrap_or_else(|e| e.into_inner());
-        sends.push(Sent {
-            id,
-            device: device.to_string(),
-            text: text.clone(),
-            title: None,
-            state: initial.into(),
-            message: None,
-            task_ids: vec![],
-            at: db::now(),
-        });
-        let excess = sends.len().saturating_sub(MAX_SENDS);
-        sends.drain(..excess);
-    }
+    let source = if device.starts_with("ext-") { "extension" } else { "phone" };
+    let id = inbox::record(app, source, device, name, &text, initial)?;
     if paired {
         let now = db::now();
         let _ = update_phone_settings(app, |p| {
@@ -500,7 +487,7 @@ fn receive(app: &AppHandle, device: &str, name: &str, peer: &SocketAddr, text: S
                 d.last_seen = now;
             }
         });
-        process(app.clone(), id, text);
+        process(app.clone(), id);
     } else {
         let req = PairRequest { device_id: device.to_string(), name: name.to_string(), ip: peer.ip().to_string() };
         let mut pending = state.phone.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -510,7 +497,7 @@ fn receive(app: &AppHandle, device: &str, name: &str, peer: &SocketAddr, text: S
             tray::show_main(app);
         }
     }
-    (id, initial.into())
+    Some((id, initial.into()))
 }
 
 #[derive(Deserialize)]
@@ -542,10 +529,13 @@ struct CookieSync {
     cookies: Vec<ExtCookie>,
     #[serde(default)]
     label: String,
+    /// 扩展自动同步（登录状态变化时）而不是用户点击
+    #[serde(default)]
+    auto: bool,
 }
 
 /// 浏览器扩展同步过来的 Cookie（chrome.cookies 格式）保存为该网站的账号。
-fn import_cookies(store: &crate::cookies::CookieStore, body: &[u8]) -> AppResult<(String, usize)> {
+fn import_cookies(store: &crate::cookies::CookieStore, body: &[u8]) -> AppResult<(String, usize, bool)> {
     let sync: CookieSync = serde_json::from_slice(body).map_err(|e| AppError::invalid(format!("数据格式不正确：{e}")))?;
     let url = url::Url::parse(&sync.url).map_err(|_| AppError::invalid("网页地址无效"))?;
     let site = crate::cookies::site_for_url(&url).ok_or_else(|| AppError::invalid("无法识别网站"))?;
@@ -567,72 +557,28 @@ fn import_cookies(store: &crate::cookies::CookieStore, body: &[u8]) -> AppResult
     let n = list.len();
     let label = if sync.label.trim().is_empty() { "浏览器扩展".to_string() } else { sync.label.trim().chars().take(40).collect() };
     store.upsert(&site, &label, list)?;
-    Ok((site, n))
-}
-
-fn set_sent(app: &AppHandle, id: u64, f: impl FnOnce(&mut Sent)) {
-    if let Some(s) = st(app).phone.sends.lock().unwrap_or_else(|e| e.into_inner()).iter_mut().find(|s| s.id == id) {
-        f(s);
-    }
+    Ok((site, n, sync.auto))
 }
 
 /// 处理一条已授权的链接：开启“自动下载”时直接加入队列，否则交给电脑端确认。
-fn process(app: AppHandle, id: u64, text: String) {
-    let settings = st(&app).settings();
-    let _ = app.emit(EVT_RECEIVED, text.clone());
+fn process(app: AppHandle, id: i64) {
+    let state = st(&app);
+    let Ok(Some(item)) = state.db.inbox_get(id) else { return };
+    let settings = state.settings();
+    let _ = app.emit(EVT_RECEIVED, item.text.clone());
     if !settings.auto_download {
-        let links = providers::detect_links_with(&text, &crate::settings::Settings { clipboard_all_sites: true, ..settings.clone() });
-        set_sent(&app, id, |s| {
-            s.state = "confirm".into();
-            s.message = Some("已发送到电脑，请在电脑上确认下载".into());
-        });
-        clipboard::on_links(&app, text, links, false);
+        let links = providers::detect_links_with(&item.text, &crate::settings::Settings { clipboard_all_sites: true, ..settings.clone() });
+        inbox::patch(&app, id, Patch { status: Some("confirm"), message: Some(Some("已发送到电脑，请在电脑上确认下载".into())), ..Default::default() });
+        clipboard::notify_links(&app, item.text, links);
         return;
     }
-    tauri::async_runtime::spawn(async move {
-        match clipboard::resolve_and_enqueue_full(&app, &text).await {
-            Ok(r) => set_sent(&app, id, |s| {
-                s.title = Some(r.title.clone());
-                if r.task_ids.is_empty() {
-                    s.state = "done".into();
-                    s.message = Some(if r.already_queued > 0 { "已在下载队列中".into() } else { "之前已下载过".into() });
-                } else {
-                    s.state = "queued".into();
-                }
-                s.task_ids = r.task_ids;
-            }),
-            Err(e) => set_sent(&app, id, |s| {
-                s.state = "failed".into();
-                s.message = Some(e.to_string());
-            }),
-        }
-    });
+    tauri::async_runtime::spawn(async move { inbox::process(&app, id).await });
 }
 
 /// 某个设备发送的链接及其最新状态（按下载任务状态更新）。
 fn statuses(app: &AppHandle, device: &str) -> Vec<Sent> {
-    let state = st(app);
-    let tasks = state.downloads.snapshots();
-    let mut sends = state.phone.sends.lock().unwrap_or_else(|e| e.into_inner());
-    for s in sends.iter_mut().filter(|s| s.device == device && !s.task_ids.is_empty()) {
-        let mine: Vec<_> = tasks.iter().filter(|t| s.task_ids.contains(&t.id)).collect();
-        if mine.is_empty() {
-            continue;
-        }
-        let (state_name, msg) = if mine.iter().all(|t| t.status == TaskStatus::Done) {
-            ("done", None)
-        } else if let Some(t) = mine.iter().find(|t| t.status == TaskStatus::Failed) {
-            ("failed", t.error.clone())
-        } else if mine.iter().any(|t| t.status == TaskStatus::Running) {
-            let (r, total) = mine.iter().fold((0u64, 0u64), |(r, tt), t| (r + t.received, tt + t.total.unwrap_or(0)));
-            ("downloading", (total > 0).then(|| format!("{}%", r * 100 / total)))
-        } else {
-            ("queued", None)
-        };
-        s.state = state_name.into();
-        s.message = msg;
-    }
-    sends.iter().filter(|s| s.device == device).rev().take(20).cloned().collect()
+    inbox::sync_tasks(app);
+    st(app).db.inbox_for_device(device, 20).unwrap_or_default().into_iter().map(Sent::from).collect()
 }
 
 fn page(token: &str) -> String {
@@ -666,7 +612,7 @@ li .t{font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}l
 const TOKEN="__TOKEN__";
 let dev=localStorage.getItem("cc_device");if(!dev){dev="web-"+Math.random().toString(36).slice(2,12);localStorage.setItem("cc_device",dev)}
 const ua=navigator.userAgent;const name=/iPhone/.test(ua)?"iPhone":/iPad/.test(ua)?"iPad":/Android/.test(ua)?"Android 手机":"浏览器";
-const S={pending_pair:"等待电脑确认配对",rejected:"电脑拒绝了配对",resolving:"解析中",confirm:"已发送，请在电脑上确认",queued:"排队中",downloading:"下载中",done:"已完成",failed:"失败"};
+const S={pending_pair:"等待电脑确认配对",rejected:"电脑拒绝了配对",resolving:"解析中",confirm:"已发送，请在电脑上确认",playlist:"是列表，请在电脑上选择条目",queued:"排队中",downloading:"下载中",done:"已完成",failed:"失败",ignored:"已忽略"};
 const $=id=>document.getElementById(id);
 async function api(path,opt={}){const r=await fetch(path,{...opt,headers:{"X-Token":TOKEN,"Content-Type":"application/json"}});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||("HTTP "+r.status));return j}
 $("send").onclick=async()=>{const text=$("text").value.trim();if(!text){$("msg").textContent="请先粘贴链接";return}
@@ -674,7 +620,7 @@ $("send").disabled=true;try{const r=await api("/api/send",{method:"POST",body:JS
 let timer;async function refresh(){clearTimeout(timer);try{const r=await api("/api/status?device="+encodeURIComponent(dev));const ul=$("list");ul.innerHTML="";
 let busy=false;for(const it of r.items){const li=document.createElement("li");const t=document.createElement("div");t.className="t";t.textContent=it.title||it.text;
 const s=document.createElement("div");s.className="s"+(it.state==="done"?" ok":it.state==="failed"||it.state==="rejected"?" err":"");s.textContent=(S[it.state]||it.state)+(it.message?" · "+it.message:"");
-li.append(t,s);ul.append(li);if(!["done","failed","rejected"].includes(it.state))busy=true}
+li.append(t,s);ul.append(li);if(!["done","failed","rejected","ignored","playlist"].includes(it.state))busy=true}
 timer=setTimeout(refresh,busy?2000:10000)}catch(e){timer=setTimeout(refresh,10000)}}
 refresh();
 </script></body></html>"#;
@@ -709,7 +655,7 @@ mod tests {
         let store = crate::cookies::CookieStore::in_memory();
         let body = serde_json::json!({"url": "https://www.youtube.com/watch?v=1", "cookies": [
             {"name": "SID", "value": "1", "domain": ".youtube.com", "path": "/", "expirationDate": 1900000000.5, "secure": true, "httpOnly": true, "hostOnly": false}]});
-        let (site, n) = import_cookies(&store, body.to_string().as_bytes()).unwrap();
+        let (site, n, _) = import_cookies(&store, body.to_string().as_bytes()).unwrap();
         assert_eq!((site.as_str(), n), ("youtube.com", 1));
         assert_eq!(store.header_for("https://www.youtube.com/").as_deref(), Some("SID=1"));
         assert!(import_cookies(&store, b"{}").is_err());

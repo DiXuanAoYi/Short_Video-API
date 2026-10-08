@@ -42,7 +42,9 @@
 - 设置里可一键检查各平台解析是否正常（健康检查）
 - 订阅与追更（默认关闭）：订阅 YouTube 频道 / 播放列表、B站 UP 主、Pixiv 画师、抖音用户主页或任意 yt-dlp 能列出条目的列表，定期检查并自动下载新内容；每个订阅可设检查间隔、首次订阅策略、关键词 / 时长 / 发布时间过滤、清晰度、保存位置和命名；连续失败自动暂停；可开机自启在托盘运行
 - 直播录制：添加直播间后自动监控开播并录制（B站、抖音、快手、虎牙原生；斗鱼、YouTube、Twitch 等走 yt-dlp；也可直接填直播流地址）；FLV / TS 不转码、自动分段、断流重连、磁盘保护，录完可转 MP4 并合并分段
-- 浏览器扩展“发送到清影”（[`extension/`](./extension/)）：网页右键发送链接，一键同步当前网站的登录 Cookie
+- 收到的链接（“媒体库 → 收到的链接”）：剪贴板识别、手机和浏览器扩展发来的链接、手动解析失败的链接都会记录下来（重启后仍在），可按来源 / 状态筛选、搜索，一键重试、忽略；播放列表提示去选择条目；需要登录的失败链接显示“登录 XX”，登录保存后自动重试；可设保留天数和条数
+- 账号与登录：每个网站有登录说明（不登录能做什么、什么时候需要、推荐方式，见 [login-guide.md](../docs/login-guide.md)）；内置登录窗口对常见网站自动识别登录完成；账号显示登录是否有效并定期检查，失效时通知并给出“重新登录”
+- 浏览器扩展“发送到清影”（[`extension/`](./extension/)）：网页右键发送链接，一键同步当前网站的登录 Cookie，可对勾选的网站在登录状态变化时自动同步；弹窗显示与清影的连接状态
 - 字幕与弹幕：下载 yt-dlp 提供的各语言字幕（与视频同名，播放器自动加载）、B站弹幕 XML
 - 图集合成视频：选中的图片按设定时长合成 MP4，可配背景音乐
 - 全局快捷键（默认 `Ctrl+Shift+D`）解析剪贴板；关闭窗口后驻留系统托盘
@@ -75,7 +77,9 @@ cargo test                                      # 解析器、下载器、数据
 
 ## 发布
 
-推送 `desktop-v*` 标签（例如 `desktop-v0.1.0`）后，`.github/workflows/desktop-release.yml` 会构建 Windows（msi / nsis）、macOS（Apple Silicon 与 Intel 的 dmg）、Linux（AppImage / deb），并创建草稿 Release。
+在 GitHub 的 Actions 页面手动运行 `desktop-release`（选 `main` 分支），或推送 `desktop-v*` 标签（例如 `desktop-v0.1.1`），`.github/workflows/desktop-release.yml` 会构建 Windows（msi / nsis、便携版 zip）、macOS（Apple Silicon 与 Intel 的 dmg）、Linux（AppImage / deb / rpm）和浏览器扩展 zip，并发布 Release。发布前先把 `tauri.conf.json`、`Cargo.toml`、`package.json` 的版本号改成一致。
+
+更新签名密钥、macOS / Windows 代码签名和扩展上架的完整步骤见 [docs/release-setup.md](../docs/release-setup.md)。
 
 macOS 签名和公证需要在仓库 Secrets 中配置 `APPLE_CERTIFICATE`、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_SIGNING_IDENTITY`、`APPLE_ID`、`APPLE_PASSWORD`、`APPLE_TEAM_ID`。不配置时生成未签名的安装包。
 
@@ -109,7 +113,8 @@ desktop/
     ├── quality.rs             # 清晰度预设
     ├── cookies.rs secret.rs   # 加密 Cookie 存储
     ├── net.rs                 # 按网站分流、限速
-    ├── phone.rs               # 手机发链接（局域网网页服务）
+    ├── phone.rs               # 手机发链接（局域网网页服务）、扩展 Cookie 同步接口
+    ├── inbox.rs               # 收到的链接：记录、状态跟随、重试、登录后自动重试
     ├── subs.rs                # 订阅：调度、检查、去重、过滤
     ├── live.rs                # 直播录制：监控、录制、分段、重连、录后处理
     │   providers/live.rs      #   各平台开播检测与直播流

@@ -87,6 +87,8 @@ export interface TaskSnapshot {
   id: number
   platform: string
   platformName: string
+  /** 登录用的网站（内置平台 ID 或域名） */
+  site: string
   mediaId: string
   title: string
   author: string
@@ -290,6 +292,7 @@ export interface Settings {
   launchAtLogin: boolean
   liveMaxRecordings: number
   liveCleanupDays: number
+  inbox: InboxSettings
 }
 
 export interface LiveSettings {
@@ -490,6 +493,11 @@ export interface AccountSummary {
   userName: string | null
   expiresAt: number | null
   isDefault: boolean
+  checkedAt: number | null
+  /** 最近一次检查结果：true 有效 / false 已失效 / null 未检查 */
+  valid: boolean | null
+  /** 能否检查登录状态 */
+  checkable: boolean
 }
 
 export interface DetectedLink {
@@ -524,4 +532,46 @@ export interface AutoResult {
   url: string
   ok: boolean
   message: string
+}
+
+export type InboxSource = 'clipboard' | 'phone' | 'extension' | 'manual'
+export type InboxStatus = 'pending_pair' | 'rejected' | 'confirm' | 'playlist' | 'resolving' | 'queued' | 'downloading' | 'done' | 'failed' | 'ignored'
+
+/** 收到的链接 */
+export interface InboxItem {
+  id: number
+  source: InboxSource
+  device: string
+  deviceName: string
+  text: string
+  url: string
+  site: string
+  status: InboxStatus
+  message: string | null
+  errorKind: ErrorKind | null
+  title: string | null
+  platform: string | null
+  mediaId: string | null
+  taskIds: number[]
+  seenBefore: number
+  createdAt: number
+  updatedAt: number
+}
+
+export interface InboxFilter {
+  source: InboxSource | 'all' | null
+  status: 'all' | 'unhandled' | 'failed' | 'done' | 'active' | 'ignored' | null
+  query: string
+  limit: number | null
+}
+
+export interface InboxCounts {
+  unhandled: number
+  total: number
+}
+
+export interface InboxSettings {
+  recordClipboard: boolean
+  keepDays: number
+  maxItems: number
 }
