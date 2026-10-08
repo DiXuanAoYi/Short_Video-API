@@ -304,6 +304,39 @@ pub struct Settings {
     pub upload: UploadSettings,
     /// 下载完成后的自动规则
     pub rules: Vec<AutoRule>,
+    /// 限速计划：不同时段用不同的限速
+    pub speed_schedule: Vec<SpeedWindow>,
+    /// 省流量模式（按流量计费的网络）：一次只下一个任务、默认选低清晰度、订阅不自动下载、不自动上传和 AI 处理
+    pub metered_mode: bool,
+}
+
+/// 限速计划里的一个时段。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SpeedWindow {
+    /// 星期几：1 = 周一 … 7 = 周日；为空表示每天
+    pub days: Vec<u8>,
+    pub start: String,
+    pub end: String,
+    /// 这个时段的限速（KB/s），0 表示不限速
+    pub limit_kbps: u64,
+}
+
+impl Default for SpeedWindow {
+    fn default() -> Self {
+        SpeedWindow { days: vec![], start: "09:00".into(), end: "18:00".into(), limit_kbps: 500 }
+    }
+}
+
+impl SpeedWindow {
+    pub fn contains(&self, weekday: u8, minute: u32) -> bool {
+        crate::live::in_schedule(&[crate::live::TimeWindow { days: self.days.clone(), start: self.start.clone(), end: self.end.clone() }], weekday, minute)
+    }
+}
+
+/// 计划里此刻生效的限速（KB/s，0 表示不限）；不在任何时段里返回 None（用全局限速）。
+pub fn schedule_limit(windows: &[SpeedWindow], weekday: u8, minute: u32) -> Option<u64> {
+    windows.iter().find(|w| w.contains(weekday, minute)).map(|w| w.limit_kbps)
 }
 
 /// 自动规则：下载完成后，满足条件就执行动作。
@@ -706,6 +739,8 @@ impl Default for Settings {
             notify: NotifySettings::default(),
             upload: UploadSettings::default(),
             rules: vec![],
+            speed_schedule: vec![],
+            metered_mode: false,
         }
     }
 }
@@ -774,6 +809,17 @@ impl Settings {
         self.remote_endpoint = self.remote_endpoint.trim().to_string();
         self.danmaku.normalize();
         self.ai.normalize();
+        self.speed_schedule
+            .retain(|w| crate::live::parse_hhmm(&w.start).is_some() && crate::live::parse_hhmm(&w.end).is_some() && w.start.trim() != w.end.trim());
+        self.speed_schedule.truncate(14);
+        for w in &mut self.speed_schedule {
+            w.days.retain(|d| (1..=7).contains(d));
+            w.days.sort_unstable();
+            w.days.dedup();
+            w.start = w.start.trim().to_string();
+            w.end = w.end.trim().to_string();
+            w.limit_kbps = w.limit_kbps.min(10_000_000);
+        }
         self.rules.truncate(50);
         for r in &mut self.rules {
             r.id = r.id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(32).collect();
@@ -812,6 +858,20 @@ impl Settings {
         }
     }
 
+    /// 省流量模式下实际生效的设置（不改保存的设置本身）。
+    pub fn metered_view(mut self) -> Settings {
+        if self.metered_mode {
+            self.concurrency = 1;
+            self.per_site_concurrency = 1;
+            self.segments = self.segments.min(2);
+            self.hls_concurrency = self.hls_concurrency.min(2);
+            if matches!(self.quality_preset, QualityPreset::Best | QualityPreset::Max1080) {
+                self.quality_preset = QualityPreset::Small;
+            }
+        }
+        self
+    }
+
     pub fn download_root(&self) -> PathBuf {
         PathBuf::from(&self.download_dir)
     }
@@ -844,6 +904,31 @@ mod tests {
     fn route_serde_shape() {
         assert_eq!(serde_json::to_string(&Route::Direct).unwrap(), r#"{"kind":"direct"}"#);
         assert_eq!(serde_json::to_string(&Route::Proxy("a".into())).unwrap(), r#"{"kind":"proxy","id":"a"}"#);
+    }
+
+    #[test]
+    fn speed_schedule_picks_the_window() {
+        let w = |days: &[u8], s: &str, e: &str, l: u64| SpeedWindow { days: days.to_vec(), start: s.into(), end: e.into(), limit_kbps: l };
+        let plan = vec![w(&[1, 2, 3, 4, 5], "09:00", "18:00", 300), w(&[], "00:00", "06:00", 0)];
+        assert_eq!(schedule_limit(&plan, 3, 10 * 60), Some(300), "Wednesday 10:00");
+        assert_eq!(schedule_limit(&plan, 6, 10 * 60), None, "Saturday daytime: global limit");
+        assert_eq!(schedule_limit(&plan, 6, 3 * 60), Some(0), "night: unlimited");
+        assert_eq!(schedule_limit(&plan, 3, 18 * 60), None, "end is exclusive");
+        let mut s = Settings { speed_schedule: vec![w(&[9], "x", "y", 1), w(&[2, 2, 0], "10:00", "11:00", 99_999_999_999)], ..Default::default() };
+        s.normalize();
+        assert_eq!(s.speed_schedule, vec![w(&[2], "10:00", "11:00", 10_000_000)]);
+    }
+
+    #[test]
+    fn metered_mode_overlays_without_touching_saved_values() {
+        let s = Settings { metered_mode: true, concurrency: 5, quality_preset: QualityPreset::Best, ..Default::default() };
+        let v = s.clone().metered_view();
+        assert_eq!((v.concurrency, v.per_site_concurrency, v.quality_preset), (1, 1, QualityPreset::Small));
+        assert_eq!(s.concurrency, 5, "the original is untouched");
+        let audio = Settings { metered_mode: true, quality_preset: QualityPreset::Audio, ..Default::default() }.metered_view();
+        assert_eq!(audio.quality_preset, QualityPreset::Audio, "audio-only stays audio-only");
+        let off = Settings { metered_mode: false, concurrency: 4, ..Default::default() }.metered_view();
+        assert_eq!(off.concurrency, 4);
     }
 
     #[test]

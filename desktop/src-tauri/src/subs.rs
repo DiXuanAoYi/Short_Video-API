@@ -548,6 +548,10 @@ async fn check_inner(app: &AppHandle, state: &Arc<AppState>, id: i64) -> AppResu
         }
         match sub.settings.filter(e, t) {
             Err(reason) => state.db.sub_item_insert(id, e, "ignored", Some(&reason))?,
+            Ok(()) if state.settings().metered_mode => {
+                state.db.sub_item_insert(id, e, "pending", Some("省流量模式：等待确认"))?;
+                found += 1;
+            }
             Ok(()) if to_download.len() < sub.settings.max_auto => {
                 state.db.sub_item_insert(id, e, "queued", None)?;
                 to_download.push((*e).clone());

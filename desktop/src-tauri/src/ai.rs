@@ -629,7 +629,13 @@ pub fn has_lang(assets: &[String], tag: &str) -> bool {
 /// 下载到字幕后，如果不是目标语言、作品下也没有目标语言字幕，就自动翻译（设置里开启时）。
 pub fn auto_translate(app: &tauri::AppHandle, st: &Arc<AppState>, item: &crate::db::LibraryItem) {
     let s = st.settings();
-    if !s.ai.auto_translate || item.kind != "subtitle" || item.source == "ai" || item.path.ends_with(".xml") || !Path::new(&item.path).exists() {
+    if s.metered_mode
+        || !s.ai.auto_translate
+        || item.kind != "subtitle"
+        || item.source == "ai"
+        || item.path.ends_with(".xml")
+        || !Path::new(&item.path).exists()
+    {
         return;
     }
     if st.vault.get(KEY_CHAT).is_none() && !is_local_url(&s.ai.base_url) {
@@ -647,7 +653,7 @@ pub fn auto_translate(app: &tauri::AppHandle, st: &Arc<AppState>, item: &crate::
 /// 视频下载完成一小段时间后，作品下还是没有任何字幕，就自动转写（设置里开启时）。
 pub fn auto_transcribe(app: &tauri::AppHandle, st: &Arc<AppState>, item: &crate::db::LibraryItem) {
     let s = st.settings();
-    if !s.ai.auto_transcribe || item.kind != "video" || matches!(item.source.as_str(), "tool" | "ai" | "import") {
+    if s.metered_mode || !s.ai.auto_transcribe || item.kind != "video" || matches!(item.source.as_str(), "tool" | "ai" | "import") {
         return;
     }
     let ready = if s.ai.stt_engine == "local" {

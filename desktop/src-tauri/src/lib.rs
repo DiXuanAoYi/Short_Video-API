@@ -88,7 +88,13 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// 实际生效的设置（省流量模式下会调低并发和清晰度）。读写设置页要用 [`settings_raw`](Self::settings_raw)。
     pub fn settings(&self) -> Settings {
+        self.settings_raw().metered_view()
+    }
+
+    /// 保存的设置原样（不含省流量模式的临时调整）。
+    pub fn settings_raw(&self) -> Settings {
         self.settings.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
@@ -267,6 +273,16 @@ pub fn run() {
                 }
             }
             download::spawn_timer(&handle);
+            // 限速计划：按时段切换限速
+            {
+                let st = app.state::<Arc<AppState>>().inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        st.net.refresh_limit(&st.settings_raw().speed_schedule);
+                        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                    }
+                });
+            }
             library_cmds::spawn_maintenance(&handle);
             spawn_account_reminders(handle.clone());
 
@@ -444,6 +460,7 @@ pub fn run() {
             commands::delete_account,
             commands::check_account,
             commands::test_route,
+            commands::route_speedtest,
             commands::get_diagnostics,
             commands::open_log_dir,
             commands::open_samples_dir,

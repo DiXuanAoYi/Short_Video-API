@@ -485,6 +485,24 @@ export interface NetworkSettings {
 
 export type ConflictPolicy = 'rename' | 'skip' | 'overwrite'
 
+export interface RouteSpeed {
+  route: Route
+  name: string
+  ok: boolean
+  ttfbMs: number
+  kbps: number
+  bytes: number
+  error: string | null
+}
+
+export interface SpeedWindow {
+  days: number[]
+  start: string
+  end: string
+  /** KB/s，0 表示不限 */
+  limitKbps: number
+}
+
 export interface RouteTest {
   route: Route
   status: number
@@ -567,6 +585,8 @@ export interface Settings {
   notify: NotifySettings
   upload: UploadSettings
   rules: AutoRule[]
+  speedSchedule: SpeedWindow[]
+  meteredMode: boolean
 }
 
 export interface TimeWindow {

@@ -1098,7 +1098,7 @@ async fn download_input(
                     let ctx = st.parse_ctx(settings);
                     let format_id = asset.format_id.clone().unwrap_or_else(|| "best".into());
                     let page = if media.source_url.is_empty() { asset.url.clone() } else { media.source_url.clone() };
-                    providers::ytdlp::download(&ctx, &page, &format_id, &asset.ext, part, rx, settings.speed_limit_kbps, |p| {
+                    providers::ytdlp::download(&ctx, &page, &format_id, &asset.ext, part, rx, st.net.effective_limit(settings.speed_limit_kbps), |p| {
                         reporter.update(p.downloaded, p.total, p.speed, None)
                     })
                     .await

@@ -199,7 +199,8 @@ pub async fn test(st: &AppState) -> AppResult<String> {
 
 /// 下载完成后触发（设置里开启时）。
 pub fn auto_upload(app: &tauri::AppHandle, st: &Arc<AppState>, item: &LibraryItem) {
-    if !wanted(&st.settings().upload, item) {
+    let settings = st.settings();
+    if settings.metered_mode || !wanted(&settings.upload, item) {
         return;
     }
     let (id, title) = (item.id, item.title.clone());

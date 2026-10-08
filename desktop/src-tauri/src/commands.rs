@@ -55,7 +55,7 @@ pub fn get_app_info(app: AppHandle, state: St<'_>) -> AppInfo {
 
 #[tauri::command]
 pub fn get_settings(state: St<'_>) -> Settings {
-    state.settings()
+    state.settings_raw()
 }
 
 #[derive(Serialize)]
@@ -70,7 +70,7 @@ pub struct SaveSettingsResult {
 pub async fn save_settings(app: AppHandle, state: St<'_>, settings: Settings) -> AppResult<SaveSettingsResult> {
     let mut s = settings;
     s.normalize();
-    let old = state.settings();
+    let old = state.settings_raw();
     // 旧版明文 Cookie 字段不再写回
     s.cookies.clear();
     s.cookie_updated_at.clear();
@@ -84,6 +84,7 @@ pub async fn save_settings(app: AppHandle, state: St<'_>, settings: Settings) ->
     if old.network != s.network {
         state.net.invalidate();
     }
+    state.net.refresh_limit(&s.speed_schedule);
     tray::sync_watch_item(&app);
     if !s.prevent_sleep {
         crate::power::keep_awake(false);
@@ -95,7 +96,7 @@ pub async fn save_settings(app: AppHandle, state: St<'_>, settings: Settings) ->
             log::warn!("autostart change failed: {e}");
         }
     }
-    if old.concurrency != s.concurrency || old.per_site_concurrency != s.per_site_concurrency {
+    if old.concurrency != s.concurrency || old.per_site_concurrency != s.per_site_concurrency || old.metered_mode != s.metered_mode {
         download::schedule(&app);
     }
     let shortcut_error = state.shortcut_error.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -1054,6 +1055,17 @@ pub async fn verify_account(state: &AppState, id: &str) -> AppResult<providers::
 }
 
 /// 测试某个地址在当前网络规则下能否访问。
+/// 对所有出口（直连、系统代理、自定义代理）测速。
+#[tauri::command]
+pub async fn route_speedtest(state: St<'_>, url: String) -> AppResult<Vec<crate::net::RouteSpeed>> {
+    let url = url.trim().to_string();
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(AppError::invalid("请填写以 https:// 开头的地址，最好是一个视频文件或大一点的资源。"));
+    }
+    let net = state.settings_raw().network;
+    Ok(state.net.speed_test(&net, &url).await)
+}
+
 #[tauri::command]
 pub async fn test_route(state: St<'_>, url: String) -> AppResult<crate::net::RouteTest> {
     let url = if url.starts_with("http") { url } else { format!("https://{url}/") };

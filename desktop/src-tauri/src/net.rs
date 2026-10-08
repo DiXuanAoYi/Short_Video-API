@@ -1,6 +1,7 @@
 //! 网络：按网站分流（直连 / 系统代理 / 自定义代理）、客户端缓存、全局限速、同一网站的请求间隔。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -19,11 +20,20 @@ pub struct Clients {
     pub download: reqwest::Client,
 }
 
-#[derive(Default)]
 pub struct NetManager {
     cache: Mutex<HashMap<String, Clients>>,
     site_last: Mutex<HashMap<String, Instant>>,
     limiter: SpeedLimiter,
+    /// 限速计划此刻生效的限速（KB/s）；`NO_OVERRIDE` 表示不在计划时段里，用任务自己带的全局限速
+    override_limit: AtomicU64,
+}
+
+pub const NO_OVERRIDE: u64 = u64::MAX;
+
+impl Default for NetManager {
+    fn default() -> Self {
+        NetManager { cache: Default::default(), site_last: Default::default(), limiter: Default::default(), override_limit: AtomicU64::new(NO_OVERRIDE) }
+    }
 }
 
 impl NetManager {
@@ -77,7 +87,42 @@ impl NetManager {
     }
 
     pub async fn throttle(&self, bytes: usize, limit_kbps: u64) {
-        self.limiter.consume(bytes as u64, limit_kbps).await;
+        self.limiter.consume(bytes as u64, self.effective_limit(limit_kbps)).await;
+    }
+
+    /// 任务带的全局限速和限速计划里此刻的限速，以计划为准。
+    pub fn effective_limit(&self, global_kbps: u64) -> u64 {
+        match self.override_limit.load(Ordering::Relaxed) {
+            NO_OVERRIDE => global_kbps,
+            planned => planned,
+        }
+    }
+
+    /// 按限速计划和当前时间刷新生效的限速（设置保存后、以及每隔一会儿调用）。返回此刻的限速（None 表示用全局限速）。
+    pub fn refresh_limit(&self, plan: &[crate::settings::SpeedWindow]) -> Option<u64> {
+        use chrono::{Datelike, Timelike};
+        let now = chrono::Local::now();
+        let planned = crate::settings::schedule_limit(plan, now.weekday().number_from_monday() as u8, now.hour() * 60 + now.minute());
+        self.override_limit.store(planned.unwrap_or(NO_OVERRIDE), Ordering::Relaxed);
+        planned
+    }
+
+    /// 对所有出口（直连、系统代理、每个自定义代理）测速，找出访问这个地址最快的线路。
+    pub async fn speed_test(&self, net: &NetworkSettings, url: &str) -> Vec<RouteSpeed> {
+        let mut routes: Vec<(Route, String)> = vec![(Route::Direct, "直连".into()), (Route::System, "系统代理".into())];
+        routes.extend(net.proxies.iter().map(|p| (Route::Proxy(p.id.clone()), format!("代理：{}", p.name))));
+        let mut out = vec![];
+        for (route, name) in routes {
+            let r = match self.clients_for_route(net, &route) {
+                Ok(c) => measure(&c.download, url, 1_500_000, 6).await,
+                Err(e) => Err(e.message),
+            };
+            out.push(match r {
+                Ok((ttfb_ms, bytes, kbps)) => RouteSpeed { route, name, ok: true, ttfb_ms, kbps, bytes, error: None },
+                Err(error) => RouteSpeed { route, name, ok: false, ttfb_ms: 0, kbps: 0, bytes: 0, error: Some(error) },
+            });
+        }
+        out
     }
 
     /// 测试某个地址在当前规则下能否访问，返回耗时（毫秒）。
@@ -97,6 +142,62 @@ impl NetManager {
         })?;
         Ok(RouteTest { route, status: resp.status().as_u16(), millis: t0.elapsed().as_millis() as u64 })
     }
+}
+
+/// 一条线路的测速结果。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteSpeed {
+    pub route: Route,
+    pub name: String,
+    pub ok: bool,
+    /// 收到第一个字节的耗时（毫秒）
+    pub ttfb_ms: u64,
+    /// 下载速度（KB/s）
+    pub kbps: u64,
+    pub bytes: u64,
+    pub error: Option<String>,
+}
+
+/// 用一个客户端下载 `url` 的开头最多 `max_bytes` 字节（最多 `max_secs` 秒），测首字节耗时和速度。
+pub async fn measure(client: &reqwest::Client, url: &str, max_bytes: u64, max_secs: u64) -> Result<(u64, u64, u64), String> {
+    let t0 = Instant::now();
+    let mut resp =
+        client.get(url).header("Range", format!("bytes=0-{}", max_bytes.saturating_sub(1))).timeout(Duration::from_secs(max_secs + 10)).send().await.map_err(
+            |e| {
+                if e.is_timeout() {
+                    "连接超时".to_string()
+                } else if e.is_connect() {
+                    "无法连接".to_string()
+                } else {
+                    e.without_url().to_string()
+                }
+            },
+        )?;
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(format!("服务器返回 {status}"));
+    }
+    let ttfb = t0.elapsed();
+    let start = Instant::now();
+    let mut bytes = 0u64;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(max_secs).saturating_sub(start.elapsed()).max(Duration::from_millis(100)), resp.chunk()).await {
+            Ok(Ok(Some(c))) => {
+                bytes += c.len() as u64;
+                if bytes >= max_bytes || start.elapsed() >= Duration::from_secs(max_secs) {
+                    break;
+                }
+            }
+            Ok(Ok(None)) | Err(_) => break,
+            Ok(Err(e)) => return Err(e.without_url().to_string()),
+        }
+    }
+    if bytes == 0 {
+        return Err("没有收到数据".into());
+    }
+    let secs = start.elapsed().as_secs_f64().max(0.001);
+    Ok((ttfb.as_millis() as u64, bytes, (bytes as f64 / 1024.0 / secs) as u64))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -237,5 +338,46 @@ mod tests {
         let t1 = Instant::now();
         l.consume(10_000_000, 0).await;
         assert!(t1.elapsed() < Duration::from_millis(10));
+    }
+
+    #[tokio::test]
+    async fn measure_reports_first_byte_and_speed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    let mut b = [0u8; 2048];
+                    let n = s.read(&mut b).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&b[..n]).into_owned();
+                    if req.contains("/missing") {
+                        let _ = s.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        return;
+                    }
+                    let body = vec![7u8; 3_000_000];
+                    let _ = s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await;
+                    let _ = s.write_all(&body).await;
+                });
+            }
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let (ttfb, bytes, kbps) = measure(&client, &format!("http://{addr}/big"), 1_000_000, 5).await.unwrap();
+        assert!((1_000_000..=3_000_000).contains(&bytes), "stops after the cap: {bytes}");
+        assert!(ttfb < 2000 && kbps > 100, "{ttfb} ms, {kbps} KB/s");
+        assert_eq!(measure(&client, &format!("http://{addr}/missing"), 1000, 2).await.unwrap_err(), "服务器返回 404");
+        assert_eq!(measure(&client, "http://127.0.0.1:1/x", 1000, 2).await.unwrap_err(), "无法连接");
+        // 完整的测速：直连一定能通
+        let m = NetManager::default();
+        let results = m.speed_test(&NetworkSettings::default(), &format!("http://{addr}/big")).await;
+        assert_eq!(results.len(), 2, "direct and system, no custom proxies");
+        assert!(results[0].ok && results[0].name == "直连" && results[0].kbps > 0);
+        // 限速计划覆盖全局限速
+        assert_eq!(m.effective_limit(100), 100);
+        m.override_limit.store(500, Ordering::Relaxed);
+        assert_eq!(m.effective_limit(100), 500, "the plan wins over the global limit");
+        m.override_limit.store(0, Ordering::Relaxed);
+        assert_eq!(m.effective_limit(100), 0, "0 means unlimited in that window");
     }
 }

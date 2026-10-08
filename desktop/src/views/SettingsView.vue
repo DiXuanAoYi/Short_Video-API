@@ -35,6 +35,11 @@ function saveSubLangs() {
     .filter(Boolean)
   subLangsText.value = form.value.subtitleLangs.join(', ')
 }
+const DAYS = ['一', '二', '三', '四', '五', '六', '日']
+
+function addSpeedWindow() {
+  form.value.speedSchedule.push({ days: [], start: '08:00', end: '23:00', limitKbps: 1024 })
+}
 const health = ref<HealthResult[] | null>(null)
 const checkingHealth = ref(false)
 const portable = ref(false)
@@ -215,6 +220,32 @@ function insertVar(v: string) {
               <el-switch v-model="form.keepPartOnCancel" />
             </div>
             <small class="mute">关闭程序、断网或下载地址过期后，任务都会从已下载的位置继续；服务器不支持续传时会自动从头下载。</small>
+          </section>
+
+          <section class="group card">
+            <h3>限速计划与省流量</h3>
+            <div class="col">
+              <span>限速计划<small class="mute block">在指定时段改用另一个限速，没命中任何时段时使用上面的全局限速；多个时段重叠时取最先匹配的</small></span>
+              <div v-for="(w, i) in form.speedSchedule" :key="i" class="win">
+                <el-checkbox-group v-model="w.days" size="small">
+                  <el-checkbox-button v-for="(d, k) in DAYS" :key="k" :value="k + 1">{{ d }}</el-checkbox-button>
+                </el-checkbox-group>
+                <el-time-select v-model="w.start" size="small" class="tsel" start="00:00" end="23:30" step="00:30" :clearable="false" />
+                <span class="mute small">到</span>
+                <el-time-select v-model="w.end" size="small" class="tsel" start="00:00" end="23:30" step="00:30" :clearable="false" />
+                <el-input-number v-model="w.limitKbps" :min="0" :max="1048576" :step="256" size="small" class="lim" />
+                <span class="mute small">KB/s</span>
+                <el-button link size="small" @click="form.speedSchedule.splice(i, 1)">删除</el-button>
+              </div>
+              <div>
+                <el-button size="small" @click="addSpeedWindow">添加时段</el-button>
+                <span class="mute small"> {{ form.speedSchedule.length ? '限速填 0 表示这个时段不限速；不选星期表示每天；结束早于开始表示跨过午夜' : '例如白天限速、半夜不限速' }}</span>
+              </div>
+            </div>
+            <div class="kv">
+              <span>省流量模式<small class="mute block">用于手机热点等按流量计费的网络：下载并发降为 1、分段数减少、默认画质改为省空间（不超过 720p）、不自动下载订阅更新、不自动上传和调用 AI，已排队的任务不受影响</small></span>
+              <el-switch v-model="form.meteredMode" />
+            </div>
           </section>
 
           <section class="group card">
@@ -607,6 +638,23 @@ h3 {
 .block {
   display: block;
   font-size: 11px;
+}
+.col {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.win {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.tsel {
+  width: 110px;
+}
+.lim {
+  width: 130px;
 }
 .field {
   display: flex;
