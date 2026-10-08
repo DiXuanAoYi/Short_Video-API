@@ -24,3 +24,28 @@ api.contextMenus.onClicked.addListener(async (info, tab) => {
     notify('发送失败', e.message)
   }
 })
+
+// 自动同步：勾选的网站登录状态变化时（Cookie 变化后安静 10 秒）同步给清影。默认关闭。
+const pending = new Map()
+const MIN_INTERVAL = 5 * 60 * 1000
+
+api.cookies.onChanged.addListener(async ({ cookie }) => {
+  const c = await getConfig()
+  if (!c.autoSync || !c.syncSites.length) return
+  const site = registrable(cookie.domain.replace(/^\./, ''))
+  if (!c.syncSites.includes(site)) return
+  clearTimeout(pending.get(site))
+  pending.set(
+    site,
+    setTimeout(async () => {
+      pending.delete(site)
+      const now = await getConfig()
+      if (Date.now() - (now.lastSync[site] || 0) < MIN_INTERVAL) return
+      try {
+        await syncCookies(`https://${site}/`, '', true)
+      } catch {
+        // 清影没有运行或网站已退出登录：下次变化时再试
+      }
+    }, 10000),
+  )
+})

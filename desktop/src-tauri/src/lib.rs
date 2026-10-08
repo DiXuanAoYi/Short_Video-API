@@ -6,6 +6,7 @@ pub mod diagnostics;
 pub mod download;
 pub mod engine;
 pub mod error;
+pub mod inbox;
 pub mod live;
 pub mod model;
 pub mod naming;
@@ -19,6 +20,8 @@ pub mod quality;
 pub mod secret;
 pub mod settings;
 pub mod subs;
+pub mod subtitle;
+pub mod subtitle_io;
 pub mod tools;
 mod tray;
 
@@ -26,7 +29,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 
-use tauri::{Manager, WindowEvent};
+use tauri::{Emitter, Manager, WindowEvent};
 
 use crate::cookies::CookieStore;
 use crate::db::Db;
@@ -91,6 +94,18 @@ fn spawn_account_reminders(app: tauri::AppHandle) {
         tokio::time::sleep(std::time::Duration::from_secs(20)).await;
         loop {
             let st = app.state::<Arc<AppState>>().inner().clone();
+            // 定期检查登录状态：从有效变为失效时提醒（网络错误不算失效）
+            for a in st.cookies.summaries().into_iter().filter(|a| a.checkable) {
+                if let Ok(status) = commands::verify_account(&st, &a.id).await {
+                    if !status.logged_in && a.valid != Some(false) {
+                        use tauri_plugin_notification::NotificationExt;
+                        let body = format!("{}账号“{}”的登录已失效，需要登录的内容将无法下载。请在“设置 → 账号与 Cookie”中重新登录。", a.site_name, a.label);
+                        let _ = app.notification().builder().title("登录已失效").body(body).show();
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+            let _ = app.emit("accounts://updated", ());
             let now = db::now();
             for a in st.cookies.summaries() {
                 let Some(exp) = a.expires_at else { continue };
@@ -205,6 +220,11 @@ pub fn run() {
             let _ = std::fs::create_dir_all(&covers);
             let _ = app.asset_protocol_scope().allow_directory(&covers, false);
             download::restore(&handle);
+            if let Ok(n) = app.state::<Arc<AppState>>().db.inbox_prune(settings.inbox.keep_days, settings.inbox.max_items) {
+                if n > 0 {
+                    log::info!("pruned {n} old inbox items");
+                }
+            }
             download::spawn_timer(&handle);
             spawn_account_reminders(handle.clone());
 
@@ -306,6 +326,16 @@ pub fn run() {
             commands::clear_finished,
             commands::pause_all,
             commands::resume_all,
+            commands::login_site,
+            commands::preferred_subtitles,
+            commands::downloaded_entries,
+            commands::inbox_list,
+            commands::inbox_counts,
+            commands::inbox_retry,
+            commands::inbox_retry_failed,
+            commands::inbox_ignore,
+            commands::inbox_delete,
+            commands::inbox_clear,
             commands::list_history,
             commands::delete_history,
             commands::clear_history,

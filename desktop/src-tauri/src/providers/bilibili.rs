@@ -120,6 +120,7 @@ impl Provider for Bilibili {
             let cover = info.assets.pop().filter(|a| a.kind == AssetKind::Cover);
             info.assets = assets;
             info.assets.extend(cover);
+            info.assets.extend(cc_subtitles(ctx, &vid, cid, cookie.as_deref()).await);
             info.assets.push(danmaku(cid));
             return Ok(info);
         }
@@ -130,6 +131,7 @@ impl Provider for Bilibili {
         let play = get_json(ctx, &play_api, cookie.as_deref()).await?;
         let play_data = api_data(&play)?;
         let mut info = parse_view(data, play_data, index, url)?;
+        info.assets.extend(cc_subtitles(ctx, &vid, cid, cookie.as_deref()).await);
         info.assets.push(danmaku(cid));
         Ok(info)
     }
@@ -151,7 +153,45 @@ impl VideoId {
     }
 }
 
-/// 弹幕 XML（可用弹幕播放器或转换工具转为 ASS 字幕）。
+/// CC 字幕（UP 主上传的和 AI 生成的）。获取字幕地址需要登录，未登录时通常是空列表。
+/// 偏好语言排在前面；获取失败不影响解析。
+async fn cc_subtitles(ctx: &Ctx<'_>, vid: &VideoId, cid: u64, cookie: Option<&str>) -> Vec<Asset> {
+    let Ok(keys) = wbi_keys(ctx, cookie).await else { return vec![] };
+    let params = vec![(vid.query_key().to_string(), vid.query_value()), ("cid".into(), cid.to_string())];
+    let q = wbi_sign(params, &keys, chrono::Utc::now().timestamp());
+    match get_json(ctx, &format!("https://api.bilibili.com/x/player/wbi/v2?{q}"), cookie).await {
+        Ok(v) => {
+            let mut list = parse_cc(&v);
+            list.sort_by_key(|a| crate::subtitle::lang_rank(a.format_id.as_deref().unwrap_or(""), &ctx.settings.subtitle_langs).unwrap_or(usize::MAX));
+            list
+        }
+        Err(e) => {
+            log::info!("bilibili cc subtitles failed: {e}");
+            vec![]
+        }
+    }
+}
+
+/// 解析 `x/player/wbi/v2` 返回里的字幕列表。
+pub fn parse_cc(v: &Value) -> Vec<Asset> {
+    let Some(list) = v.pointer("/data/subtitle/subtitles").and_then(Value::as_array) else { return vec![] };
+    list.iter()
+        .filter_map(|t| {
+            let lan = str_at(t, "/lan")?;
+            let url = str_at(t, "/subtitle_url").filter(|u| !u.is_empty())?;
+            let url = if let Some(rest) = url.strip_prefix("//") { format!("https://{rest}") } else { url.replacen("http://", "https://", 1) };
+            let ai = lan.starts_with("ai-") || t.get("ai_type").and_then(Value::as_u64).unwrap_or(0) != 0;
+            let name = str_at(t, "/lan_doc").map(String::from).unwrap_or_else(|| crate::subtitle::lang_name(lan));
+            let mut a = Asset::base(format!("cc-{lan}"), AssetKind::Subtitle, url, format!("字幕 · {name}{}", if ai { "（AI 生成）" } else { "" }), "json");
+            let base = crate::subtitle::normalize_lang(lan);
+            a.quality = Some(if ai { format!("{base}.ai") } else { base });
+            a.format_id = Some(lan.to_string());
+            Some(a)
+        })
+        .collect()
+}
+
+/// 弹幕 XML（下载时按设置转成 ASS，播放器可直接显示滚动弹幕）。
 fn danmaku(cid: u64) -> Asset {
     let mut a = Asset::base("danmaku", AssetKind::Subtitle, format!("https://comment.bilibili.com/{cid}.xml"), "弹幕 XML", "xml");
     a.quality = Some("danmaku".into());
@@ -449,6 +489,7 @@ pub fn parse_view(data: &Value, play: &Value, index: usize, source_url: &str) ->
         assets,
         entries: vec![],
         series: None,
+        chapters: vec![],
         extractor: Some("native".into()),
     })
 }
@@ -459,6 +500,26 @@ mod tests {
 
     const VIEW: &str = include_str!("../../tests/fixtures/bili_view.json");
     const PLAY: &str = include_str!("../../tests/fixtures/bili_playurl.json");
+
+    #[test]
+    fn cc_subtitle_list() {
+        let v = serde_json::json!({"code": 0, "data": {"subtitle": {"subtitles": [
+            {"lan": "ai-zh", "lan_doc": "中文（自动生成）", "subtitle_url": "//aisubtitle.hdslb.com/bfs/ai_subtitle/prod/x?auth_key=k", "ai_type": 1},
+            {"lan": "en-US", "lan_doc": "English", "subtitle_url": "http://i0.hdslb.com/bfs/subtitle/y.json", "ai_type": 0},
+            {"lan": "ja", "lan_doc": "日本語", "subtitle_url": ""}
+        ]}}});
+        let list = parse_cc(&v);
+        assert_eq!(list.len(), 2, "tracks without a URL (not logged in) are skipped");
+        assert_eq!(list[0].id, "cc-ai-zh");
+        assert_eq!(list[0].url, "https://aisubtitle.hdslb.com/bfs/ai_subtitle/prod/x?auth_key=k");
+        assert_eq!(list[0].quality.as_deref(), Some("zh.ai"));
+        assert!(list[0].label.contains("AI 生成"));
+        assert_eq!(list[1].url, "https://i0.hdslb.com/bfs/subtitle/y.json");
+        assert_eq!(list[1].quality.as_deref(), Some("en-us"));
+        assert_eq!(list[1].ext, "json");
+        assert!(parse_cc(&serde_json::json!({"data": {"subtitle": {"subtitles": []}}})).is_empty());
+        assert!(parse_cc(&serde_json::json!({})).is_empty());
+    }
 
     #[test]
     fn video_ids() {

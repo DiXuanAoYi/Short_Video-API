@@ -4,6 +4,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { api, errorText } from '../api'
 import VirtualList from '../components/VirtualList.vue'
+import InboxPanel from '../components/InboxPanel.vue'
 import { useAppStore, useParseStore, useQueueStore } from '../stores/app'
 import type { HistoryItem, LibraryItem, PlatformCount } from '../types'
 import { formatBytes, formatDateTime } from '../utils/format'
@@ -12,7 +13,7 @@ const app = useAppStore()
 const parse = useParseStore()
 const queue = useQueueStore()
 
-const tab = ref<'files' | 'history'>('files')
+const tab = computed({ get: () => app.libraryTab, set: (v) => (app.libraryTab = v) })
 const query = ref('')
 const files = ref<LibraryItem[]>([])
 const history = ref<HistoryItem[]>([])
@@ -72,6 +73,7 @@ function assetName(f: LibraryItem) {
 async function load() {
   loading.value = true
   try {
+    if (tab.value === 'inbox') return
     if (tab.value === 'files') {
       files.value = await api.listLibrary({ query: query.value, platform: fPlatform.value || null, kind: fKind.value || null, since: sinceValue(), missingOnly: fMissing.value })
       platforms.value = await api.libraryPlatforms()
@@ -150,9 +152,10 @@ async function clearHistory() {
     <div class="head">
       <el-radio-group v-model="tab" size="small">
         <el-radio-button value="files">已下载</el-radio-button>
+        <el-radio-button value="inbox">收到的链接<template v-if="app.inboxUnhandled"> ({{ app.inboxUnhandled }})</template></el-radio-button>
         <el-radio-button value="history">解析历史</el-radio-button>
       </el-radio-group>
-      <el-input v-model="query" size="small" clearable placeholder="搜索标题或作者" class="search" />
+      <el-input v-model="query" size="small" clearable :placeholder="tab === 'inbox' ? '搜索链接、标题或设备' : '搜索标题或作者'" class="search" />
       <el-button v-if="tab === 'files' && app.settings" size="small" @click="run(api.revealFile, app.settings!.downloadDir)">打开下载目录</el-button>
       <el-radio-group v-if="tab === 'files'" v-model="mode" size="small">
         <el-radio-button value="list">列表</el-radio-button>
@@ -181,7 +184,8 @@ async function clearHistory() {
       <span class="mute count">{{ files.length }} 项</span>
     </div>
 
-    <div v-loading="loading" class="list">
+    <InboxPanel v-if="tab === 'inbox'" :query="query" />
+    <div v-else v-loading="loading" class="list">
       <template v-if="tab === 'files'">
         <div v-if="!files.length" class="empty mute">{{ query || fPlatform || fKind || fSince || fMissing ? '没有匹配的文件。' : '还没有下载过文件。' }}</div>
         <VirtualList v-else-if="mode === 'grid'" :items="gridRows" :item-height="190" :gap="10" :item-key="(r) => r.key" class="vl">

@@ -4,6 +4,7 @@ import { api, errorKind, errorText, events } from '../api'
 import type { AppInfo, ErrorKind, HistoryItem, MediaInfo, Settings, TaskSnapshot } from '../types'
 
 export type ViewName = 'parse' | 'queue' | 'subs' | 'live' | 'library' | 'settings'
+export type LibraryTab = 'files' | 'inbox' | 'history'
 export type SettingsTab = 'download' | 'parse' | 'network' | 'accounts' | 'phone' | 'components' | 'diagnostics' | 'general'
 
 /** 设置、主题与当前页面。 */
@@ -13,10 +14,26 @@ export const useAppStore = defineStore('app', () => {
   const view = ref<ViewName>('parse')
   const settingsTab = ref<SettingsTab>('download')
   const shortcutError = ref<string | null>(null)
+  const libraryTab = ref<LibraryTab>('files')
+  /** 需要处理的收到的链接数量（侧栏角标） */
+  const inboxUnhandled = ref(0)
+  /** 请求账号页打开某个网站的登录（内置平台 ID 或域名）；处理后清空 */
+  const loginRequest = ref<string | null>(null)
 
   function goSettings(tab: SettingsTab) {
     settingsTab.value = tab
     view.value = 'settings'
+  }
+
+  function goLibrary(tab: LibraryTab) {
+    libraryTab.value = tab
+    view.value = 'library'
+  }
+
+  /** 打开账号页并直接开始登录这个网站。 */
+  function goLogin(site: string | null | undefined) {
+    loginRequest.value = site || null
+    goSettings('accounts')
   }
 
   async function load() {
@@ -47,7 +64,7 @@ export const useAppStore = defineStore('app', () => {
   }
   media.addEventListener('change', applyTheme)
 
-  return { settings, info, view, settingsTab, shortcutError, goSettings, load, save, patch, applyTheme }
+  return { settings, info, view, settingsTab, shortcutError, libraryTab, inboxUnhandled, loginRequest, goSettings, goLibrary, goLogin, load, save, patch, applyTheme }
 })
 
 /** 下载队列，监听后端事件保持同步。 */
@@ -89,6 +106,8 @@ export const useParseStore = defineStore('parse', () => {
   const loading = ref(false)
   const error = ref('')
   const errorKindRef = ref<ErrorKind>('other')
+  /** 需要登录时对应的网站 */
+  const errorSite = ref<string | null>(null)
   const result = ref<MediaInfo | null>(null)
   const recent = ref<HistoryItem[]>([])
 
@@ -108,6 +127,8 @@ export const useParseStore = defineStore('parse', () => {
       result.value = null
       error.value = errorText(e)
       errorKindRef.value = errorKind(e)
+      errorSite.value = null
+      if (errorKindRef.value === 'need_login' || errorKindRef.value === 'rate_limited') errorSite.value = await api.loginSite(t).catch(() => null)
     } finally {
       loading.value = false
     }
@@ -123,5 +144,5 @@ export const useParseStore = defineStore('parse', () => {
     result.value = null
   }
 
-  return { text, loading, error, errorKind: errorKindRef, result, recent, parse, loadRecent, clear }
+  return { text, loading, error, errorKind: errorKindRef, errorSite, result, recent, parse, loadRecent, clear }
 })

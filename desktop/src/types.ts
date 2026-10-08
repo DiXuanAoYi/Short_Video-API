@@ -59,6 +59,21 @@ export interface MediaInfo {
   entries: PlaylistEntry[]
   series: SeriesInfo | null
   extractor: string | null
+  chapters: Chapter[]
+}
+
+export interface Chapter {
+  title: string
+  startMs: number
+  endMs: number
+}
+
+/** 只下载 / 保留的时间段 */
+export interface Clip {
+  startMs: number
+  endMs: number | null
+  /** 重新编码，起点精确到帧 */
+  precise: boolean
 }
 
 export type TaskStatus = 'queued' | 'running' | 'paused' | 'done' | 'failed' | 'canceled'
@@ -87,6 +102,8 @@ export interface TaskSnapshot {
   id: number
   platform: string
   platformName: string
+  /** 登录用的网站（内置平台 ID 或域名） */
+  site: string
   mediaId: string
   title: string
   author: string
@@ -102,6 +119,8 @@ export interface TaskSnapshot {
   error: string | null
   errorKind: ErrorKind | null
   note: string | null
+  /** 下载成功但有附带问题（如字幕没有处理成功） */
+  warning: string | null
   resumable: boolean | null
   step: 'download' | 'merge' | 'post' | null
   inputs: number
@@ -290,6 +309,13 @@ export interface Settings {
   launchAtLogin: boolean
   liveMaxRecordings: number
   liveCleanupDays: number
+  inbox: InboxSettings
+  subtitleLangs: string[]
+  subtitleAuto: boolean
+  subtitleMode: 'off' | 'file' | 'embed' | 'burn'
+  subtitleConvert: boolean
+  danmakuAss: boolean
+  verifyDownloads: boolean
 }
 
 export interface LiveSettings {
@@ -430,6 +456,11 @@ export type QualityPreset = 'best' | 'max1080' | 'small' | 'audio'
 export interface PostOptions {
   extractAudio: string | null
   embedMetadata: boolean
+  /** 选中的字幕：soft 内嵌为字幕轨 / burn 烧录进画面；为空时字幕单独保存为文件 */
+  subMode?: 'soft' | 'burn' | null
+  clip?: Clip | null
+  /** 按这些章节另外拆分成多个文件 */
+  splitChapters?: Chapter[]
 }
 
 export type ToolId = 'yt-dlp' | 'ffmpeg'
@@ -490,6 +521,11 @@ export interface AccountSummary {
   userName: string | null
   expiresAt: number | null
   isDefault: boolean
+  checkedAt: number | null
+  /** 最近一次检查结果：true 有效 / false 已失效 / null 未检查 */
+  valid: boolean | null
+  /** 能否检查登录状态 */
+  checkable: boolean
 }
 
 export interface DetectedLink {
@@ -524,4 +560,46 @@ export interface AutoResult {
   url: string
   ok: boolean
   message: string
+}
+
+export type InboxSource = 'clipboard' | 'phone' | 'extension' | 'manual'
+export type InboxStatus = 'pending_pair' | 'rejected' | 'confirm' | 'playlist' | 'resolving' | 'queued' | 'downloading' | 'done' | 'failed' | 'ignored'
+
+/** 收到的链接 */
+export interface InboxItem {
+  id: number
+  source: InboxSource
+  device: string
+  deviceName: string
+  text: string
+  url: string
+  site: string
+  status: InboxStatus
+  message: string | null
+  errorKind: ErrorKind | null
+  title: string | null
+  platform: string | null
+  mediaId: string | null
+  taskIds: number[]
+  seenBefore: number
+  createdAt: number
+  updatedAt: number
+}
+
+export interface InboxFilter {
+  source: InboxSource | 'all' | null
+  status: 'all' | 'unhandled' | 'failed' | 'done' | 'active' | 'ignored' | null
+  query: string
+  limit: number | null
+}
+
+export interface InboxCounts {
+  unhandled: number
+  total: number
+}
+
+export interface InboxSettings {
+  recordClipboard: boolean
+  keepDays: number
+  maxItems: number
 }

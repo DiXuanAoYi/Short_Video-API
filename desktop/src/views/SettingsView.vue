@@ -21,6 +21,15 @@ const checking = ref(false)
 // 快捷键在输入框失焦后才生效，避免输入到一半就注册
 const shortcutDraft = ref(form.value.shortcut)
 const domainsText = ref(form.value.clipboardDomains.join('\n'))
+const subLangsText = ref(form.value.subtitleLangs.join(', '))
+
+function saveSubLangs() {
+  form.value.subtitleLangs = subLangsText.value
+    .split(/[,，\s]+/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+  subLangsText.value = form.value.subtitleLangs.join(', ')
+}
 const health = ref<HealthResult[] | null>(null)
 const checkingHealth = ref(false)
 const portable = ref(false)
@@ -222,6 +231,10 @@ function insertVar(v: string) {
 
           <section class="group card">
             <h3>完成后</h3>
+            <div class="kv">
+              <span>下载后检查文件<small class="mute block">用 ffmpeg 检查视频能否正常读取；损坏时自动清理并重新下载一次。需要安装 ffmpeg</small></span>
+              <el-switch v-model="form.verifyDownloads" />
+            </div>
             <div class="kv"><span>全部完成后打开下载文件夹</span><el-switch v-model="form.openFolderOnDone" /></div>
             <div class="kv"><span>有下载任务时阻止系统休眠</span><el-switch v-model="form.preventSleep" /></div>
             <div class="kv">
@@ -260,6 +273,52 @@ function insertVar(v: string) {
               <label>额外识别的网站</label>
               <el-input v-model="domainsText" type="textarea" :rows="3" size="small" class="mono" placeholder="youtube.com" @change="saveDomains" />
               <small class="mute">每行一个域名，同时匹配子域名。</small>
+            </div>
+          </section>
+          <section class="group card">
+            <h3>收到的链接</h3>
+            <small class="mute">手机、浏览器扩展发来的链接和手动解析失败的链接会记录在“媒体库 → 收到的链接”，可以随时重试。</small>
+            <div class="kv">
+              <span>记录剪贴板识别到的链接<small class="mute block">关闭后不再记录剪贴板里的链接</small></span>
+              <el-switch v-model="form.inbox.recordClipboard" />
+            </div>
+            <div class="kv">
+              <span>保留天数<small class="mute block">0 表示不按时间清理；进行中的不会被清理</small></span>
+              <el-input-number v-model="form.inbox.keepDays" :min="0" :max="3650" size="small" />
+            </div>
+            <div class="kv">
+              <span>最多保留条数<small class="mute block">0 表示不限</small></span>
+              <el-input-number v-model="form.inbox.maxItems" :min="0" :max="100000" :step="100" size="small" />
+            </div>
+          </section>
+          <section class="group card">
+            <h3>字幕与弹幕</h3>
+            <small class="mute">解析结果里会列出字幕轨：人工上传的字幕、YouTube 的自动生成字幕和偏好语言的自动翻译、B站的 CC / AI 字幕（需要登录）和弹幕。</small>
+            <div class="field">
+              <label>偏好语言（靠前的优先）</label>
+              <el-input v-model="subLangsText" size="small" class="mono" placeholder="zh, en" @change="saveSubLangs" />
+              <small class="mute">用逗号分隔，如 <span class="mono">zh, en, ja</span>。<span class="mono">zh</span> 同时匹配简体、繁体等变体。偏好语言的字幕在列表里排前面，也是“自动选中”的依据。</small>
+            </div>
+            <div class="kv">
+              <span>下载视频时同时处理字幕<small class="mute block">对剪贴板自动下载、播放列表和订阅生效；解析页里也会默认选中偏好语言的字幕</small></span>
+              <el-select v-model="form.subtitleMode" size="small" class="sel">
+                <el-option value="off" label="不处理" />
+                <el-option value="file" label="保存为字幕文件" />
+                <el-option value="embed" label="内嵌到视频" />
+                <el-option value="burn" label="烧录进画面" />
+              </el-select>
+            </div>
+            <div class="kv">
+              <span>包含自动生成和自动翻译的字幕<small class="mute block">YouTube 没有人工字幕时很有用，质量不如人工字幕</small></span>
+              <el-switch v-model="form.subtitleAuto" />
+            </div>
+            <div class="kv">
+              <span>VTT 字幕转成 SRT<small class="mute block">SRT 是播放器和剪辑软件通用的格式；自动字幕的重复滚动文字也会一并整理</small></span>
+              <el-switch v-model="form.subtitleConvert" />
+            </div>
+            <div class="kv">
+              <span>B站弹幕转成 ASS<small class="mute block">播放器（PotPlayer、VLC、mpv 等）可以直接显示滚动弹幕；关闭则保存 XML 原文</small></span>
+              <el-switch v-model="form.danmakuAss" />
             </div>
           </section>
           <section class="group card">

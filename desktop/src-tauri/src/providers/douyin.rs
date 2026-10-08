@@ -144,6 +144,7 @@ pub fn parse_item(item: &Value, id: &str, source_url: &str) -> AppResult<MediaIn
         assets,
         entries: vec![],
         series: None,
+        chapters: vec![],
         extractor: Some("native".into()),
     })
 }

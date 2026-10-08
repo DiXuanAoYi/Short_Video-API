@@ -77,6 +77,7 @@ pub fn parse_response(data: &Value, source_url: &str) -> AppResult<MediaInfo> {
         assets,
         entries: vec![],
         series: None,
+        chapters: vec![],
         extractor: Some("remote".into()),
     })
 }

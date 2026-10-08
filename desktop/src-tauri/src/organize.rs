@@ -86,7 +86,18 @@ pub async fn embed(st: &AppState, media: &MediaInfo, input: &Path, output: &Path
     let cover = cover.filter(|_| supports_cover(&ext));
     let mut args: Vec<String> = vec!["-hide_banner".into(), "-loglevel".into(), "error".into(), "-y".into(), "-i".into(), input.to_string_lossy().into_owned()];
     if let Some(c) = cover {
-        args.extend(["-i".into(), c.to_string_lossy().into_owned(), "-map".into(), "0:v?".into(), "-map".into(), "0:a?".into(), "-map".into(), "1".into()]);
+        args.extend([
+            "-i".into(),
+            c.to_string_lossy().into_owned(),
+            "-map".into(),
+            "0:v?".into(),
+            "-map".into(),
+            "0:a?".into(),
+            "-map".into(),
+            "0:s?".into(),
+            "-map".into(),
+            "1".into(),
+        ]);
         args.extend(["-c".into(), "copy".into()]);
         // 封面是最后一路视频流
         let cover_idx = if ext == "mp3" || ext == "m4a" { 0 } else { 1 };
@@ -198,6 +209,7 @@ mod tests {
             assets: vec![],
             entries: vec![],
             series: Some(SeriesInfo { name: "合集".into(), season: None, episode: Some(3) }),
+            chapters: vec![],
             extractor: None,
         }
     }

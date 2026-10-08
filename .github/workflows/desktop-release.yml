@@ -1,6 +1,6 @@
 name: desktop-release
 
-# 推送 desktop-v* 标签（例如 desktop-v0.1.0）时构建三平台安装包，并创建草稿 Release。
+# 推送 desktop-v* 标签（例如 desktop-v0.1.0）或手动运行时，构建三平台安装包和浏览器扩展，并发布 Release。
 on:
   push:
     tags: ['desktop-v*']
@@ -78,6 +78,12 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           CLEARCLIP_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
         run: |
+          # 没有配置 Apple 开发者证书时，在 macOS 上做临时（ad-hoc）签名。
+          # 完全没有签名的 .app 在 Apple 芯片上会被系统提示“已损坏，无法打开”；
+          # 临时签名后提示变为“无法验证开发者”，可在“系统设置 → 隐私与安全性”中点“仍要打开”。
+          if [ "$RUNNER_OS" = "macOS" ] && [ -z "$APPLE_CERTIFICATE" ] && [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+            APPLE_SIGNING_IDENTITY="-"
+          fi
           for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD CLEARCLIP_UPDATER_PUBKEY; do
             value="${!name}"
             if [ -n "$value" ]; then
@@ -105,16 +111,28 @@ jobs:
             | macOS（M 系列芯片） | `ClearClip_<版本>_aarch64.dmg` |
             | macOS（Intel 芯片） | `ClearClip_<版本>_x64.dmg` |
             | Linux | `.AppImage`（赋予执行权限后直接运行）或 `.deb` |
+            | 浏览器扩展（Chrome / Edge / Firefox） | `ClearClip-extension-<版本>.zip`，解压后按 [扩展说明](https://github.com/DiXuanAoYi/Short_Video-API/tree/main/desktop/extension) 加载 |
 
             首次运行说明：
             - Windows：安装包未做代码签名，如出现“Windows 已保护你的电脑”，点“更多信息 → 仍要运行”。
-            - macOS：未签名版本首次打开会被拦截，在“系统设置 → 隐私与安全性”中点“仍要打开”；或在终端执行 `xattr -cr /Applications/ClearClip.app`。
+            - macOS：安装包未经 Apple 公证。首次打开如果被拦截，到“系统设置 → 隐私与安全性”，在页面下方点“仍要打开”；如果提示“已损坏，无法打开”，在终端执行 `xattr -cr /Applications/ClearClip.app` 后再打开。
             - YouTube 等网站需要的 yt-dlp、ffmpeg 组件在“设置 → 组件”中一键安装，国内网络可填写 GitHub 镜像。
 
             仅用于下载你有权保存的内容。
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }} ${{ steps.updater.outputs.args }}
+
+      # macOS：校验 .app 的签名完整（没有签名或签名损坏时系统会提示“已损坏”）
+      - name: Verify macOS app signature
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        run: |
+          app=$(find desktop/src-tauri/target -type d -name "ClearClip.app" -path "*bundle/macos*" | head -n 1)
+          echo "app: $app"
+          codesign -dv --verbose=2 "$app" 2>&1 | grep -E "Identifier|Signature|Authority|flags" || true
+          codesign --verify --deep --strict --verbose=2 "$app"
+          lipo -archs "$app/Contents/MacOS/clearclip"
 
       # Windows 便携版：免安装 zip，数据保存在程序目录的 data 文件夹（旁边放一个 portable 文件即启用）
       - name: Upload Windows portable zip
@@ -130,3 +148,15 @@ jobs:
           Set-Content -Path "$dir/portable" -Value "设置、数据和日志保存在本目录的 data 文件夹。删除此文件则改用系统应用数据目录。"
           Compress-Archive -Path $dir -DestinationPath "$dir-windows-x64.zip" -Force
           gh release upload "desktop-v$version" "$dir-windows-x64.zip" --clobber
+
+      # 浏览器扩展：打包为 zip，可直接上传到扩展商店，或解压后以开发者模式加载
+      - name: Upload browser extension zip
+        if: matrix.platform == 'ubuntu-22.04'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(jq -r .version desktop/src-tauri/tauri.conf.json)
+          ext=$(jq -r .version desktop/extension/manifest.json)
+          (cd desktop/extension && zip -r -X "$GITHUB_WORKSPACE/ClearClip-extension-$ext.zip" . -x README.md)
+          gh release upload "desktop-v$version" "ClearClip-extension-$ext.zip" --clobber

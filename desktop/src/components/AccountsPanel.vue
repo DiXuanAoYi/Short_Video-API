@@ -1,12 +1,13 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { open } from '@tauri-apps/plugin-dialog'
 import { api, errorText } from '../api'
 import { useAppStore } from '../stores/app'
 import type { AccountSummary } from '../types'
-import { formatDateTime } from '../utils/format'
+import { formatDateTime, formatRelative } from '../utils/format'
+import { METHOD_NAME, SITE_GUIDES, guideFor, type LoginMethod } from '../utils/siteGuides'
 
 const app = useAppStore()
 const accounts = ref<AccountSummary[]>([])
@@ -18,12 +19,40 @@ const pasteVisible = ref(false)
 const pasteText = ref('')
 const busy = ref(false)
 
-/** 谷歌系网站会拦截内嵌浏览器登录，只能导入 Cookie。 */
-const GOOGLE_SITES = ['youtube.com', 'google.com']
-
 const providers = computed(() => app.info?.providers ?? [])
+/** 内置平台以外、有登录说明的常用网站 */
+const extraSites = computed(() => SITE_GUIDES.filter((g) => !providers.value.some((p) => p.id === g.site)))
 const targetSite = computed(() => (site.value === 'other' ? normalizeDomain(customDomain.value) : site.value))
-const loginBlocked = computed(() => GOOGLE_SITES.includes(targetSite.value))
+const guide = computed(() => (targetSite.value ? guideFor(targetSite.value) : null))
+/** 谷歌系网站会拦截内嵌浏览器登录，只能用扩展或导入 Cookie。 */
+const loginBlocked = computed(() => !!guide.value?.embeddedBlocked)
+const recommended = computed<LoginMethod | null>(() => guide.value?.methods[0] ?? null)
+const methodsEl = ref<HTMLElement | null>(null)
+const methodsText = computed(() => (guide.value?.methods ?? []).map((m) => METHOD_NAME[m]).join(' → '))
+
+/** 选择网站：已知网站直接选中，其他填到“其他网站” */
+function selectSite(s: string) {
+  const known = providers.value.some((p) => p.id === s) || extraSites.value.some((g) => g.site === s)
+  if (known) site.value = s
+  else {
+    site.value = 'other'
+    customDomain.value = s
+  }
+}
+
+// 从出错提示跳过来：选中网站，能用内置登录时直接打开登录窗口
+watch(
+  () => app.loginRequest,
+  async (req) => {
+    if (!req) return
+    app.loginRequest = null
+    selectSite(req)
+    await nextTick()
+    methodsEl.value?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    if (!loginBlocked.value && recommended.value === 'embedded') await openLogin()
+  },
+  { immediate: true },
+)
 const now = () => Math.floor(Date.now() / 1000)
 
 function normalizeDomain(v: string) {
@@ -53,12 +82,22 @@ async function load() {
   accounts.value = await api.listAccounts()
 }
 let unlistenAccounts: UnlistenFn | undefined
+let unlistenLogin: UnlistenFn | undefined
 onMounted(async () => {
   await load()
-  // 浏览器扩展同步 Cookie 后刷新
+  // 浏览器扩展同步 Cookie、定期检查登录状态后刷新
   unlistenAccounts = await listen('accounts://updated', load)
+  // 登录窗口自动识别到登录完成
+  unlistenLogin = await listen<string>('login://auto-saved', async (e) => {
+    if (e.payload === targetSite.value) loginOpen.value = false
+    await load()
+    ElMessage.success('已识别到登录，登录状态已自动保存')
+  })
 })
-onUnmounted(() => unlistenAccounts?.())
+onUnmounted(() => {
+  unlistenAccounts?.()
+  unlistenLogin?.()
+})
 
 async function run(fn: () => Promise<AccountSummary[] | void>, ok?: string) {
   busy.value = true
@@ -85,7 +124,7 @@ async function openLogin() {
   const s = requireSite()
   if (!s) return
   await run(async () => {
-    await api.openLogin(s, site.value === 'other' ? `https://www.${s}/` : undefined)
+    await api.openLogin(s, site.value === 'other' ? `https://www.${s}/` : undefined, label.value.trim() || undefined)
     loginOpen.value = true
   })
 }
@@ -113,9 +152,19 @@ async function importPaste() {
   pasteText.value = ''
 }
 
-/** 支持检查登录状态的平台 */
-const CHECKABLE = ['bilibili', 'weibo']
 const checking = ref<string | null>(null)
+
+function validText(a: AccountSummary) {
+  if (a.valid === null || !a.checkedAt) return ''
+  return a.valid ? `登录有效（${formatRelative(a.checkedAt)}检查）` : `登录已失效（${formatRelative(a.checkedAt)}检查）`
+}
+
+function relogin(a: AccountSummary) {
+  label.value = a.label === '默认' ? '' : a.label
+  selectSite(a.site)
+  nextTick(() => methodsEl.value?.scrollIntoView({ behavior: 'smooth', block: 'center' }))
+  if (!guideFor(a.site).embeddedBlocked) openLogin()
+}
 
 async function check(a: AccountSummary) {
   checking.value = a.id
@@ -176,10 +225,12 @@ async function remove(a: AccountSummary) {
           <small class="mute">
             {{ a.cookieCount }} 个 Cookie · 更新于 {{ formatDateTime(a.updatedAt) }} ·
             <span :class="expiryClass(a)">{{ expiryText(a) }}</span>
+            <template v-if="validText(a)"> · <span :class="a.valid ? 'ok' : 'bad'">{{ validText(a) }}</span></template>
           </small>
         </div>
         <div class="ops">
-          <el-button v-if="CHECKABLE.includes(a.site)" link size="small" :loading="checking === a.id" @click="check(a)">检测</el-button>
+          <el-button v-if="a.valid === false || expiryClass(a) === 'bad'" link size="small" type="primary" @click="relogin(a)">重新登录</el-button>
+          <el-button v-if="a.checkable" link size="small" :loading="checking === a.id" @click="check(a)">检测</el-button>
           <el-button v-if="!a.isDefault" link size="small" type="primary" @click="makeDefault(a)">设为默认</el-button>
           <el-button link size="small" @click="rename(a)">重命名</el-button>
           <el-button link size="small" @click="remove(a)">删除</el-button>
@@ -192,30 +243,40 @@ async function remove(a: AccountSummary) {
       <div class="row">
         <el-select v-model="site" size="small" class="site">
           <el-option v-for="p in providers" :key="p.id" :value="p.id" :label="p.name" />
-          <el-option value="youtube.com" label="YouTube" />
-          <el-option value="pornhub.com" label="Pornhub" />
+          <el-option v-for="g in extraSites" :key="g.site" :value="g.site" :label="g.name" />
           <el-option value="other" label="其他网站…" />
         </el-select>
         <el-input v-if="site === 'other'" v-model="customDomain" size="small" placeholder="网站域名，例如 x.com" class="domain" />
         <el-input v-model="label" size="small" placeholder="账号名称（可选），例如“大会员”" class="label-input" />
       </div>
 
+      <div v-if="guide" class="guide">
+        <div><span class="mute">不登录：</span>{{ guide.anonymous }}</div>
+        <div><span class="mute">需要登录：</span>{{ guide.needLogin }}</div>
+        <div>
+          <span class="mute">推荐方式：</span>{{ methodsText }}<template v-if="guide.loginTip">。{{ guide.loginTip }}</template>
+        </div>
+        <a class="link" @click="api.openUrl(`https://github.com/${app.info?.repo ?? 'DiXuanAoYi/Short_Video-API'}/blob/main/docs/login-guide.md`)">各网站登录说明</a>
+      </div>
+
       <el-alert v-if="loginBlocked" type="info" :closable="false" show-icon>
-        <template #title>谷歌会拦截内置登录窗口，YouTube 请导入 cookies.txt</template>
-        建议用浏览器的无痕 / 隐私窗口登录 YouTube，用 Cookie 导出扩展导出 cookies.txt 后关闭该窗口，不要再在浏览器里使用这次登录，否则 Cookie 很快会失效。
+        <template #title>{{ guide?.name }}会拦截内置登录窗口，请用浏览器扩展同步或导入 cookies.txt</template>
+        建议在浏览器的无痕 / 隐私窗口里登录，同步或导出 Cookie 后关闭该窗口，不要再在浏览器里使用这次登录，否则 Cookie 很快会失效。
       </el-alert>
 
-      <div class="methods">
-        <div class="method">
-          <b>内置登录窗口</b>
-          <small class="mute">在弹出的官网窗口里登录，完成后点“保存登录状态”。</small>
+      <div ref="methodsEl" class="methods">
+        <div class="method" :class="{ rec: recommended === 'embedded' }">
+          <b>内置登录窗口<span v-if="recommended === 'embedded'" class="chip rec-chip">推荐</span></b>
+          <small class="mute">
+            在弹出的官网窗口里登录。{{ guide?.autoDetect ? '登录完成后会自动保存并关闭窗口，也可以手动点“保存登录状态”。' : '完成后点“保存登录状态”。' }}
+          </small>
           <div class="row">
             <el-button v-if="!loginOpen" size="small" :disabled="loginBlocked" :loading="busy" @click="openLogin">打开登录窗口</el-button>
             <el-button v-else size="small" type="primary" :loading="busy" @click="saveLogin">保存登录状态</el-button>
           </div>
         </div>
-        <div class="method">
-          <b>导入 cookies.txt</b>
+        <div class="method" :class="{ rec: recommended === 'cookies' }">
+          <b>导入 cookies.txt<span v-if="recommended === 'cookies'" class="chip rec-chip">推荐</span></b>
           <small class="mute">Netscape 格式，可用浏览器扩展导出；会按网站自动分组保存。</small>
           <div class="row"><el-button size="small" :loading="busy" @click="importFile">选择文件…</el-button></div>
         </div>
@@ -224,8 +285,8 @@ async function remove(a: AccountSummary) {
           <small class="mute">粘贴 cookies.txt 内容，或请求头里的 Cookie 字符串。</small>
           <div class="row"><el-button size="small" @click="pasteVisible = true">粘贴…</el-button></div>
         </div>
-        <div class="method">
-          <b>浏览器扩展同步</b>
+        <div class="method" :class="{ rec: recommended === 'extension' }">
+          <b>浏览器扩展同步<span v-if="recommended === 'extension'" class="chip rec-chip">推荐</span></b>
           <small class="mute">安装“发送到清影”扩展，在已登录的网站上点“同步此网站的登录 Cookie”，适合 YouTube 等拦截内置登录窗口的网站。</small>
           <div class="row"><el-button size="small" @click="app.goSettings('phone')">设置扩展</el-button></div>
         </div>
@@ -334,6 +395,30 @@ h3 {
 }
 .warn {
   color: #d9a441;
+}
+.ok {
+  color: var(--cc-ok);
+}
+.guide {
+  font-size: 12px;
+  line-height: 1.7;
+  background: var(--cc-side);
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+.link {
+  color: var(--cc-acc);
+  cursor: pointer;
+  font-size: 12px;
+}
+.method.rec {
+  border-color: var(--cc-acc);
+}
+.rec-chip {
+  margin-left: 6px;
+  border-color: var(--cc-acc);
+  color: var(--cc-acc);
+  font-weight: 400;
 }
 .bad {
   color: var(--cc-err);

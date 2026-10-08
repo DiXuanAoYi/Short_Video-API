@@ -14,7 +14,7 @@ use crate::engine::hls::{self as hls_engine, HlsOptions};
 use crate::engine::http::{self as http_engine, HttpOptions, HttpRequest};
 use crate::engine::{wait_ctrl, DlError, ResumeMeta, CTRL_CANCEL, CTRL_PAUSE, CTRL_RUN};
 use crate::error::ErrorKind;
-use crate::model::{AppResult, Asset, AssetKind, MediaInfo, Protocol};
+use crate::model::{AppResult, Asset, AssetKind, Chapter, Clip, MediaInfo, Protocol};
 use crate::settings::{ConflictPolicy, Settings};
 use crate::{naming, postprocess, providers, AppState};
 
@@ -71,6 +71,16 @@ pub struct PostOptions {
     pub extract_audio: Option<String>,
     /// 写入封面和标题等元数据
     pub embed_metadata: bool,
+    /// 字幕文件的目标格式（`srt` / `ass`），为空表示保持原样。由加入队列时根据设置决定，重启后保持一致
+    pub sub_to: Option<String>,
+    /// 内嵌或烧录进视频的字幕（解析结果里选中的字幕轨）
+    pub embed_subs: Vec<Asset>,
+    /// `soft` 内嵌为可切换的字幕轨 / `burn` 烧录进画面
+    pub sub_mode: Option<String>,
+    /// 只保留这个时间段
+    pub clip: Option<Clip>,
+    /// 按这些章节另外拆分成多个文件（保留完整文件）
+    pub split_chapters: Vec<Chapter>,
 }
 
 /// 一个下载任务的内容：一个或多个输入（音视频分离时为视频轨 + 音频轨），完成后合并为一个文件。
@@ -113,6 +123,8 @@ pub struct TaskSnapshot {
     pub id: i64,
     pub platform: String,
     pub platform_name: String,
+    /// 登录用的网站（内置平台 ID 或域名），出现“需要登录”时用来打开对应的登录窗口
+    pub site: String,
     pub media_id: String,
     pub title: String,
     pub author: String,
@@ -128,6 +140,8 @@ pub struct TaskSnapshot {
     pub error: Option<String>,
     pub error_kind: Option<ErrorKind>,
     pub note: Option<String>,
+    /// 下载成功但有附带问题（如字幕没有处理成功），完成后仍显示
+    pub warning: Option<String>,
     pub resumable: Option<bool>,
     /// 当前步骤：download / merge / post
     pub step: Option<String>,
@@ -314,6 +328,7 @@ fn snapshot_for(id: i64, media: &MediaInfo, spec: &JobSpec, path: &str, status: 
         id,
         platform: media.platform.clone(),
         platform_name: media.platform_name.clone(),
+        site: crate::inbox::site_for(&media.source_url),
         media_id: media.id.clone(),
         title: media.title.clone(),
         author: media.author.clone(),
@@ -329,6 +344,7 @@ fn snapshot_for(id: i64, media: &MediaInfo, spec: &JobSpec, path: &str, status: 
         error: None,
         error_kind: None,
         note: None,
+        warning: None,
         resumable: None,
         step: None,
         inputs: spec.inputs.len(),
@@ -378,10 +394,53 @@ pub struct EnqueueExtra {
     pub sub_item: Option<(i64, String)>,
 }
 
+/// 这个任务适用的后处理选项：字幕转换、内嵌、裁剪、章节只对相应类型的资源有意义。
+fn post_for(post: &PostOptions, asset: &Asset, settings: &Settings) -> PostOptions {
+    let mut p = post.clone();
+    match asset.kind {
+        AssetKind::Video => {
+            p.sub_to = None;
+        }
+        AssetKind::Audio => {
+            p.sub_to = None;
+            p.embed_subs.clear();
+            p.sub_mode = None;
+            p.split_chapters.clear();
+        }
+        AssetKind::Subtitle => {
+            // 有裁剪区间时 VTT 一律转 SRT，才能同步裁剪
+            let convert = settings.subtitle_convert || post.clip.is_some();
+            let to = crate::subtitle::target_ext(&asset.ext, convert, settings.danmaku_ass);
+            p.sub_to = (to != asset.ext).then_some(to);
+            p = PostOptions { sub_to: p.sub_to, clip: post.clip.clone(), ..Default::default() };
+        }
+        AssetKind::Image | AssetKind::Cover => {
+            p = PostOptions::default();
+        }
+    }
+    p
+}
+
 pub fn enqueue_ext(app: &AppHandle, media: MediaInfo, asset_ids: &[String], post: PostOptions, extra: EnqueueExtra) -> AppResult<EnqueueResult> {
     let st = state(app);
     let settings = st.settings();
     let media = Arc::new(media);
+    // 内嵌 / 烧录：选中的字幕不单独下载，交给视频任务处理（没有同时选视频时仍作为文件保存）
+    let mut post = post;
+    let mut asset_ids: Vec<String> = asset_ids.to_vec();
+    let is_sub = |id: &String| media.asset(id).is_some_and(|a| a.kind == AssetKind::Subtitle);
+    let has_video = asset_ids.iter().any(|id| media.asset(id).is_some_and(|a| a.kind == AssetKind::Video));
+    match (post.sub_mode.as_deref(), has_video) {
+        (Some("soft" | "burn"), true) if asset_ids.iter().any(is_sub) => {
+            post.embed_subs = asset_ids.iter().filter(|id| is_sub(id)).filter_map(|id| media.asset(id).cloned()).collect();
+            asset_ids.retain(|id| !is_sub(id));
+        }
+        _ => {
+            post.sub_mode = None;
+            post.embed_subs.clear();
+        }
+    }
+    let asset_ids = &asset_ids[..];
     let root = extra.dir.clone().unwrap_or_else(|| settings.download_root());
     let mut dir = if extra.dir.is_some() { root } else { naming::target_dir(&root, &media, settings.subfolder_by_platform) };
     let base = match (&extra.template, naming::render_series(&settings.series_template, &media)) {
@@ -398,7 +457,7 @@ pub fn enqueue_ext(app: &AppHandle, media: MediaInfo, asset_ids: &[String], post
     {
         let mut list = st.downloads.lock();
         for mut spec in build_specs(&media, asset_ids) {
-            spec.post = post.clone();
+            spec.post = post_for(&post, spec.primary(), &settings);
             spec.origin = extra.origin.clone();
             spec.sub_item = extra.sub_item.clone();
             let primary = spec.primary().clone();
@@ -419,6 +478,9 @@ pub fn enqueue_ext(app: &AppHandle, media: MediaInfo, asset_ids: &[String], post
             let mut out_asset = primary.clone();
             if spec.inputs.len() > 1 && settings.merge_container == "mkv" {
                 out_asset.ext = "mkv".into();
+            }
+            if let Some(to) = &spec.post.sub_to {
+                out_asset.ext = to.clone();
             }
             if let Some(fmt) = &spec.post.extract_audio {
                 out_asset.ext = fmt.clone();
@@ -461,6 +523,11 @@ pub fn enqueue_ext(app: &AppHandle, media: MediaInfo, asset_ids: &[String], post
             let meta = JobMeta { inputs: vec![ResumeMeta::default(); spec.inputs.len()] };
             list.push(Entry { snap, spec, media: media.clone(), ctrl, meta });
         }
+    }
+    // 收到的链接里等待处理的同一作品，关联到这些任务
+    let ids: Vec<i64> = result.tasks.iter().map(|t| t.id).collect();
+    if st.db.inbox_link_tasks(&media.platform, &media.id, &ids).unwrap_or(false) {
+        crate::inbox::emit_changed(app);
     }
     schedule(app);
     Ok(result)
@@ -590,7 +657,7 @@ fn with_entry<R>(st: &AppState, id: i64, f: impl FnOnce(&mut Entry) -> R) -> Opt
     list.iter_mut().find(|e| e.snap.id == id).map(f)
 }
 
-fn build_request(st: &AppState, media: &MediaInfo, asset: &Asset) -> HttpRequest {
+pub(crate) fn build_request(st: &AppState, media: &MediaInfo, asset: &Asset) -> HttpRequest {
     let mut req = HttpRequest::new(&asset.url);
     let has = |k: &str| asset.headers.iter().any(|(h, _)| h.eq_ignore_ascii_case(k));
     if !has("referer") {
@@ -605,7 +672,17 @@ fn build_request(st: &AppState, media: &MediaInfo, asset: &Asset) -> HttpRequest
 }
 
 async fn run_task(app: AppHandle, id: i64) {
+    run_task_inner(app, id, true).await
+}
+
+/// `retry_ok`：下载后的文件检查没通过时，允许清理后从头重新下载一次。
+fn run_task_inner(app: AppHandle, id: i64, retry_ok: bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move { run_task_body(app, id, retry_ok).await })
+}
+
+async fn run_task_body(app: AppHandle, id: i64, retry_ok: bool) {
     let st = state(&app);
+    with_entry(&st, id, |e| e.snap.warning = None);
     let Some((mut spec, media, mut rx, mut final_path, mut meta)) =
         with_entry(&st, id, |e| (e.spec.clone(), e.media.clone(), e.ctrl.subscribe(), PathBuf::from(&e.snap.file_path), e.meta.clone()))
     else {
@@ -730,6 +807,61 @@ async fn run_task(app: AppHandle, id: i64) {
             };
         }
     }
+    // 裁剪所选时间段
+    if outcome.is_ok() && matches!(spec.primary().kind, AssetKind::Video | AssetKind::Audio) {
+        if let Some(c) = spec.post.clip.clone() {
+            match postprocess::find_ffmpeg(&st) {
+                None => outcome = Err(DlError::Other(postprocess::ffmpeg_missing().message)),
+                Some(ff) => {
+                    set_step(&st, id, "post");
+                    set_note(&app, id, Some(if c.precise { "正在精确裁剪（重新编码）…" } else { "正在裁剪所选时间段…" }));
+                    let out = suffixed(&final_part, ".clip");
+                    outcome = match postprocess::clip(&ff, &final_part, &out, &final_path, c.start_ms, c.end_ms, c.precise).await {
+                        Ok(()) => {
+                            let _ = std::fs::remove_file(&final_part);
+                            let _ = std::fs::rename(&out, &final_part);
+                            Ok(file_len(&final_part))
+                        }
+                        Err(e) => {
+                            remove_part(&out);
+                            Err(DlError::Other(format!("裁剪失败：{}", e.message)))
+                        }
+                    };
+                }
+            }
+        }
+    }
+    // 内嵌 / 烧录字幕（失败不影响视频本身，原因显示在任务的提示里）
+    if outcome.is_ok() && spec.primary().kind == AssetKind::Video && !spec.post.embed_subs.is_empty() && spec.post.extract_audio.is_none() {
+        let mode = spec.post.sub_mode.clone().unwrap_or_else(|| "soft".into());
+        let warning = match postprocess::find_ffmpeg(&st) {
+            None => Some(format!("字幕未处理：{}", postprocess::ffmpeg_missing().message)),
+            Some(ff) => {
+                set_step(&st, id, "post");
+                set_note(&app, id, Some(if mode == "burn" { "正在把字幕烧录进画面（需要重新编码，较慢）…" } else { "正在内嵌字幕…" }));
+                let work = suffixed(&final_part, ".subs");
+                crate::subtitle_io::VideoSubs {
+                    st: &st,
+                    settings: &settings,
+                    media: &media,
+                    embed: &spec.post.embed_subs,
+                    mode: &mode,
+                    clip: spec.post.clip.as_ref(),
+                    ffmpeg: &ff,
+                    input: &final_part,
+                    final_path: &final_path,
+                    work: &work,
+                }
+                .apply()
+                .await
+            }
+        };
+        if let Some(w) = warning {
+            log::warn!("job {id}: {w}");
+            with_entry(&st, id, |e| e.snap.warning = Some(w));
+        }
+        outcome = Ok(file_len(&final_part));
+    }
     // 写入标题、作者、封面
     let primary = spec.primary();
     let out_ext = final_path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
@@ -759,7 +891,77 @@ async fn run_task(app: AppHandle, id: i64) {
             let _ = std::fs::remove_file(c);
         }
     }
+    // 下载后检查文件能否正常读取；损坏时清理后从头重新下载一次
+    if outcome.is_ok() && settings.verify_downloads && matches!(spec.primary().kind, AssetKind::Video | AssetKind::Audio) {
+        if let Some(ff) = postprocess::find_ffmpeg(&st) {
+            set_step(&st, id, "post");
+            set_note(&app, id, Some("正在检查文件…"));
+            let p = postprocess::probe(&ff, &final_part).await;
+            if !p.readable() {
+                let why = p.error.clone().unwrap_or_else(|| "没有检测到音频或视频".into());
+                if retry_ok {
+                    log::warn!("job {id}: verification failed ({why}), downloading again");
+                    for part in parts.iter().chain(std::iter::once(&final_part)) {
+                        remove_part(part);
+                    }
+                    let n = spec.inputs.len();
+                    let st2 = st.clone();
+                    with_entry(&st, id, |e| {
+                        e.meta = JobMeta { inputs: vec![ResumeMeta::default(); n] };
+                        e.snap.received = 0;
+                        e.snap.total = None;
+                        persist(&st2, e);
+                    });
+                    set_note(&app, id, Some("下载的文件没通过检查，正在重新下载…"));
+                    return run_task_inner(app, id, false).await;
+                }
+                outcome = Err(DlError::Other(format!("下载的文件无法播放（{why}）。请重试；如果反复出现，可能是网站限制了这个资源。")));
+            } else if let (Some(actual), Some(expect), None) = (p.duration_ms, media.duration_ms, spec.post.clip.as_ref()) {
+                // 只提示，不判失败：跳过广告的 m3u8、网站标注的时长不准都会造成差异
+                let ads_skipped = settings.hls_skip_ads && spec.inputs.iter().any(|a| a.protocol == Protocol::Hls);
+                if expect >= 10_000 && actual + 3_000 < expect * 9 / 10 && !ads_skipped {
+                    let w = format!("文件时长 {} 秒，网站标注为 {} 秒，可能不完整", actual / 1000, expect / 1000);
+                    with_entry(&st, id, |e| e.snap.warning = Some(w));
+                }
+            }
+        }
+    }
+    // 按章节另外拆分（保留完整文件）
+    if outcome.is_ok() && !spec.post.split_chapters.is_empty() && matches!(spec.primary().kind, AssetKind::Video | AssetKind::Audio) {
+        if let Some(ff) = postprocess::find_ffmpeg(&st) {
+            set_step(&st, id, "post");
+            set_note(&app, id, Some("正在按章节拆分…"));
+            let chapters = clip_chapters(&spec.post.split_chapters, spec.post.clip.as_ref());
+            let stem = final_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let dir = final_path.parent().map(|p| p.join(format!("{stem} 章节"))).unwrap_or_else(|| PathBuf::from(format!("{stem} 章节")));
+            let ext = final_path.extension().and_then(|e| e.to_str()).unwrap_or("mp4").to_string();
+            let total = chapters.len();
+            let w = match postprocess::split_chapters(&ff, &final_part, &dir, &ext, &chapters).await {
+                Ok(n) if n == total => None,
+                Ok(n) => Some(format!("章节只拆分出 {n}/{total} 个")),
+                Err(e) => Some(format!("章节拆分失败：{}", e.message)),
+            };
+            if let Some(w) = w {
+                with_entry(&st, id, |e| e.snap.warning = Some(w));
+            }
+        } else {
+            with_entry(&st, id, |e| e.snap.warning = Some("章节没有拆分：需要安装 ffmpeg".into()));
+        }
+    }
     finish(&app, &st, id, outcome, &final_part, &final_path, &parts, &settings);
+}
+
+/// 裁剪后章节的时间需要平移：只保留落在区间内的部分，时间从 0 开始。
+pub fn clip_chapters(chapters: &[Chapter], clip: Option<&Clip>) -> Vec<Chapter> {
+    let Some(c) = clip else { return chapters.to_vec() };
+    chapters
+        .iter()
+        .filter_map(|ch| {
+            let start = ch.start_ms.max(c.start_ms);
+            let end = c.end_ms.map_or(ch.end_ms, |e| ch.end_ms.min(e));
+            (end > start + 500).then(|| Chapter { title: ch.title.clone(), start_ms: start - c.start_ms, end_ms: end - c.start_ms })
+        })
+        .collect()
 }
 
 /// 进度上报：限制频率、计算速度、定期写入数据库。
@@ -839,43 +1041,59 @@ async fn download_input(
         }
         let asset = spec.inputs[i].clone();
         let mut reporter = Reporter::new(app, st, id, i, done_before);
-        let res = match asset.protocol {
-            Protocol::Http => {
-                let req = build_request(st, media, &asset);
-                let client = st.net.clients_for(&settings.network, &asset.url).map_err(|e| DlError::Other(e.message))?.download;
-                http_engine::download(&client, &req, part, &mut meta.inputs[i], rx, opts, |received, total, meta_now| {
-                    reporter.update(received, total, None, Some(meta_now))
-                })
-                .await
-            }
-            Protocol::Hls => {
-                let req = build_request(st, media, &asset);
-                let client = st.net.clients_for(&settings.network, &asset.url).map_err(|e| DlError::Other(e.message))?.download;
-                let hopts = HlsOptions {
-                    concurrency: settings.hls_concurrency,
-                    skip_ads: settings.hls_skip_ads,
-                    speed_limit_kbps: settings.speed_limit_kbps,
-                    disk_reserve: opts.disk_reserve,
-                    net: opts.net.clone(),
-                };
-                hls_engine::download(&client, &req, part, rx, &hopts, |received, total| reporter.update(received, total, None, None)).await.map(|r| {
-                    *fmp4 = r.fmp4;
-                    if r.skipped_ads > 0 {
-                        log::info!("job {id}: skipped {} ad segments", r.skipped_ads);
+        let res = if asset.kind == AssetKind::Subtitle {
+            // 字幕文件很小：直接取回并按设置转换（不走分段下载引擎）
+            match crate::subtitle_io::fetch_converted(st, settings, media, &asset, spec.post.sub_to.as_deref(), spec.post.clip.as_ref()).await {
+                Ok((text, _)) => match tokio::fs::write(part, text.as_bytes()).await {
+                    Ok(()) => {
+                        let len = text.len() as u64;
+                        meta.inputs[i] = ResumeMeta { total: Some(len), ..Default::default() };
+                        reporter.update(len, Some(len), None, None);
+                        Ok(len)
                     }
-                    meta.inputs[i] = ResumeMeta { total: Some(r.size), ..Default::default() };
-                    r.size
-                })
+                    Err(e) => Err(DlError::Io(format!("无法保存字幕：{e}"))),
+                },
+                Err(e) => Err(e),
             }
-            Protocol::Ytdlp => {
-                let ctx = st.parse_ctx(settings);
-                let format_id = asset.format_id.clone().unwrap_or_else(|| "best".into());
-                let page = if media.source_url.is_empty() { asset.url.clone() } else { media.source_url.clone() };
-                providers::ytdlp::download(&ctx, &page, &format_id, &asset.ext, part, rx, settings.speed_limit_kbps, |p| {
-                    reporter.update(p.downloaded, p.total, p.speed, None)
-                })
-                .await
-                .inspect(|size| meta.inputs[i] = ResumeMeta { total: Some(*size), ..Default::default() })
+        } else {
+            match asset.protocol {
+                Protocol::Http => {
+                    let req = build_request(st, media, &asset);
+                    let client = st.net.clients_for(&settings.network, &asset.url).map_err(|e| DlError::Other(e.message))?.download;
+                    http_engine::download(&client, &req, part, &mut meta.inputs[i], rx, opts, |received, total, meta_now| {
+                        reporter.update(received, total, None, Some(meta_now))
+                    })
+                    .await
+                }
+                Protocol::Hls => {
+                    let req = build_request(st, media, &asset);
+                    let client = st.net.clients_for(&settings.network, &asset.url).map_err(|e| DlError::Other(e.message))?.download;
+                    let hopts = HlsOptions {
+                        concurrency: settings.hls_concurrency,
+                        skip_ads: settings.hls_skip_ads,
+                        speed_limit_kbps: settings.speed_limit_kbps,
+                        disk_reserve: opts.disk_reserve,
+                        net: opts.net.clone(),
+                    };
+                    hls_engine::download(&client, &req, part, rx, &hopts, |received, total| reporter.update(received, total, None, None)).await.map(|r| {
+                        *fmp4 = r.fmp4;
+                        if r.skipped_ads > 0 {
+                            log::info!("job {id}: skipped {} ad segments", r.skipped_ads);
+                        }
+                        meta.inputs[i] = ResumeMeta { total: Some(r.size), ..Default::default() };
+                        r.size
+                    })
+                }
+                Protocol::Ytdlp => {
+                    let ctx = st.parse_ctx(settings);
+                    let format_id = asset.format_id.clone().unwrap_or_else(|| "best".into());
+                    let page = if media.source_url.is_empty() { asset.url.clone() } else { media.source_url.clone() };
+                    providers::ytdlp::download(&ctx, &page, &format_id, &asset.ext, part, rx, settings.speed_limit_kbps, |p| {
+                        reporter.update(p.downloaded, p.total, p.speed, None)
+                    })
+                    .await
+                    .inspect(|size| meta.inputs[i] = ResumeMeta { total: Some(*size), ..Default::default() })
+                }
             }
         };
         let m = meta.clone();
@@ -952,6 +1170,7 @@ fn remove_part(p: &Path) {
         let _ = std::fs::remove_file(f);
     }
     let _ = std::fs::remove_dir_all(hls_engine::segment_dir(p));
+    let _ = std::fs::remove_dir_all(suffixed(p, ".subs"));
 }
 
 fn dir_size(dir: &Path) -> u64 {
@@ -1097,6 +1316,7 @@ fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>
     if all_done && done_file.is_some() {
         on_all_done(app, st, settings, done_file.as_ref().map(|(f, _)| f.as_path()));
     }
+    crate::inbox::sync_tasks(app);
     schedule(app);
 }
 
@@ -1267,8 +1487,14 @@ fn all_parts(settings: &Settings, e: &Entry) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = (0..n).map(|i| input_part_path(settings, e.snap.id, fp, i, n)).collect();
     v.push(part_path(fp));
     // yt-dlp 下载时自己的临时文件，以及后处理的中间文件
-    let extra: Vec<PathBuf> =
-        v.iter().flat_map(|p| [suffixed(p, ".remux"), suffixed(p, ".audio"), suffixed(p, ".meta")].into_iter().chain(ytdlp_leftovers(p))).collect();
+    let extra: Vec<PathBuf> = v
+        .iter()
+        .flat_map(|p| {
+            [suffixed(p, ".remux"), suffixed(p, ".audio"), suffixed(p, ".meta"), suffixed(p, ".clip"), suffixed(p, ".embed")]
+                .into_iter()
+                .chain(ytdlp_leftovers(p))
+        })
+        .collect();
     v.extend(extra);
     v
 }
@@ -1425,8 +1651,68 @@ mod tests {
             assets: vec![v1080, v720, audio],
             entries: vec![],
             series: None,
+            chapters: vec![],
             extractor: None,
         }
+    }
+
+    fn asset_of(kind: AssetKind, ext: &str) -> Asset {
+        Asset::base("x", kind, "https://x".into(), "x", ext)
+    }
+
+    #[test]
+    fn post_options_apply_per_asset_kind() {
+        let sub = asset_of(AssetKind::Subtitle, "vtt");
+        let ch = Chapter { title: "c".into(), start_ms: 0, end_ms: 5000 };
+        let post = PostOptions {
+            extract_audio: None,
+            sub_mode: Some("soft".into()),
+            embed_subs: vec![sub.clone()],
+            clip: Some(Clip { start_ms: 1000, end_ms: None, precise: false }),
+            split_chapters: vec![ch],
+            ..Default::default()
+        };
+        let s = Settings::default();
+        let video = post_for(&post, &asset_of(AssetKind::Video, "mp4"), &s);
+        assert_eq!((video.embed_subs.len(), video.sub_mode.as_deref(), video.split_chapters.len()), (1, Some("soft"), 1));
+        assert!(video.clip.is_some() && video.sub_to.is_none());
+        let audio = post_for(&post, &asset_of(AssetKind::Audio, "m4a"), &s);
+        assert!(audio.clip.is_some() && audio.embed_subs.is_empty() && audio.sub_mode.is_none() && audio.split_chapters.is_empty());
+        // 字幕：转换目标按格式决定，裁剪区间保留，其他选项清掉
+        let vtt = post_for(&post, &sub, &s);
+        assert_eq!(vtt.sub_to.as_deref(), Some("srt"));
+        assert!(vtt.clip.is_some() && vtt.embed_subs.is_empty() && vtt.sub_mode.is_none());
+        assert_eq!(post_for(&post, &asset_of(AssetKind::Subtitle, "xml"), &s).sub_to.as_deref(), Some("ass"));
+        assert_eq!(post_for(&post, &asset_of(AssetKind::Subtitle, "json"), &s).sub_to.as_deref(), Some("srt"));
+        assert_eq!(post_for(&post, &asset_of(AssetKind::Subtitle, "srt"), &s).sub_to, None);
+        assert_eq!(post_for(&post, &asset_of(AssetKind::Subtitle, "ass"), &s).sub_to, None);
+        // 关闭转换且没有裁剪：VTT 保持原样；有裁剪时仍要转 SRT 才能同步裁剪
+        let keep = Settings { subtitle_convert: false, danmaku_ass: false, ..Settings::default() };
+        let no_clip = PostOptions::default();
+        assert_eq!(post_for(&no_clip, &sub, &keep).sub_to, None);
+        assert_eq!(post_for(&no_clip, &asset_of(AssetKind::Subtitle, "xml"), &keep).sub_to, None);
+        assert_eq!(post_for(&post, &sub, &keep).sub_to.as_deref(), Some("srt"));
+        assert_eq!(post_for(&post, &asset_of(AssetKind::Image, "jpg"), &s), PostOptions::default());
+        assert_eq!(post_for(&post, &asset_of(AssetKind::Cover, "jpg"), &s), PostOptions::default());
+    }
+
+    #[test]
+    fn chapters_follow_clip() {
+        let chs = vec![
+            Chapter { title: "一".into(), start_ms: 0, end_ms: 10_000 },
+            Chapter { title: "二".into(), start_ms: 10_000, end_ms: 30_000 },
+            Chapter { title: "三".into(), start_ms: 30_000, end_ms: 40_000 },
+        ];
+        assert_eq!(clip_chapters(&chs, None), chs);
+        let clip = Clip { start_ms: 5_000, end_ms: Some(32_000), precise: false };
+        let got = clip_chapters(&chs, Some(&clip));
+        assert_eq!(got.len(), 3);
+        assert_eq!((got[0].start_ms, got[0].end_ms), (0, 5_000));
+        assert_eq!((got[1].start_ms, got[1].end_ms), (5_000, 25_000));
+        assert_eq!((got[2].start_ms, got[2].end_ms), (25_000, 27_000));
+        // 只覆盖了不到半秒的章节被丢弃
+        let clip = Clip { start_ms: 0, end_ms: Some(10_200), precise: false };
+        assert_eq!(clip_chapters(&chs, Some(&clip)).len(), 1);
     }
 
     #[test]

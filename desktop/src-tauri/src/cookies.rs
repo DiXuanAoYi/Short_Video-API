@@ -80,6 +80,11 @@ pub struct Account {
     pub updated_at: i64,
     #[serde(default)]
     pub user_name: Option<String>,
+    /// 最近一次检查登录状态的时间和结果
+    #[serde(default)]
+    pub checked_at: Option<i64>,
+    #[serde(default)]
+    pub valid: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -95,6 +100,11 @@ pub struct AccountSummary {
     /// 最早过期的非会话 Cookie 的过期时间
     pub expires_at: Option<i64>,
     pub is_default: bool,
+    pub checked_at: Option<i64>,
+    /// 最近一次检查的结果：true 有效 / false 已失效 / None 未检查
+    pub valid: Option<bool>,
+    /// 能否检查登录状态（联网验证，或检查登录 Cookie 是否存在）
+    pub checkable: bool,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -194,11 +204,22 @@ impl CookieStore {
                 Some(a) => {
                     a.cookies = cookies;
                     a.updated_at = now;
+                    a.checked_at = None;
+                    a.valid = None;
                     a.id.clone()
                 }
                 None => {
                     let id = format!("{site}-{now}-{}", data.accounts.len());
-                    data.accounts.push(Account { id: id.clone(), site: site.to_string(), label: label.to_string(), cookies, updated_at: now, user_name: None });
+                    data.accounts.push(Account {
+                        id: id.clone(),
+                        site: site.to_string(),
+                        label: label.to_string(),
+                        cookies,
+                        updated_at: now,
+                        user_name: None,
+                        checked_at: None,
+                        valid: None,
+                    });
                     id
                 }
             };
@@ -234,6 +255,32 @@ impl CookieStore {
             }
         }
         self.save()
+    }
+
+    /// 记录检查结果；返回之前的结果。
+    pub fn set_check_result(&self, id: &str, valid: bool, name: Option<String>) -> AppResult<Option<bool>> {
+        let prev = {
+            let mut data = self.data.write().unwrap_or_else(|e| e.into_inner());
+            let Some(a) = data.accounts.iter_mut().find(|a| a.id == id) else { return Ok(None) };
+            let prev = a.valid;
+            a.valid = Some(valid);
+            a.checked_at = Some(crate::db::now());
+            if name.is_some() || !valid {
+                a.user_name = name;
+            }
+            prev
+        };
+        self.save()?;
+        Ok(prev)
+    }
+
+    /// 本地检查：账号里有没有未过期的登录 Cookie。网站不在已知列表时返回 None。
+    pub fn has_login_cookie(&self, id: &str) -> Option<bool> {
+        let data = self.data.read().unwrap_or_else(|e| e.into_inner());
+        let a = data.accounts.iter().find(|a| a.id == id)?;
+        let names = login_cookie_names(&a.site)?;
+        let now = crate::db::now();
+        Some(a.cookies.iter().any(|c| names.contains(&c.name.as_str()) && !c.value.is_empty() && c.expires.map_or(true, |t| t <= 0 || t > now)))
     }
 
     pub fn rename(&self, id: &str, label: &str) -> AppResult<()> {
@@ -282,6 +329,9 @@ impl CookieStore {
                 user_name: a.user_name.clone(),
                 expires_at: a.cookies.iter().filter_map(|c| c.expires).filter(|t| *t > 0).min(),
                 is_default: data.defaults.get(&a.site) == Some(&a.id),
+                checked_at: a.checked_at,
+                valid: a.valid,
+                checkable: providers::by_id(&a.site).is_some_and(|p| ONLINE_CHECK.contains(&p.id())) || login_cookie_names(&a.site).is_some(),
             })
             .collect();
         out.sort_by(|a, b| a.site.cmp(&b.site).then(b.is_default.cmp(&a.is_default)));
@@ -320,6 +370,26 @@ impl CookieStore {
         }
         Ok((sites, total))
     }
+}
+
+/// 支持联网检查登录状态的内置平台。
+pub const ONLINE_CHECK: &[&str] = &["bilibili", "weibo"];
+
+/// 登录后才会出现的 Cookie（任意一个存在即视为已登录）。用于自动识别登录完成和本地检查登录状态。
+/// 访客也会拿到的 Cookie（如微博的 SUB、小红书的 web_session）不能用于判断，这些网站不在列表里。
+pub fn login_cookie_names(site: &str) -> Option<&'static [&'static str]> {
+    let site = site.trim_start_matches("www.");
+    Some(match site {
+        "bilibili" | "bilibili.com" => &["SESSDATA"],
+        "douyin" | "douyin.com" => &["sessionid", "sessionid_ss"],
+        "kuaishou" | "kuaishou.com" => &["kuaishou.server.web_st", "kuaishou.server.webday7_st"],
+        "instagram.com" => &["sessionid"],
+        "x.com" | "twitter.com" => &["auth_token"],
+        "facebook.com" => &["c_user"],
+        "tiktok.com" => &["sessionid", "sessionid_ss"],
+        "youtube.com" => &["SAPISID", "__Secure-3PSID"],
+        _ => return None,
+    })
 }
 
 fn default_account<'a>(data: &'a StoreData, site: &str) -> Option<&'a Account> {
@@ -464,6 +534,39 @@ mod tests {
             secure: false,
             http_only: false,
         }
+    }
+
+    #[test]
+    fn login_cookie_check() {
+        let store = CookieStore::in_memory();
+        // 只有访客 Cookie：不算登录
+        let id = store.upsert("bilibili", "默认", vec![ck("buvid3", "bilibili.com", false)]).unwrap();
+        assert_eq!(store.has_login_cookie(&id), Some(false));
+        // 有登录 Cookie
+        let id = store.upsert("bilibili", "大会员", vec![ck("SESSDATA", "bilibili.com", false)]).unwrap();
+        assert_eq!(store.has_login_cookie(&id), Some(true));
+        // 登录 Cookie 已过期
+        let mut expired = ck("SESSDATA", "bilibili.com", false);
+        expired.expires = Some(100);
+        let id = store.upsert("bilibili", "过期", vec![expired]).unwrap();
+        assert_eq!(store.has_login_cookie(&id), Some(false));
+        // 不在已知列表的网站无法本地检查
+        let id = store.upsert("example.com", "x", vec![ck("sid", "example.com", false)]).unwrap();
+        assert_eq!(store.has_login_cookie(&id), None);
+        assert!(!store.summaries().iter().find(|a| a.id == id).unwrap().checkable);
+    }
+
+    #[test]
+    fn check_result_is_recorded_and_reset_on_new_login() {
+        let store = CookieStore::in_memory();
+        let id = store.upsert("youtube.com", "默认", vec![ck("SAPISID", "youtube.com", false)]).unwrap();
+        assert_eq!(store.set_check_result(&id, false, None).unwrap(), None);
+        let s = store.summaries();
+        assert_eq!(s[0].valid, Some(false));
+        assert!(s[0].checked_at.is_some());
+        // 重新登录保存后，之前的检查结果作废
+        store.upsert("youtube.com", "默认", vec![ck("SAPISID", "youtube.com", false)]).unwrap();
+        assert_eq!(store.summaries()[0].valid, None);
     }
 
     #[test]

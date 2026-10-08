@@ -272,6 +272,38 @@ pub struct Settings {
     pub live_max_recordings: usize,
     /// 自动删除多少天前的直播录像（0 表示不删除）
     pub live_cleanup_days: u32,
+    /// 收到的链接（收件箱）
+    pub inbox: InboxSettings,
+    /// 字幕偏好语言，靠前的优先（`zh` 同时匹配简体、繁体等变体）
+    pub subtitle_langs: Vec<String>,
+    /// 解析时包含自动生成和自动翻译的字幕（YouTube）
+    pub subtitle_auto: bool,
+    /// 自动下载时的字幕处理：off 不下载 / file 单独保存字幕文件 / embed 内嵌到视频 / burn 烧录进画面
+    pub subtitle_mode: String,
+    /// VTT 字幕转成 SRT（播放器和剪辑软件通用）
+    pub subtitle_convert: bool,
+    /// B站弹幕 XML 转成 ASS（播放器可直接显示滚动弹幕）
+    pub danmaku_ass: bool,
+    /// 下载完成后用 ffmpeg 检查文件能否正常读取，损坏时自动重新下载一次
+    pub verify_downloads: bool,
+}
+
+/// 收到的链接的记录与保留。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct InboxSettings {
+    /// 记录剪贴板识别到的链接（关闭后只记录手机和浏览器扩展发送的链接）
+    pub record_clipboard: bool,
+    /// 保留多少天（0 表示不按时间清理）
+    pub keep_days: u32,
+    /// 最多保留多少条（0 表示不限）
+    pub max_items: usize,
+}
+
+impl Default for InboxSettings {
+    fn default() -> Self {
+        InboxSettings { record_clipboard: true, keep_days: 30, max_items: 1000 }
+    }
 }
 
 /// 已配对的手机。
@@ -357,6 +389,13 @@ impl Default for Settings {
             launch_at_login: false,
             live_max_recordings: 3,
             live_cleanup_days: 0,
+            inbox: InboxSettings::default(),
+            subtitle_langs: vec!["zh".into(), "en".into()],
+            subtitle_auto: true,
+            subtitle_mode: "off".into(),
+            subtitle_convert: true,
+            danmaku_ass: true,
+            verify_downloads: true,
         }
     }
 }
@@ -394,6 +433,14 @@ impl Settings {
         }
         self.network.rules.retain(|r| !r.pattern.is_empty());
         self.hls_concurrency = self.hls_concurrency.clamp(1, 16);
+        self.inbox.keep_days = self.inbox.keep_days.min(3650);
+        if self.inbox.max_items > 0 {
+            self.inbox.max_items = self.inbox.max_items.clamp(50, 100_000);
+        }
+        self.subtitle_langs = self.subtitle_langs.iter().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).take(12).collect();
+        if !matches!(self.subtitle_mode.as_str(), "off" | "file" | "embed" | "burn") {
+            self.subtitle_mode = "off".into();
+        }
         if !matches!(self.merge_container.as_str(), "mp4" | "mkv") {
             self.merge_container = "mp4".into();
         }

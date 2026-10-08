@@ -3,6 +3,7 @@
 use crate::download::PostOptions;
 use crate::model::{Asset, AssetKind, MediaInfo, MediaKind};
 use crate::settings::{QualityPreset, Settings};
+use crate::subtitle;
 
 fn is_h264(a: &Asset) -> bool {
     a.vcodec.as_deref().is_some_and(|c| {
@@ -38,8 +39,46 @@ pub fn sort_videos(info: &mut MediaInfo, settings: &Settings) {
     info.assets = videos.into_iter().chain(others).collect();
 }
 
+/// 按偏好语言挑选字幕：每个偏好语言取一条（人工字幕优先于自动生成和 AI 字幕），弹幕不在其中。
+pub fn preferred_subtitles(info: &MediaInfo, settings: &Settings) -> Vec<String> {
+    let lang_of = |a: &Asset| a.format_id.clone().or_else(|| a.quality.clone()).unwrap_or_default();
+    let machine = |a: &Asset| a.id.starts_with("auto-") || a.quality.as_deref().is_some_and(|q| q.ends_with(".auto") || q.ends_with(".ai"));
+    let subs: Vec<&Asset> = info.assets.iter().filter(|a| a.kind == AssetKind::Subtitle && a.ext != "xml").collect();
+    let mut out: Vec<String> = vec![];
+    for pref in &settings.subtitle_langs {
+        let best = subs.iter().enumerate().filter(|(_, a)| subtitle::lang_matches(&lang_of(a), pref)).min_by_key(|(i, a)| (machine(a), *i));
+        if let Some((_, a)) = best {
+            if !out.contains(&a.id) {
+                out.push(a.id.clone());
+            }
+        }
+    }
+    out
+}
+
 /// 自动下载（剪贴板、播放列表、订阅）时下载哪些资源，以及后处理选项。
+/// “字幕处理”不为 off 时，同时带上偏好语言的字幕。
 pub fn auto_selection(info: &MediaInfo, settings: &Settings) -> (Vec<String>, PostOptions) {
+    let (mut ids, mut post) = base_selection(info, settings);
+    if settings.subtitle_mode != "off" && ids.iter().any(|id| info.asset(id).is_some_and(|a| a.kind == AssetKind::Video)) {
+        let mut subs = preferred_subtitles(info, settings);
+        // 烧录进画面时多种语言会叠在一起，只用最优先的一种
+        if settings.subtitle_mode == "burn" {
+            subs.truncate(1);
+        }
+        if !subs.is_empty() {
+            ids.extend(subs);
+            post.sub_mode = match settings.subtitle_mode.as_str() {
+                "embed" => Some("soft".into()),
+                "burn" => Some("burn".into()),
+                _ => None,
+            };
+        }
+    }
+    (ids, post)
+}
+
+fn base_selection(info: &MediaInfo, settings: &Settings) -> (Vec<String>, PostOptions) {
     let mut post = PostOptions::default();
     if settings.quality_preset == QualityPreset::Audio && info.kind == MediaKind::Video {
         // 优先下载单独的音频轨；没有时下载视频再提取音频
@@ -95,6 +134,7 @@ mod tests {
             assets,
             entries: vec![],
             series: None,
+            chapters: vec![],
             extractor: None,
         }
     }
@@ -113,6 +153,51 @@ mod tests {
         assert_eq!(first(QualityPreset::Max1080, true), "v1080h");
         assert_eq!(first(QualityPreset::Max1080, false), "v1080h", "higher bitrate wins without codec preference");
         assert_eq!(first(QualityPreset::Small, true), "v360");
+    }
+
+    fn with_subs(mode: &str) -> (MediaInfo, Settings) {
+        let mut i = info();
+        let mut sub = |id: &str, lang: &str, quality: &str| {
+            let mut a = Asset::subtitle(lang, lang, String::new(), "vtt");
+            a.id = id.into();
+            a.quality = Some(quality.into());
+            a.format_id = Some(lang.into());
+            i.assets.push(a);
+        };
+        sub("auto-en", "en-orig", "en.auto");
+        sub("sub-en", "en", "en");
+        sub("sub-ja", "ja", "ja");
+        sub("sub-zh-Hant", "zh-Hant", "zh-Hant");
+        sub("cc-ai-zh", "ai-zh", "zh.ai");
+        let mut danmaku = Asset::base("danmaku", AssetKind::Subtitle, String::new(), "弹幕", "xml");
+        danmaku.quality = Some("danmaku".into());
+        i.assets.push(danmaku);
+        (i, Settings { subtitle_mode: mode.into(), subtitle_langs: vec!["zh".into(), "en".into()], ..Settings::default() })
+    }
+
+    #[test]
+    fn subtitles_follow_preferences() {
+        let (i, s) = with_subs("file");
+        // 中文：繁体人工字幕优先于 AI 中文；英文：人工字幕优先于自动生成；日文和弹幕不在偏好里
+        assert_eq!(preferred_subtitles(&i, &s), vec!["sub-zh-Hant", "sub-en"]);
+        let (ids, post) = auto_selection(&i, &s);
+        assert_eq!(ids, vec!["v360", "sub-zh-Hant", "sub-en"]);
+        assert_eq!(post.sub_mode, None, "file mode keeps subtitles as separate files");
+        let (i, s) = with_subs("embed");
+        assert_eq!(auto_selection(&i, &s).1.sub_mode.as_deref(), Some("soft"));
+        let (i, s) = with_subs("burn");
+        let (ids, post) = auto_selection(&i, &s);
+        assert_eq!(post.sub_mode.as_deref(), Some("burn"));
+        assert_eq!(ids, vec!["v360", "sub-zh-Hant"], "only one language is burned into the picture");
+        let (i, s) = with_subs("off");
+        assert_eq!(auto_selection(&i, &s).0, vec!["v360"]);
+        // 只有机器字幕时也会选
+        let (mut i, s) = with_subs("file");
+        i.assets.retain(|a| a.id != "sub-en" && a.id != "sub-zh-Hant");
+        assert_eq!(preferred_subtitles(&i, &s), vec!["cc-ai-zh", "auto-en"]);
+        // 偏好里没有的语言不下载
+        let s = Settings { subtitle_langs: vec!["fr".into()], ..s };
+        assert!(preferred_subtitles(&i, &s).is_empty());
     }
 
     #[test]

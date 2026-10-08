@@ -4,9 +4,12 @@ import { ElMessage } from 'element-plus'
 import type { UnlistenFn } from '@tauri-apps/api/event'
 import { api, errorText, events } from '../api'
 import { useAppStore, useParseStore } from '../stores/app'
-import type { Asset, BatchProgress, DetectedLink, HistoryItem, MediaInfo } from '../types'
+import type { Asset, BatchProgress, Clip, DetectedLink, HistoryItem, MediaInfo } from '../types'
 import { formatBytes, formatDate, formatDuration } from '../utils/format'
 import ErrorAlert from '../components/ErrorAlert.vue'
+import SubtitlePicker, { type SubMode } from '../components/SubtitlePicker.vue'
+import ClipPicker from '../components/ClipPicker.vue'
+import PlaylistPicker from '../components/PlaylistPicker.vue'
 
 const app = useAppStore()
 const parse = useParseStore()
@@ -44,13 +47,21 @@ async function makeSlideshow() {
   }
 }
 const entrySel = ref<Set<string>>(new Set())
+const downloadedEntries = ref<Set<string>>(new Set())
+const subMode = ref<SubMode>('file')
+const preferredSubs = ref<string[]>([])
+const clip = ref<Clip | null>(null)
+const splitOn = ref(false)
 const batchInfo = ref<BatchProgress | null>(null)
 let unlistenBatch: UnlistenFn | undefined
 
 const result = computed(() => parse.result)
 const images = computed(() => result.value?.assets.filter((a) => a.kind === 'image') ?? [])
 const videoFormats = computed(() => result.value?.assets.filter((a) => a.kind === 'video') ?? [])
-const extras = computed(() => result.value?.assets.filter((a) => a.kind !== 'image' && a.kind !== 'video') ?? [])
+const subtitleAssets = computed(() => result.value?.assets.filter((a) => a.kind === 'subtitle') ?? [])
+const extras = computed(() => result.value?.assets.filter((a) => a.kind !== 'image' && a.kind !== 'video' && a.kind !== 'subtitle') ?? [])
+const videoSelected = computed(() => videoFormats.value.some((v) => selected.value.has(v.id)))
+const canClip = computed(() => !!result.value && !isPlaylist.value && (result.value.kind === 'video' || result.value.kind === 'audio') && !audioOnly.value)
 const videoAsset = computed(() => result.value?.assets.find((a) => a.kind === 'video' && a.protocol === 'http'))
 const entries = computed(() => result.value?.entries ?? [])
 const isPlaylist = computed(() => result.value?.kind === 'playlist')
@@ -65,11 +76,50 @@ const kindText = computed(() => {
 const selectedImages = computed(() => images.value.filter((a) => selected.value.has(a.id)).length)
 const supported = computed(() => (app.info?.providers.map((p) => p.name).join('、') ?? '') + (app.settings?.useYtdlp ? '，其他网站用 yt-dlp' : ''))
 
+async function loadPlaylistState(r: MediaInfo) {
+  downloadedEntries.value = new Set()
+  if (r.kind !== 'playlist' || !r.entries.length) return
+  try {
+    const done = new Set(await api.downloadedEntries(r.platform, r.entries))
+    if (result.value !== r) return
+    downloadedEntries.value = done
+    // 跳过已下载时，默认只选没下载过的，省去逐条解析的时间
+    if (done.size && app.settings?.skipExisting) entrySel.value = new Set(r.entries.filter((e) => !done.has(e.id)).map((e) => e.id))
+  } catch {
+    /* 查不到不影响下载 */
+  }
+}
+
+async function loadPreferredSubs(r: MediaInfo) {
+  preferredSubs.value = []
+  if (!r.assets.some((a) => a.kind === 'subtitle')) return
+  try {
+    const ids = await api.preferredSubtitles(r)
+    if (result.value !== r) return
+    preferredSubs.value = ids
+    // 设置里开启了“下载视频时同时处理字幕”：默认选中偏好语言的字幕
+    if (app.settings?.subtitleMode !== 'off' && ids.length && r.kind === 'video') {
+      const next = new Set(selected.value)
+      ids.forEach((id) => next.add(id))
+      selected.value = next
+    }
+  } catch {
+    /* 没有偏好字幕也能手动选 */
+  }
+}
+
 watch(
   result,
   (r) => {
     selected.value = new Set(r ? defaultSelection(r) : [])
     entrySel.value = new Set(r?.entries.map((e) => e.id) ?? [])
+    clip.value = null
+    splitOn.value = false
+    subMode.value = app.settings?.subtitleMode === 'embed' ? 'soft' : app.settings?.subtitleMode === 'burn' ? 'burn' : 'file'
+    if (r) {
+      loadPlaylistState(r)
+      loadPreferredSubs(r)
+    }
     audioOnly.value = false
     if (r && r.kind === 'video' && app.settings?.qualityPreset === 'audio') {
       // “只要音频”：优先选单独的音频轨，没有时下载视频后提取音频
@@ -104,15 +154,11 @@ function defaultSelection(r: MediaInfo): string[] {
   return first ? [first.id] : []
 }
 
-function toggleEntry(id: string) {
-  const next = new Set(entrySel.value)
-  if (next.has(id)) next.delete(id)
-  else next.add(id)
-  entrySel.value = next
-}
-
-function selectAllEntries(on: boolean) {
-  entrySel.value = new Set(on ? entries.value.map((e) => e.id) : [])
+function pickSubs(ids: string[]) {
+  const next = new Set(selected.value)
+  for (const a of subtitleAssets.value) next.delete(a.id)
+  ids.forEach((id) => next.add(id))
+  selected.value = next
 }
 
 async function downloadEntries() {
@@ -207,7 +253,14 @@ async function download() {
   enqueuing.value = true
   try {
     const fmt = app.settings?.audioFormat ?? 'mp3'
-    const r = await api.enqueue(result.value, ids, { extractAudio: audioOnly.value ? fmt : null, embedMetadata: false })
+    const hasSubs = ids.some((id) => subtitleAssets.value.some((a) => a.id === id))
+    const r = await api.enqueue(result.value, ids, {
+      extractAudio: audioOnly.value ? fmt : null,
+      embedMetadata: false,
+      subMode: hasSubs && subMode.value !== 'file' ? subMode.value : null,
+      clip: canClip.value ? clip.value : null,
+      splitChapters: canClip.value && splitOn.value ? result.value.chapters : [],
+    })
     const added = r.tasks.length
     const parts: string[] = []
     if (r.alreadyQueued) parts.push(`${r.alreadyQueued} 项已在队列中`)
@@ -311,7 +364,7 @@ function sizeText(a: Asset) {
       </el-button>
     </div>
 
-    <ErrorAlert v-if="parse.error" :message="parse.error" :kind="parse.errorKind" />
+    <ErrorAlert v-if="parse.error" :message="parse.error" :kind="parse.errorKind" :site="parse.errorSite" />
 
     <div v-if="parse.loading && !result" class="result card skeleton">
       <el-skeleton animated :rows="5" />
@@ -392,22 +445,21 @@ function sizeText(a: Asset) {
           </button>
         </div>
 
+        <SubtitlePicker
+          v-if="subtitleAssets.length && !isPlaylist"
+          v-model:mode="subMode"
+          :assets="subtitleAssets"
+          :selected="selected"
+          :has-video="videoSelected"
+          :preferred="preferredSubs"
+          @toggle="toggle"
+          @pick="pickSubs"
+        />
+        <ClipPicker v-if="canClip" v-model:clip="clip" v-model:split="splitOn" :duration-ms="result.durationMs" :chapters="result.chapters ?? []" />
+
         <template v-if="isPlaylist">
-          <div class="grid-head">
-            <span>已选 {{ entrySel.size }} / {{ entries.length }} 条</span>
-            <el-button link type="primary" @click="selectAllEntries(entrySel.size < entries.length)">
-              {{ entrySel.size < entries.length ? '全选' : '全不选' }}
-            </el-button>
-          </div>
-          <div class="entries">
-            <label v-for="e in entries" :key="e.id" class="entry" :class="{ on: entrySel.has(e.id) }">
-              <el-checkbox :model-value="entrySel.has(e.id)" @change="toggleEntry(e.id)" />
-              <span class="mono mute idx">{{ e.index }}</span>
-              <span class="ellipsis grow">{{ e.title }}</span>
-              <small v-if="e.durationMs" class="mono mute">{{ formatDuration(e.durationMs) }}</small>
-            </label>
-          </div>
-          <small class="mute">每个条目会按设置里的默认清晰度下载，保存到以列表名命名的文件夹。</small>
+          <PlaylistPicker v-model:selected="entrySel" :entries="entries" :downloaded="downloadedEntries" />
+          <small class="mute">每个条目会按设置里的默认清晰度下载（{{ app.settings?.subtitleMode === 'off' ? '不含字幕' : '同时处理偏好语言的字幕' }}），保存到以列表名命名的文件夹。</small>
           <div class="row">
             <el-button type="primary" :loading="enqueuing" :disabled="!!batchInfo && !batchInfo.finished" @click="downloadEntries">
               {{ batchInfo && !batchInfo.finished ? `解析中 ${batchInfo.done}/${batchInfo.total}` : `下载所选 ${entrySel.size} 条` }}

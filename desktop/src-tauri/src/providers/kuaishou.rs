@@ -171,6 +171,7 @@ pub fn parse_photo(photo: &Value, atlas: Option<&Value>, id: &str, source_url: &
         assets,
         entries: vec![],
         series: None,
+        chapters: vec![],
         extractor: Some("native".into()),
     })
 }

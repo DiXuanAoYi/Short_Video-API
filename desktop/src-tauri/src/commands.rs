@@ -1,6 +1,7 @@
 //! 前端可调用的命令。涉及数据库、文件和网络的命令都是异步命令，不占用界面线程。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
@@ -125,11 +126,32 @@ pub fn detect_links(text: String) -> Vec<DetectedLink> {
 }
 
 #[tauri::command]
-pub async fn resolve_link(state: St<'_>, text: String) -> AppResult<MediaInfo> {
+pub async fn resolve_link(app: AppHandle, state: St<'_>, text: String) -> AppResult<MediaInfo> {
     let settings = state.settings();
-    let info = providers::resolve_text(&state.parse_ctx(&settings), &text).await.inspect_err(|e| log::info!("resolve failed ({:?}): {e}", e.kind))?;
+    let info = match providers::resolve_text(&state.parse_ctx(&settings), &text).await {
+        Ok(info) => info,
+        Err(e) => {
+            log::info!("resolve failed ({:?}): {e}", e.kind);
+            crate::inbox::record_manual_failure(&app, &text, &e);
+            return Err(e);
+        }
+    };
     let _ = state.db.upsert_history(&info);
+    let _ = state.db.inbox_mark_parsed(&text, &info);
     Ok(info)
+}
+
+/// 解析页默认勾选的字幕（按偏好语言）。
+#[tauri::command]
+pub fn preferred_subtitles(state: St<'_>, media: MediaInfo) -> Vec<String> {
+    quality::preferred_subtitles(&media, &state.settings())
+}
+
+/// 播放列表里已经下载过的条目（条目 ID）。
+#[tauri::command]
+pub fn downloaded_entries(state: St<'_>, platform: String, entries: Vec<PlaylistEntry>) -> AppResult<Vec<String>> {
+    let pairs: Vec<(String, String)> = entries.into_iter().map(|e| (e.id, e.url)).collect();
+    state.db.downloaded_entry_ids(&platform, &pairs)
 }
 
 #[tauri::command]
@@ -168,6 +190,9 @@ pub async fn enqueue_entries(app: AppHandle, state: St<'_>, playlist: MediaInfo,
         return Err(AppError::invalid("请至少选择一个条目。"));
     }
     let n = entries.len();
+    if state.db.inbox_playlist_chosen(&playlist.platform, &playlist.id, n).unwrap_or(false) {
+        crate::inbox::emit_changed(&app);
+    }
     let st = state.inner().clone();
     tauri::async_runtime::spawn(async move {
         let settings = st.settings();
@@ -758,38 +783,102 @@ fn login_label(site: &str) -> String {
 }
 
 /// 打开登录窗口。窗口内是网站官网，没有任何调用本程序的权限。
+/// 已知登录 Cookie 的网站会自动识别登录完成：保存账号、关闭窗口并通知前端。
 #[tauri::command]
-pub fn open_login(app: AppHandle, site: String, url: Option<String>) -> AppResult<()> {
-    let label = login_label(&site);
-    if let Some(w) = app.get_webview_window(&label) {
+pub fn open_login(app: AppHandle, site: String, url: Option<String>, label: Option<String>) -> AppResult<()> {
+    let label_win = login_label(&site);
+    if let Some(w) = app.get_webview_window(&label_win) {
         let _ = w.set_focus();
         return Ok(());
     }
     let (name, target) = login_target(&site, url.as_deref())?;
-    WebviewWindowBuilder::new(&app, label, WebviewUrl::External(target))
-        .title(format!("登录{name}：登录完成后回到清影点击“保存登录状态”"))
-        .inner_size(1100.0, 780.0)
-        .build()?;
+    let auto = cookies::login_cookie_names(&site).is_some();
+    let hint = if auto { "登录完成后会自动保存并关闭窗口" } else { "登录完成后回到清影点击“保存登录状态”" };
+    WebviewWindowBuilder::new(&app, label_win, WebviewUrl::External(target)).title(format!("登录{name}：{hint}")).inner_size(1100.0, 780.0).build()?;
+    if auto {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move { watch_login(app, site, label).await });
+    }
     Ok(())
 }
 
-/// 读取登录窗口里属于该网站的全部 Cookie，保存为一个账号，然后关闭登录窗口。
-#[tauri::command]
-pub async fn save_login_cookies(app: AppHandle, state: St<'_>, site: String, label: Option<String>) -> AppResult<Vec<AccountSummary>> {
-    let window = app.get_webview_window(&login_label(&site)).ok_or_else(|| AppError::invalid("登录窗口已关闭。请先点击“打开登录窗口”并完成登录。"))?;
-    let (_, target) = login_target(&site, None).or_else(|_| window.url().map(|u| (site.clone(), u)).map_err(AppError::from))?;
+pub const EVT_LOGIN_SAVED: &str = "login://auto-saved";
+
+/// 登录窗口里属于该网站的 Cookie。
+fn window_cookies(window: &tauri::WebviewWindow, site: &str) -> Vec<cookies::StoredCookie> {
+    let Ok((_, target)) = login_target(site, None).or_else(|_| window.url().map(|u| (site.to_string(), u)).map_err(AppError::from)) else { return vec![] };
     let domain = target.host_str().map(cookies::registrable_domain).unwrap_or_default();
     let mut list: Vec<cookies::StoredCookie> =
         window.cookies().unwrap_or_default().iter().filter_map(cookies::from_webview).filter(|c| cookies::registrable_domain(&c.domain) == domain).collect();
     if list.is_empty() {
-        list = window.cookies_for_url(target)?.iter().filter_map(cookies::from_webview).collect();
+        list = window.cookies_for_url(target).unwrap_or_default().iter().filter_map(cookies::from_webview).collect();
     }
+    list
+}
+
+fn login_cookie_values(list: &[cookies::StoredCookie], names: &[&str]) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> =
+        list.iter().filter(|c| names.contains(&c.name.as_str()) && !c.value.is_empty()).map(|c| (c.name.clone(), c.value.clone())).collect();
+    v.sort();
+    v
+}
+
+/// 等待登录 Cookie 出现（或变化），然后自动保存。最多等 20 分钟；窗口关闭即停止。
+async fn watch_login(app: AppHandle, site: String, label: Option<String>) {
+    let Some(names) = cookies::login_cookie_names(&site) else { return };
+    let win = login_label(&site);
+    // 打开时已有的登录 Cookie（之前登录过）不算，换账号时要等新的登录
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let initial = match app.get_webview_window(&win) {
+        Some(w) => login_cookie_values(&window_cookies(&w, &site), names),
+        None => return,
+    };
+    for _ in 0..800 {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let Some(w) = app.get_webview_window(&win) else { return };
+        let now = login_cookie_values(&window_cookies(&w, &site), names);
+        if now.is_empty() || now == initial {
+            continue;
+        }
+        // 等网站把其余 Cookie 写完
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let state = app.state::<Arc<AppState>>().inner().clone();
+        match save_window_login(&app, &state, &site, label.as_deref()) {
+            Ok(_) => {
+                let _ = app.emit(EVT_LOGIN_SAVED, &site);
+                let _ = app.emit("accounts://updated", ());
+                // 顺便检查一次登录状态（拿到用户名）
+                if let Some(id) =
+                    state.cookies.summaries().into_iter().find(|a| a.site == site && a.label == label.clone().unwrap_or_else(|| "默认".into())).map(|a| a.id)
+                {
+                    if verify_account(&state, &id).await.is_ok() {
+                        let _ = app.emit("accounts://updated", ());
+                    }
+                }
+            }
+            Err(e) => log::warn!("auto-save login for {site} failed: {e}"),
+        }
+        return;
+    }
+}
+
+/// 读取登录窗口里属于该网站的全部 Cookie，保存为一个账号，关闭登录窗口，并重试需要登录的链接。
+fn save_window_login(app: &AppHandle, state: &AppState, site: &str, label: Option<&str>) -> AppResult<()> {
+    let window = app.get_webview_window(&login_label(site)).ok_or_else(|| AppError::invalid("登录窗口已关闭。请先点击“打开登录窗口”并完成登录。"))?;
+    let list = window_cookies(&window, site);
     if list.is_empty() {
         return Err(AppError::need_login("没有读取到 Cookie，请确认已在登录窗口中完成登录。"));
     }
-    state.cookies.upsert(&site, label.as_deref().unwrap_or("默认"), list)?;
+    state.cookies.upsert(site, label.unwrap_or("默认"), list)?;
     let _ = window.close();
     log::info!("saved login cookies for {site}");
+    crate::inbox::retry_after_login(app, site, false);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn save_login_cookies(app: AppHandle, state: St<'_>, site: String, label: Option<String>) -> AppResult<Vec<AccountSummary>> {
+    save_window_login(&app, &state, &site, label.as_deref())?;
     Ok(state.cookies.summaries())
 }
 
@@ -800,23 +889,27 @@ pub fn list_accounts(state: St<'_>) -> Vec<AccountSummary> {
 
 /// 导入 Netscape 格式的 cookies.txt 文件。
 #[tauri::command]
-pub async fn import_cookies_file(state: St<'_>, path: String, label: Option<String>) -> AppResult<Vec<AccountSummary>> {
+pub async fn import_cookies_file(app: AppHandle, state: St<'_>, path: String, label: Option<String>) -> AppResult<Vec<AccountSummary>> {
     let meta = std::fs::metadata(&path)?;
     if meta.len() > 5 * 1024 * 1024 {
         return Err(AppError::invalid("文件过大，不像是 cookies.txt。"));
     }
     let text = std::fs::read_to_string(&path)?;
+    let before: Vec<String> = state.cookies.summaries().into_iter().map(|a| a.id).collect();
     let (sites, n) = state.cookies.import_netscape(&text, label.as_deref().unwrap_or("导入"))?;
     log::info!("imported {n} cookies for {sites} sites");
+    retry_changed_sites(&app, &state, &before);
     Ok(state.cookies.summaries())
 }
 
 /// 导入粘贴的内容：Netscape 格式，或 `a=1; b=2` 形式的 Cookie 头（需要指定网站）。
 #[tauri::command]
-pub async fn import_cookies_text(state: St<'_>, site: String, text: String, label: Option<String>) -> AppResult<Vec<AccountSummary>> {
+pub async fn import_cookies_text(app: AppHandle, state: St<'_>, site: String, text: String, label: Option<String>) -> AppResult<Vec<AccountSummary>> {
     let label = label.unwrap_or_else(|| "手动填写".into());
+    let before: Vec<String> = state.cookies.summaries().into_iter().map(|a| a.id).collect();
     if text.contains('\t') {
         state.cookies.import_netscape(&text, &label)?;
+        retry_changed_sites(&app, &state, &before);
     } else {
         let site = site.trim().to_ascii_lowercase();
         if site.is_empty() {
@@ -825,8 +918,80 @@ pub async fn import_cookies_text(state: St<'_>, site: String, text: String, labe
         let (_, target) = login_target(&site, None)?;
         let domain = target.host_str().map(cookies::registrable_domain).unwrap_or(site.clone());
         state.cookies.upsert(&site, &label, cookies::parse_header(&text, &domain))?;
+        crate::inbox::retry_after_login(&app, &site, false);
     }
     Ok(state.cookies.summaries())
+}
+
+/// 导入 cookies.txt 后：对更新过的网站重试需要登录的链接。
+fn retry_changed_sites(app: &AppHandle, state: &AppState, before: &[String]) {
+    let now = crate::db::now();
+    let mut sites: Vec<String> = state.cookies.summaries().into_iter().filter(|a| !before.contains(&a.id) || now - a.updated_at < 60).map(|a| a.site).collect();
+    sites.dedup();
+    for s in sites {
+        crate::inbox::retry_after_login(app, &s, false);
+    }
+}
+
+// ---------- 收到的链接 ----------
+
+/// 一段文本里的链接需要登录时对应的网站（内置平台 ID 或域名）。
+#[tauri::command]
+pub fn login_site(text: String) -> Option<String> {
+    crate::inbox::primary_url(&text).map(|u| crate::inbox::site_for(&u)).filter(|s| !s.is_empty())
+}
+
+#[tauri::command]
+pub fn inbox_list(app: AppHandle, state: St<'_>, filter: Option<crate::inbox::InboxFilter>) -> AppResult<Vec<crate::inbox::InboxItem>> {
+    crate::inbox::sync_tasks(&app);
+    state.db.inbox_list(&filter.unwrap_or_default())
+}
+
+#[tauri::command]
+pub fn inbox_counts(state: St<'_>) -> AppResult<crate::inbox::InboxCounts> {
+    state.db.inbox_counts()
+}
+
+#[tauri::command]
+pub fn inbox_retry(app: AppHandle, ids: Vec<i64>) -> AppResult<usize> {
+    let mut n = 0;
+    let mut last_err = None;
+    for id in ids {
+        match crate::inbox::retry(&app, id) {
+            Ok(()) => n += 1,
+            Err(e) => last_err = Some(e),
+        }
+    }
+    match (n, last_err) {
+        (0, Some(e)) => Err(e),
+        _ => Ok(n),
+    }
+}
+
+/// 重试全部失败的记录。
+#[tauri::command]
+pub fn inbox_retry_failed(app: AppHandle, state: St<'_>) -> AppResult<usize> {
+    let ids: Vec<i64> = state.db.inbox_with_status("('failed')")?.into_iter().map(|i| i.id).collect();
+    inbox_retry(app, ids)
+}
+
+#[tauri::command]
+pub fn inbox_ignore(app: AppHandle, ids: Vec<i64>) -> AppResult<()> {
+    crate::inbox::ignore(&app, &ids)
+}
+
+#[tauri::command]
+pub fn inbox_delete(app: AppHandle, state: St<'_>, ids: Vec<i64>) -> AppResult<()> {
+    state.db.inbox_delete(&ids)?;
+    crate::inbox::emit_changed(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn inbox_clear(app: AppHandle, state: St<'_>, scope: String) -> AppResult<usize> {
+    let n = state.db.inbox_clear(&scope)?;
+    crate::inbox::emit_changed(&app);
+    Ok(n)
 }
 
 #[tauri::command]
@@ -849,18 +1014,34 @@ pub async fn delete_account(state: St<'_>, id: String) -> AppResult<Vec<AccountS
 
 /// 检查账号是否仍处于登录状态（目前支持 B站、微博），并记录用户名。
 #[tauri::command]
-pub async fn check_account(state: St<'_>, id: String) -> AppResult<providers::AccountStatus> {
-    let site = state.cookies.account_site(&id).ok_or_else(|| AppError::not_found("账号不存在。"))?;
-    let provider = providers::by_id(&site).ok_or_else(|| AppError::unsupported("暂不支持检查这个网站的登录状态。"))?;
-    let settings = state.settings();
-    let mut ctx = state.parse_ctx(&settings);
-    ctx.account = Some(id.clone());
-    let status = provider.account_status(&ctx).await?.ok_or_else(|| AppError::unsupported(format!("暂不支持检查{}的登录状态。", provider.name())))?;
+pub async fn check_account(app: AppHandle, state: St<'_>, id: String) -> AppResult<providers::AccountStatus> {
+    let st = state.inner().clone();
+    let r = verify_account(&st, &id).await;
+    let _ = app.emit("accounts://updated", ());
+    r
+}
+
+/// 检查账号的登录状态并记录结果：支持的平台联网验证，其他已知网站检查登录 Cookie 是否存在且未过期。
+pub async fn verify_account(state: &AppState, id: &str) -> AppResult<providers::AccountStatus> {
+    let site = state.cookies.account_site(id).ok_or_else(|| AppError::not_found("账号不存在。"))?;
+    let online = providers::by_id(&site).filter(|p| cookies::ONLINE_CHECK.contains(&p.id()));
+    let status = match online {
+        Some(provider) => {
+            let settings = state.settings();
+            let mut ctx = state.parse_ctx(&settings);
+            ctx.account = Some(id.to_string());
+            provider.account_status(&ctx).await?.ok_or_else(|| AppError::unsupported(format!("暂不支持检查{}的登录状态。", provider.name())))?
+        }
+        None => {
+            let ok = state.cookies.has_login_cookie(id).ok_or_else(|| AppError::unsupported("暂不支持检查这个网站的登录状态。"))?;
+            providers::AccountStatus { logged_in: ok, user_name: None, vip: None }
+        }
+    };
     let name = match (&status.user_name, &status.vip) {
         (Some(n), Some(v)) => Some(format!("{n}（{v}）")),
         (n, _) => n.clone(),
     };
-    state.cookies.set_user_name(&id, if status.logged_in { name } else { None })?;
+    state.cookies.set_check_result(id, status.logged_in, if status.logged_in { name } else { None })?;
     Ok(status)
 }
 
