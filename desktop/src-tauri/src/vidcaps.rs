@@ -84,10 +84,11 @@ impl Caps {
             notes.push("没有 zscale / tonemap 滤镜，HDR 转 SDR 会使用程序内置的色调映射（3D LUT），效果接近但不如 zscale。".into());
         }
         if !self.vidstab() {
+            let hint = if self.gpl { "" } else { "安装完整版 ffmpeg 后可以使用 vidstab 两遍防抖。" };
             notes.push(if self.has_filter("deshake") {
-                "没有 vidstab，防抖会使用 deshake，效果较弱。安装完整版 ffmpeg 后使用 vidstab 两遍防抖。".into()
+                format!("没有 vidstab，防抖会使用 deshake，效果较弱。{hint}")
             } else {
-                "没有防抖滤镜（vidstab / deshake），无法防抖。".into()
+                format!("没有防抖滤镜（vidstab / deshake），无法防抖。{hint}")
             });
         }
         if !self.has_filter("lut3d") {
@@ -134,6 +135,9 @@ pub fn parse_version(first_line: &str) -> (String, u32, u32) {
     (v, major, minor)
 }
 
+/// 解析 `ffmpeg -filters`。每行形如 ` TSC lut3d  V->V  说明`：先是标志列，再是滤镜名，再是输入输出类型（`V->V`、`N->A`……）。
+/// 标志列旧版是 3 个字符（`T..`、`TSC`），新版（2026 年的开发版）只剩 2 个字符（`TS`、`..`），所以不能写死长度，
+/// 改用“第三列带 `->`”来认行，图例行（`T.. = Timeline support`）的第三列没有 `->`，不会混进来。
 pub fn parse_filters(out: &str) -> BTreeSet<String> {
     out.lines()
         .filter(|l| l.starts_with(' '))
@@ -141,8 +145,12 @@ pub fn parse_filters(out: &str) -> BTreeSet<String> {
             let mut it = l.split_whitespace();
             let flags = it.next()?;
             let name = it.next()?;
-            (flags.len() == 3 && flags.chars().all(|c| matches!(c, '.' | 'T' | 'S' | 'C')) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
-                .then(|| name.to_string())
+            let io = it.next()?;
+            ((1..=4).contains(&flags.len())
+                && flags.chars().all(|c| matches!(c, '.' | 'T' | 'S' | 'C'))
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && io.contains("->"))
+            .then(|| name.to_string())
         })
         .collect()
 }
@@ -287,6 +295,19 @@ mod tests {
         assert!(!f.contains("Timeline") && !f.contains("="), "{f:?}");
     }
 
+    /// ffmpeg 开发版（2026）把标志列从 3 个字符改成了 2 个，没有“Command support”那一列。
+    #[test]
+    fn filter_listing_with_two_flag_columns() {
+        let out = "Filters:\n  T.. = Timeline support\n  .S. = Slice threading\n  A = Audio input/output\n  V = Video input/output\n  N = Dynamic number and/or type of input/output\n  | = Source or sink filter\n  ------\n TS aap               AA->A      Apply Affine Projection algorithm to first audio stream.\n .. abench            A->A       Benchmark part of a filtergraph.\n .S acrossover        A->N       Split audio into per-bands streams.\n T. acrusher          A->A       Reduce audio bit resolution.\n .. anullsrc          |->A       Null audio source, return empty audio frames.\n .. nullsink          V->|       Do absolutely nothing with the input video.\n T. lut3d             V->V       Adjust colors using a 3D LUT.\n .. zscale            V->V       Apply resizing, colorspace and bit depth conversion.\n";
+        let f = parse_filters(out);
+        for n in ["aap", "abench", "acrossover", "acrusher", "anullsrc", "nullsink", "lut3d", "zscale"] {
+            assert!(f.contains(n), "{n} {f:?}");
+        }
+        assert_eq!(f.len(), 8, "{f:?}");
+        // 带 \r\n 的输出（Windows）也一样
+        assert_eq!(parse_filters(&out.replace('\n', "\r\n")), f);
+    }
+
     #[test]
     fn summary_explains_limits() {
         let lite = Caps { encoders: Encoders { h264: None, ..Default::default() }, ..Default::default() };
@@ -315,6 +336,9 @@ mod tests {
         };
         let c = detect(&ff).await;
         assert!(c.has_filter("scale") && c.has_filter("fps"), "{:?}", c.filters.len());
+        // 这些滤镜每个构建都有；解析不出来说明列表格式变了
+        assert!(c.has_filter("lut3d") && c.has_filter("cropdetect") && c.has_filter("loudnorm"), "{:?}", c.filters.len());
+        assert!(c.filters.len() > 100, "{}", c.filters.len());
         assert!(!c.version.is_empty());
     }
 }

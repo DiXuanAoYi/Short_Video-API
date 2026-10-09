@@ -1013,6 +1013,12 @@ export interface AutoResult {
   message: string
 }
 
+/** 迷你窗页面刚加载好时要显示的内容（窗口是用到时才创建的，创建时发出的事件它收不到）。 */
+export interface MiniState {
+  link: ClipboardLink | null
+  result: AutoResult | null
+}
+
 export type InboxSource = 'clipboard' | 'phone' | 'extension' | 'manual' | 'api' | 'cli'
 export type InboxStatus = 'pending_pair' | 'rejected' | 'confirm' | 'playlist' | 'resolving' | 'queued' | 'downloading' | 'done' | 'failed' | 'ignored'
 

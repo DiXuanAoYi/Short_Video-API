@@ -105,12 +105,14 @@ async fn setup(name: &str) -> Option<(PathBuf, PathBuf, Caps)> {
 }
 
 async fn hdr_sample(ff: &Path, d: &Path, trc: &str) -> Option<PathBuf> {
+    // 用 setparams 写色彩标记：新版 ffmpeg 不再认编码输出上的 -color_primaries / -color_trc
+    let vf = format!("setparams=colorspace=bt2020nc:color_primaries=bt2020:color_trc={trc}:range=tv");
     gen(
         ff,
         d,
         "hdr.mp4",
         &["-f", "lavfi", "-i", SRC, "-f", "lavfi", "-i", "sine=d=2"],
-        &["-c:v", "libx264", "-pix_fmt", "yuv420p10le", "-color_primaries", "bt2020", "-color_trc", trc, "-colorspace", "bt2020nc", "-c:a", "aac", "-shortest"],
+        &["-vf", &vf, "-c:v", "libx264", "-pix_fmt", "yuv420p10le", "-c:a", "aac", "-shortest"],
     )
     .await
 }
@@ -433,18 +435,12 @@ async fn already_compliant_files_are_reported_unchanged() {
             "ok.mp4",
             &["-f", "lavfi", "-i", SRC, "-f", "lavfi", "-i", "sine=d=2"],
             &[
+                "-vf",
+                "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv",
                 "-c:v",
                 "libx264",
                 "-pix_fmt",
                 "yuv420p",
-                "-colorspace",
-                "bt709",
-                "-color_primaries",
-                "bt709",
-                "-color_trc",
-                "bt709",
-                "-color_range",
-                "tv",
                 "-c:a",
                 "aac",
                 "-shortest"
