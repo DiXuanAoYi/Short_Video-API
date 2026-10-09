@@ -301,10 +301,16 @@ export interface NormSpec {
   hdr: boolean
   fixColor: boolean
   levels: number
-  /** 分段色彩匹配的强度（0 关闭）：把和整体色调不一致的镜头单独校正到和整体一致 */
+  /** 输出电平：tv 为 16–235（电视范围，游戏、美术等素材的要求，默认），pc 为 0–255，keep 沿用素材 */
+  outRange: 'tv' | 'pc' | 'keep'
+  /** 降噪档位 */
+  denoise: 'off' | 'light' | 'medium' | 'strong' | 'best'
+  /** 分段色彩匹配的强度（0 关闭）：把和整体色调不一致的镜头校正到和整体一致 */
   matchColor: number
-  /** 不校正的镜头（镜头开头的毫秒数） */
-  matchExclude: number[]
+  /** 统一调节：作用在所有没有单独调节的镜头上 */
+  matchTone: ToneAdjust
+  /** 单独调节的镜头（只能选检测出来和整体不一致的镜头） */
+  matchShots: ShotAdjust[]
   lut: string | null
   lutStrength: number
   autocrop: boolean
@@ -314,6 +320,22 @@ export interface NormSpec {
   fixSync: boolean
   codec: 'keep' | 'h264' | 'hevc'
   quality: 'small' | 'balanced' | 'high'
+}
+
+/** 手动调节，每项在 -1 到 1 之间，0 为不动。 */
+export interface ToneAdjust {
+  brightness: number
+  contrast: number
+  saturation: number
+  temperature: number
+  tint: number
+}
+
+/** 单独调节的镜头：`id` 是检测结果里镜头开头的毫秒数；`strength` 为 null 时和统一的校正强度一样。 */
+export interface ShotAdjust {
+  id: number
+  strength: number | null
+  tone: ToneAdjust
 }
 
 export interface ColorTimelineSeg {

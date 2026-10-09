@@ -10,14 +10,18 @@
 //!    亮度、对比度调 Y，偏色平移 U / V，饱和度缩放 U / V；用带时间窗口的 `lutyuv` 滤镜只作用在这个镜头上。
 //! 5. 只对需要校正的镜头，用场景检测把分界时间精确到帧。
 //!
-//! 限制：画面内容本来就不同色调的镜头（蓝天和绿草地）可能被误判，所以只处理偏离超出正常范围的，强度可调，也可以在检测结果里取消某个镜头；
+//! 6. 手动调节：每个镜头有“自动校正强度 + 亮度 / 对比度 / 饱和度 / 色温 / 色调”两部分参数。默认所有镜头用同一组“统一参数”
+//!    （统一的自动校正强度、统一的手动调节）；检测出的不一致镜头可以单独调节，单独调节的镜头只用自己的参数，不再用统一参数。
+//!    手动调节同样换成 Y / U / V 三条曲线，用 `lutyuv` 做；统一调节用“排除窗口”避开单独调节的镜头。
+//!
+//! 限制：画面内容本来就不同色调的镜头（蓝天和绿草地）可能被误判，所以只处理偏离超出正常范围的，强度可调，也可以单独调节或关掉某个镜头；
 //! 没有硬切、渐变过渡的色调变化，以及比关键帧间隔还短的镜头，检测不到。
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::postprocess::run_ffmpeg_capture;
 use crate::vidcaps::Caps;
@@ -424,6 +428,8 @@ pub struct ColorFix {
     pub y: Option<Curve>,
     pub u: Option<Curve>,
     pub v: Option<Curve>,
+    /// 要避开的时间窗口（单独调节的镜头）：统一调节不作用在这些镜头上
+    pub except: Vec<(Option<i64>, Option<i64>)>,
 }
 
 impl ColorFix {
@@ -436,13 +442,20 @@ impl ColorFix {
             }
         }
         // 窗口的两端各让出半毫秒，避免时间戳取整后把分界处的第一帧排除在外
-        let window = match (self.start_ms, self.end_ms) {
-            (Some(a), Some(b)) => format!("gte(t,{:.4})*lt(t,{:.4})", a as f64 / 1000.0 - 0.0005, b as f64 / 1000.0 - 0.0005),
-            (Some(a), None) => format!("gte(t,{:.4})", a as f64 / 1000.0 - 0.0005),
-            (None, Some(b)) => format!("lt(t,{:.4})", b as f64 / 1000.0 - 0.0005),
-            (None, None) => "1".to_string(),
+        let window = |a: Option<i64>, b: Option<i64>| -> String {
+            match (a, b) {
+                (Some(a), Some(b)) => format!("gte(t,{:.4})*lt(t,{:.4})", a as f64 / 1000.0 - 0.0005, b as f64 / 1000.0 - 0.0005),
+                (Some(a), None) => format!("gte(t,{:.4})", a as f64 / 1000.0 - 0.0005),
+                (None, Some(b)) => format!("lt(t,{:.4})", b as f64 / 1000.0 - 0.0005),
+                (None, None) => "1".to_string(),
+            }
         };
-        opts.push(format!("enable='{window}'"));
+        let mut enable = window(self.start_ms, self.end_ms);
+        if !self.except.is_empty() {
+            let skip: Vec<String> = self.except.iter().map(|(a, b)| window(*a, *b)).collect();
+            enable = format!("{enable}*not({})", skip.join("+"));
+        }
+        opts.push(format!("enable='{enable}'"));
         format!("lutyuv={}", opts.join(":"))
     }
 
@@ -457,23 +470,124 @@ impl ColorFix {
 #[serde(rename_all = "camelCase")]
 pub struct ColorPlan {
     pub fixes: Vec<ColorFix>,
+    /// 按自动校正处理的不一致镜头数、单独调节的镜头数、有没有统一的手动调节（只用来写处理说明）
+    pub auto_shots: usize,
+    pub own_shots: usize,
+    pub unified: bool,
 }
 
 impl ColorPlan {
-    /// 预览用：视频从 `offset_ms` 处开始读，滤镜看到的时间都要减去它。
+    /// 处理说明里的一句话。
+    pub fn describe(&self) -> String {
+        let mut parts = vec![];
+        if self.auto_shots > 0 {
+            parts.push(format!("{} 个不一致的镜头自动校正到和整体一致", self.auto_shots));
+        }
+        if self.own_shots > 0 {
+            parts.push(format!("{} 个镜头单独调节", self.own_shots));
+        }
+        if self.unified {
+            parts.push(if self.own_shots > 0 { "其余镜头用统一的手动调节".to_string() } else { "统一的手动调节".to_string() });
+        }
+        format!("分段色彩匹配：{}", parts.join("，"))
+    }
+
+    /// 预览用：视频从 `offset_ms` 处开始读，滤镜看到的时间都要减去它。预览只会看到开头 `PREVIEW_SPAN_MS` 毫秒，
+    /// 和这段时间没有交集的校正（别的镜头）直接去掉，滤镜图不用跟着镜头数一起变长。
     pub fn shifted(&self, offset_ms: i64) -> ColorPlan {
+        let hits = |a: Option<i64>, b: Option<i64>| a.map_or(true, |a| a < PREVIEW_SPAN_MS) && b.map_or(true, |b| b > 0);
+        let shift = |v: Option<i64>| v.map(|v| v - offset_ms);
         ColorPlan {
+            auto_shots: self.auto_shots,
+            own_shots: self.own_shots,
+            unified: self.unified,
             fixes: self
                 .fixes
                 .iter()
-                .map(|f| ColorFix { start_ms: f.start_ms.map(|v| v - offset_ms), end_ms: f.end_ms.map(|v| v - offset_ms), ..f.clone() })
+                .map(|f| ColorFix {
+                    start_ms: shift(f.start_ms),
+                    end_ms: shift(f.end_ms),
+                    except: f.except.iter().map(|(a, b)| (shift(*a), shift(*b))).filter(|(a, b)| hits(*a, *b)).collect(),
+                    ..f.clone()
+                })
+                .filter(|f| hits(f.start_ms, f.end_ms))
                 .collect(),
         }
     }
 }
 
+/// 预览只读开头这么长的一段（预热加一帧）。
+const PREVIEW_SPAN_MS: i64 = 1500;
+
 const MAX_Y_SHIFT: f64 = 40.0;
 const MAX_C_SHIFT: f64 = 24.0;
+
+// ---------- 手动调节 ----------
+
+/// 手动调节：五项都在 -1 到 1 之间，0 是不动。用于“统一调节”和单个镜头的“单独调节”。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ToneAdjust {
+    /// 亮度：±1 约等于 Y 平移 ±40 级
+    pub brightness: f64,
+    /// 对比度：±1 约等于以中灰为轴放大 / 缩小 50%
+    pub contrast: f64,
+    /// 饱和度：-1 变成黑白，+1 色度放大一倍
+    pub saturation: f64,
+    /// 色温：正数偏暖（黄、橙），负数偏冷（蓝）
+    pub temperature: f64,
+    /// 色调：正数偏品红，负数偏绿
+    pub tint: f64,
+}
+
+impl ToneAdjust {
+    pub fn is_neutral(&self) -> bool {
+        *self == ToneAdjust::default()
+    }
+
+    /// 限制在 -1 到 1，不是数字的当作 0。
+    pub fn checked(self) -> ToneAdjust {
+        let c = |v: f64| if v.is_finite() { (v.clamp(-1.0, 1.0) * 1000.0).round() / 1000.0 } else { 0.0 };
+        ToneAdjust {
+            brightness: c(self.brightness),
+            contrast: c(self.contrast),
+            saturation: c(self.saturation),
+            temperature: c(self.temperature),
+            tint: c(self.tint),
+        }
+    }
+
+    /// 换成 Y / U / V 三条曲线（在 YUV 里做的近似：亮度平移、对比度缩放，色温和色调平移 U / V，饱和度缩放 U / V）。
+    fn curves(&self) -> (Option<Curve>, Option<Curve>, Option<Curve>) {
+        let y = (self.brightness != 0.0 || self.contrast != 0.0).then_some(Curve {
+            pivot: 126.0,
+            gain: 1.0 + 0.5 * self.contrast,
+            out: 126.0 + 40.0 * self.brightness,
+        });
+        // 暖色：U 降（少蓝）、V 略升（多红）；品红：U、V 都升
+        let shift_u = -12.0 * self.temperature + 8.0 * self.tint;
+        let shift_v = 6.0 * self.temperature + 8.0 * self.tint;
+        let chroma = |shift: f64| (self.saturation != 0.0 || shift != 0.0).then_some(Curve { pivot: 128.0, gain: 1.0 + self.saturation, out: 128.0 + shift });
+        (y, chroma(shift_u), chroma(shift_v))
+    }
+}
+
+/// 单独调节的镜头。`id` 是检测结果里这个镜头开头的毫秒数。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ShotAdjust {
+    pub id: i64,
+    /// 这个镜头的自动校正强度（0–1）；不填就和统一的强度一样
+    pub strength: Option<f64>,
+    pub tone: ToneAdjust,
+}
+
+/// 没有镜头分析（HDR、太短、分析失败）时也能做的部分：只有统一的手动调节。
+pub fn tone_plan(tone: &ToneAdjust) -> ColorPlan {
+    let (y, u, v) = tone.curves();
+    let on = y.is_some() || u.is_some() || v.is_some();
+    ColorPlan { fixes: if on { vec![ColorFix { start_ms: None, end_ms: None, y, u, v, except: vec![] }] } else { vec![] }, unified: on, ..Default::default() }
+}
 
 /// 按强度（0–1）算一个镜头的校正曲线，只改不一致的那几项。
 fn fix_for(s: &FrameStats, r: &Reference, d: &Defects, strength: f64) -> (Option<Curve>, Option<Curve>, Option<Curve>) {
@@ -550,22 +664,42 @@ pub struct FlaggedShot {
 }
 
 impl ColorAnalysis {
-    pub fn plan(&self, strength: f64, exclude: &[i64]) -> ColorPlan {
-        if strength <= 0.0 {
-            return ColorPlan::default();
+    /// 生成要执行的校正。`strength` 和 `tone` 是统一的参数：不一致的镜头按统一强度自动校正，再加上统一的手动调节；
+    /// 其他镜头只加统一的手动调节。`shots` 里的镜头单独调节：用自己的自动校正强度和手动调节，不再用统一的手动调节。
+    pub fn plan(&self, strength: f64, tone: &ToneAdjust, shots: &[ShotAdjust]) -> ColorPlan {
+        let mut fixes = vec![];
+        let mut except = vec![];
+        let (mut auto_shots, mut own_shots) = (0, 0);
+        for f in &self.flagged {
+            let own = shots.iter().rev().find(|s| s.id == f.start_ms.unwrap_or(0));
+            let k = own.and_then(|s| s.strength).unwrap_or(strength).clamp(0.0, 1.0);
+            if k > 0.0 {
+                let (y, u, v) = fix_for(&f.st, &self.reference, &f.defects, k);
+                if y.is_some() || u.is_some() || v.is_some() {
+                    fixes.push(ColorFix { start_ms: f.start_ms, end_ms: f.end_ms, y, u, v, except: vec![] });
+                    if own.is_none() {
+                        auto_shots += 1;
+                    }
+                }
+            }
+            if let Some(own) = own {
+                except.push((f.start_ms, f.end_ms));
+                let (y, u, v) = own.tone.curves();
+                let manual = y.is_some() || u.is_some() || v.is_some();
+                if manual {
+                    fixes.push(ColorFix { start_ms: f.start_ms, end_ms: f.end_ms, y, u, v, except: vec![] });
+                }
+                if manual || k > 0.0 {
+                    own_shots += 1;
+                }
+            }
         }
-        ColorPlan {
-            fixes: self
-                .flagged
-                .iter()
-                .filter(|f| !exclude.contains(&f.start_ms.unwrap_or(0)))
-                .map(|f| {
-                    let (y, u, v) = fix_for(&f.st, &self.reference, &f.defects, strength);
-                    ColorFix { start_ms: f.start_ms, end_ms: f.end_ms, y, u, v }
-                })
-                .filter(|f| f.y.is_some() || f.u.is_some() || f.v.is_some())
-                .collect(),
+        let (y, u, v) = tone.curves();
+        let unified = y.is_some() || u.is_some() || v.is_some();
+        if unified {
+            fixes.push(ColorFix { start_ms: None, end_ms: None, y, u, v, except });
         }
+        ColorPlan { fixes, auto_shots, own_shots, unified }
     }
 
     pub fn shots_total(&self) -> usize {
@@ -878,7 +1012,7 @@ mod tests {
     #[test]
     fn filter_text_has_a_time_window() {
         let c = Curve { pivot: 100.0, gain: 1.1, out: 90.0 };
-        let fix = ColorFix { start_ms: Some(3000), end_ms: Some(6000), y: Some(c), u: None, v: None };
+        let fix = ColorFix { start_ms: Some(3000), end_ms: Some(6000), y: Some(c), u: None, v: None, except: vec![] };
         let f = fix.filter();
         assert!(f.starts_with("lutyuv=y='clip((val-100.00)*1.1000+90.00,0,255)':enable='gte(t,2.9995)*lt(t,5.9995)'"), "{f}");
         let first = ColorFix { start_ms: None, end_ms: Some(2000), ..fix.clone() };
@@ -886,28 +1020,120 @@ mod tests {
         let last = ColorFix { start_ms: Some(2000), end_ms: None, ..fix.clone() };
         assert!(last.filter().ends_with("enable='gte(t,1.9995)'"));
         // 预览从 2 秒处开始读：窗口往前移 2 秒
-        let plan = ColorPlan { fixes: vec![fix] }.shifted(2000);
+        let plan = ColorPlan { fixes: vec![fix], ..Default::default() }.shifted(2000);
         assert_eq!((plan.fixes[0].start_ms, plan.fixes[0].end_ms), (Some(1000), Some(4000)));
     }
 
-    #[test]
-    fn plan_respects_strength_and_exclusions() {
+    fn flagged_analysis() -> ColorAnalysis {
         let r = Reference { st: base(), spread_y: 2.0, spread_c: 1.0, spread_s: 0.05 };
         let off = FrameStats { y: 160.0, ..base() };
-        let a = ColorAnalysis {
+        ColorAnalysis {
             duration_ms: 20_000,
             shots: vec![(0, 5000, true), (5000, 20_000, false)],
             looks: vec![off, base()],
             reference: r,
             flagged: vec![Flagged { start_ms: None, end_ms: Some(5000), st: off, defects: defects(&off, &r) }],
             note: None,
-        };
-        assert_eq!(a.plan(0.0, &[]).fixes.len(), 0);
-        assert_eq!(a.plan(0.8, &[]).fixes.len(), 1);
-        assert_eq!(a.plan(0.8, &[0]).fixes.len(), 0, "取消了这个镜头");
+        }
+    }
+
+    #[test]
+    fn plan_follows_the_unified_strength() {
+        let a = flagged_analysis();
+        let none = ToneAdjust::default();
+        assert_eq!(a.plan(0.0, &none, &[]).fixes.len(), 0);
+        assert_eq!(a.plan(0.8, &none, &[]).fixes.len(), 1);
         let rep = a.report();
         assert_eq!((rep.shots_total, rep.flagged.len(), rep.timeline.len()), (2, 1, 2));
         assert_eq!(rep.flagged[0].defects, vec!["偏亮".to_string()]);
+    }
+
+    #[test]
+    fn unified_tone_skips_shots_that_are_adjusted_on_their_own() {
+        let a = flagged_analysis();
+        let warm = ToneAdjust { temperature: 0.5, ..Default::default() };
+        // 统一的手动调节作用在整段视频上：不一致的镜头先自动校正，再加统一调节
+        let p = a.plan(0.8, &warm, &[]);
+        assert_eq!(p.fixes.len(), 2);
+        let uni = p.fixes.last().unwrap();
+        assert!(uni.start_ms.is_none() && uni.end_ms.is_none() && uni.except.is_empty() && uni.y.is_none() && uni.u.is_some() && uni.v.is_some());
+        // 单独调节且强度 0、不加手动调节：这个镜头什么都不做，统一调节也避开它
+        let skip = ShotAdjust { id: 0, strength: Some(0.0), tone: ToneAdjust::default() };
+        let p = a.plan(0.8, &warm, &[skip]);
+        assert_eq!(p.fixes.len(), 1, "只剩统一调节");
+        assert_eq!(p.fixes[0].except, vec![(None, Some(5000))]);
+        assert!(p.fixes[0].filter().ends_with("enable='1*not(lt(t,4.9995))'"), "{}", p.fixes[0].filter());
+        // 单独调节的镜头：自己的自动校正强度（不填跟统一一样）+ 自己的手动调节
+        let own = ShotAdjust { id: 0, strength: None, tone: ToneAdjust { brightness: -0.3, ..Default::default() } };
+        let p = a.plan(0.8, &ToneAdjust::default(), std::slice::from_ref(&own));
+        assert_eq!(p.fixes.len(), 2);
+        assert_eq!((p.fixes[1].start_ms, p.fixes[1].end_ms), (None, Some(5000)));
+        let y = p.fixes[1].y.unwrap();
+        assert!((y.out - (126.0 - 12.0)).abs() < 1e-9 && y.gain == 1.0, "{y:?}");
+        // 没有对应镜头的 id 被忽略；同一个 id 写了两次，以后一个为准
+        let stray = ShotAdjust { id: 12345, strength: Some(0.0), tone: ToneAdjust { tint: 1.0, ..Default::default() } };
+        assert_eq!(a.plan(0.8, &ToneAdjust::default(), &[stray]).fixes.len(), 1);
+        let off = ShotAdjust { id: 0, strength: Some(0.0), tone: ToneAdjust::default() };
+        assert_eq!(a.plan(0.8, &ToneAdjust::default(), &[own, off]).fixes.len(), 0);
+        // 预览从 2 秒处开始读时，排除窗口也一起往前移
+        let shifted = a.plan(0.8, &warm, &[ShotAdjust { id: 0, strength: Some(0.0), ..Default::default() }]).shifted(2000);
+        assert_eq!(shifted.fixes[0].except, vec![(None, Some(3000))]);
+    }
+
+    #[test]
+    fn preview_plan_only_keeps_what_the_preview_can_see() {
+        let fix = |a: i64, b: i64| ColorFix { start_ms: Some(a), end_ms: Some(b), y: None, u: None, v: None, except: vec![] };
+        let plan = ColorPlan {
+            fixes: vec![
+                fix(0, 3000),
+                fix(3000, 6000),
+                fix(6000, 9000),
+                ColorFix { start_ms: None, end_ms: None, except: vec![(Some(0), Some(3000)), (Some(6000), Some(9000))], ..fix(0, 0) },
+            ],
+            auto_shots: 3,
+            own_shots: 0,
+            unified: true,
+        };
+        // 预览从 3.2 秒处读起：只剩第 2 个镜头和统一调节，统一调节只留下和预览有交集的排除窗口
+        let p = plan.shifted(3200);
+        assert_eq!(p.fixes.len(), 2, "{:?}", p.fixes);
+        assert_eq!((p.fixes[0].start_ms, p.fixes[0].end_ms), (Some(-200), Some(2800)));
+        assert!(p.fixes[1].except.is_empty(), "{:?}", p.fixes[1].except);
+        // 预览从第 3 个镜头开头读起：第 3 个镜头的排除窗口要留着
+        let p = plan.shifted(6000);
+        assert_eq!(p.fixes.len(), 2);
+        assert_eq!(p.fixes[1].except, vec![(Some(0), Some(3000))]);
+    }
+
+    #[test]
+    fn tone_adjust_maps_to_curves() {
+        assert!(ToneAdjust::default().is_neutral());
+        assert!(tone_plan(&ToneAdjust::default()).fixes.is_empty());
+        let (y, u, v) = ToneAdjust::default().curves();
+        assert!(y.is_none() && u.is_none() && v.is_none());
+        // 亮度、对比度只动 Y
+        let (y, u, v) = ToneAdjust { brightness: 0.5, contrast: -1.0, ..Default::default() }.curves();
+        assert_eq!(y, Some(Curve { pivot: 126.0, gain: 0.5, out: 146.0 }));
+        assert!(u.is_none() && v.is_none());
+        // 饱和度只动 U / V（以 128 为轴缩放）
+        let (y, u, v) = ToneAdjust { saturation: -1.0, ..Default::default() }.curves();
+        assert!(y.is_none());
+        assert_eq!((u, v), (Some(Curve { pivot: 128.0, gain: 0.0, out: 128.0 }), Some(Curve { pivot: 128.0, gain: 0.0, out: 128.0 })));
+        // 偏暖：U 下降（少蓝）、V 上升（多红）；偏冷反过来；品红两个都升
+        let (_, u, v) = ToneAdjust { temperature: 1.0, ..Default::default() }.curves();
+        assert!(u.unwrap().out < 128.0 && v.unwrap().out > 128.0);
+        let (_, u, v) = ToneAdjust { temperature: -1.0, ..Default::default() }.curves();
+        assert!(u.unwrap().out > 128.0 && v.unwrap().out < 128.0);
+        let (_, u, v) = ToneAdjust { tint: 1.0, ..Default::default() }.curves();
+        assert!(u.unwrap().out > 128.0 && v.unwrap().out > 128.0);
+        // 越界和非数字
+        let c = ToneAdjust { brightness: 7.0, contrast: f64::NAN, saturation: -3.0, temperature: f64::INFINITY, tint: 0.12345 }.checked();
+        assert_eq!((c.brightness, c.contrast, c.saturation, c.temperature, c.tint), (1.0, 0.0, -1.0, 0.0, 0.123));
+        // 前端传来的 JSON：缺的项按 0
+        let t: ToneAdjust = serde_json::from_str(r#"{"brightness":0.2,"tint":-0.4}"#).unwrap();
+        assert_eq!((t.brightness, t.contrast, t.tint), (0.2, 0.0, -0.4));
+        let s: ShotAdjust = serde_json::from_str(r#"{"id":4200,"tone":{"saturation":0.3}}"#).unwrap();
+        assert_eq!((s.id, s.strength, s.tone.saturation), (4200, None, 0.3));
     }
 
     #[test]

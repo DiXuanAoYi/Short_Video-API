@@ -150,11 +150,17 @@ pub async fn analyze_quick(ffmpeg: &Path, file: &Path, facts: &Facts) -> Analysi
 // ---------- 预览 ----------
 
 /// 截取某一时刻的“处理前”和“处理后”两张图（宽度不超过 960）。`graph` 是 `video_graph` 生成的滤镜图（输入 `[0:v:0]`，输出 `[v]`）。
-pub async fn preview(ffmpeg: &Path, file: &Path, at_ms: u64, graph: Option<&str>, dir: &Path, key: &str) -> AppResult<(PathBuf, PathBuf)> {
+/// 从 `start_ms` 处开始读，丢掉前 `warm_ms` 毫秒再取一帧：降噪这类要看前后几帧的滤镜，需要先“预热”才和真正处理的结果一样。
+pub async fn preview(ffmpeg: &Path, file: &Path, start_ms: u64, warm_ms: u64, graph: Option<&str>, dir: &Path, key: &str) -> AppResult<(PathBuf, PathBuf)> {
     std::fs::create_dir_all(dir)?;
     let (before, after) = (dir.join(format!("{key}-before.jpg")), dir.join(format!("{key}-after.jpg")));
-    let at = format!("{:.3}", at_ms as f64 / 1000.0);
-    let shrink = "scale='min(960,iw)':-2";
+    let at = format!("{:.3}", start_ms as f64 / 1000.0);
+    // 前面预热的画面丢掉，只留时间点那一帧
+    let shrink = if warm_ms > 0 {
+        format!("select='gte(t,{:.3})',scale='min(960,iw)':-2", warm_ms as f64 / 1000.0 - 0.001)
+    } else {
+        "scale='min(960,iw)':-2".to_string()
+    };
     let mk = |out: &Path, complex: String| {
         let mut a = args(&["-hide_banner", "-loglevel", "error", "-y", "-ss"]);
         a.push(at.clone());

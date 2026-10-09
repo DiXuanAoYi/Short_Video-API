@@ -5,9 +5,10 @@ import { open } from '@tauri-apps/plugin-dialog'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { api, errorText } from '../../api'
 import { useAppStore } from '../../stores/app'
-import type { CapsSummary, ColorFlaggedShot, ColorReport, NormPreset, NormSpec, VideoFactsInfo, VideoPreview, VideoReport } from '../../types'
+import type { CapsSummary, ColorFlaggedShot, ColorReport, NormPreset, NormSpec, ToneAdjust, VideoFactsInfo, VideoPreview, VideoReport } from '../../types'
 import { formatClock, parseClock } from '../../utils/time'
 import FileInput from './FileInput.vue'
+import ToneSliders from './ToneSliders.vue'
 
 const props = defineProps<{ preset?: string[]; hint?: string; lut?: string }>()
 const emit = defineEmits<{ started: [] }>()
@@ -17,8 +18,10 @@ const files = ref<string[]>(props.preset ? [...props.preset] : [])
 const caps = ref<CapsSummary | null>(null)
 const presets = ref<NormPreset[]>([])
 const presetId = ref('compat')
+const noTone = (): ToneAdjust => ({ brightness: 0, contrast: 0, saturation: 0, temperature: 0, tint: 0 })
 const spec = reactive<NormSpec>({
-  size: 'limit', width: 1920, height: 1080, shortSide: 1080, followOrientation: true, fps: 'auto', fpsValue: 30, hdr: true, fixColor: true, levels: 0, matchColor: 0, matchExclude: [], lut: null,
+  size: 'limit', width: 1920, height: 1080, shortSide: 1080, followOrientation: true, fps: 'auto', fpsValue: 30, hdr: true, fixColor: true, levels: 0, outRange: 'tv', denoise: 'off',
+  matchColor: 0, matchTone: noTone(), matchShots: [], lut: null,
   lutStrength: 1, autocrop: false, audioRate: 0, audioChannels: 0, loudness: null, fixSync: true, codec: 'h264', quality: 'balanced',
 })
 const reports = ref<Record<string, VideoReport | { error: string }>>({})
@@ -35,12 +38,12 @@ const colorReport = ref<ColorReport | null>(null)
 const colorBusy = ref(false)
 let token = 0
 
-// 换了第一个文件：旧的色彩检测结果和取消的镜头都作废
+// 换了第一个文件：旧的色彩检测结果和单独调节的镜头都作废（统一调节不跟文件走，保留）
 watch(
   () => files.value[0],
   () => {
     colorReport.value = null
-    spec.matchExclude = []
+    spec.matchShots = []
   },
 )
 
@@ -50,7 +53,9 @@ async function checkColor() {
   colorBusy.value = true
   try {
     colorReport.value = await api.videoColor(f)
-    spec.matchExclude = []
+    // 重新检测后，已经不在结果里的镜头不再单独调节
+    const ids = new Set(colorReport.value.flagged.map((x) => x.id))
+    spec.matchShots = spec.matchShots.filter((x) => ids.has(x.id))
   } catch (e) {
     colorReport.value = null
     ElMessage.error(errorText(e))
@@ -59,10 +64,14 @@ async function checkColor() {
   }
 }
 
-function toggleShot(id: number, on: boolean) {
-  const rest = spec.matchExclude.filter((x) => x !== id)
-  spec.matchExclude = on ? rest : [...rest, id]
+/** 打开 / 关闭某个镜头的单独调节：关闭后这个镜头跟着统一的参数走。 */
+function toggleOwn(id: number, on: boolean) {
+  const rest = spec.matchShots.filter((x) => x.id !== id)
+  spec.matchShots = on ? [...rest, { id, strength: spec.matchColor, tone: noTone() }] : rest
 }
+const isOwn = (id: number) => spec.matchShots.some((x) => x.id === id)
+const ownOf = (id: number) => spec.matchShots.filter((x) => x.id === id)
+const pctText = (v: number) => `${Math.round(v * 100)}%`
 
 /** 看某个镜头校正前后的对比：取镜头中间的一帧。 */
 function previewShot(s: ColorFlaggedShot) {
@@ -91,8 +100,16 @@ watch(
 
 function applyPreset(p: NormPreset) {
   presetId.value = p.id
-  // 色阶和 LUT 是个人风格，不跟着预设走
-  Object.assign(spec, p.spec, { lut: spec.lut, lutStrength: spec.lutStrength, levels: spec.levels, matchExclude: spec.matchExclude })
+  // 色阶、LUT、输出电平、降噪和手动调节是个人的选择，不跟着预设走
+  Object.assign(spec, p.spec, {
+    lut: spec.lut,
+    lutStrength: spec.lutStrength,
+    levels: spec.levels,
+    outRange: spec.outRange,
+    denoise: spec.denoise,
+    matchTone: spec.matchTone,
+    matchShots: spec.matchShots,
+  })
 }
 
 onMounted(async () => {
@@ -158,6 +175,14 @@ function summary(f: VideoFactsInfo): string {
 const presetName = (id: string) => presets.value.find((p) => p.id === id)?.name ?? id
 const curPreset = computed(() => presets.value.find((p) => p.id === presetId.value))
 
+const DENOISE_NOTES: Record<NormSpec['denoise'], string> = {
+  off: '',
+  light: '去掉轻微的噪点：白天拍摄的素材、轻度压缩产生的颗粒。',
+  medium: '夜景、室内暗光、高 ISO 的素材常用这一档。',
+  strong: '噪点很重时用。画面会更柔和，毛发、纹理这些细节可能被抹掉一些。',
+  best: '非局部均值算法，画质最好，但处理速度只有其他档位的四分之一左右，适合需要认真处理的短素材。',
+}
+
 const loudnessOn = computed({
   get: () => spec.loudness !== null,
   set: (v: boolean) => (spec.loudness = v ? -16 : null),
@@ -210,8 +235,8 @@ async function start() {
   busy.value = true
   try {
     for (const f of files.value) {
-      // 取消的镜头是按第一个文件的检测结果记的，别的文件用不上
-      const own = { ...spec, matchExclude: f === files.value[0] ? [...spec.matchExclude] : [] }
+      // 单独调节的镜头是按第一个文件的检测结果记的，别的文件用不上；统一调节对每个文件都有效
+      const own = { ...spec, matchShots: f === files.value[0] ? spec.matchShots.map((x) => ({ ...x, tone: { ...x.tone } })) : [] }
       await api.mediaJobStart({ op: 'normalize', spec: own, preset: presetId.value, inputs: [f], outputDir: outDir.value || null })
     }
     ElMessage.success(files.value.length > 1 ? `已加入 ${files.value.length} 个任务，可以在下方查看进度。` : '已开始处理，可以在下方查看进度。')
@@ -333,6 +358,19 @@ const imgSrc = (p: string) => convertFileSrc(p)
           <el-switch v-model="spec.autocrop" />
           <small class="mute">在视频里取几处画面检测，上下左右至少有 8 像素黑边才会裁；画面本身很暗时不会误裁。</small>
         </label>
+        <label>
+          <span>降噪</span>
+          <el-select v-model="spec.denoise" size="small" class="w">
+            <el-option value="off" label="关闭" />
+            <el-option value="light" label="弱" />
+            <el-option value="medium" label="中" />
+            <el-option value="strong" label="强" />
+            <el-option value="best" label="高质量（最慢）" />
+          </el-select>
+          <small class="mute">
+            {{ DENOISE_NOTES[spec.denoise] || '去掉暗光、高 ISO、压缩过度画面里的噪点颗粒。先到下面的“预览对比”里看效果：降噪越强，细节被抹掉得越多。' }}
+          </small>
+        </label>
 
         <h5>帧率</h5>
         <label>
@@ -357,8 +395,19 @@ const imgSrc = (p: string) => convertFileSrc(p)
         <label>
           <span>补全色彩信息</span>
           <el-switch v-model="spec.fixColor" />
-          <small class="mute">补写缺失的色彩标记；全范围色彩转电视范围；高清素材的 BT.601 转 BT.709。</small>
+          <small class="mute">补写缺失的色彩标记；高清素材的 BT.601 转 BT.709。</small>
         </label>
+        <div class="frow">
+          <span>输出电平</span>
+          <el-radio-group v-model="spec.outRange" size="small">
+            <el-radio-button value="tv">16–235</el-radio-button>
+            <el-radio-button value="pc">0–255</el-radio-button>
+            <el-radio-button value="keep">沿用素材</el-radio-button>
+          </el-radio-group>
+          <small class="mute">
+            16–235 是视频的标准电平（电视范围），游戏、影视美术、投稿平台等基本都要求用它，所以是默认值；0–255 是全范围，黑和白更满，但有些播放器和剪辑软件对全范围视频的处理不一致，除非明确要求，不建议用。
+          </small>
+        </div>
         <label>
           <span>自动色阶</span>
           <el-slider v-model="spec.levels" :min="0" :max="1" :step="0.05" :format-tooltip="(v: number) => `${Math.round(v * 100)}%`" size="small" class="sl" />
@@ -368,13 +417,17 @@ const imgSrc = (p: string) => convertFileSrc(p)
           <span>分段色彩匹配</span>
           <el-slider v-model="spec.matchColor" :min="0" :max="1" :step="0.05" :format-tooltip="(v: number) => `${Math.round(v * 100)}%`" size="small" class="sl" />
           <small class="mute">
-            0 为关闭。视频里有几段来源不同、偏色（偏黄、偏蓝……）、亮度或饱和度和整体不一致时，只把不一致的镜头单独校正到和整体一致，一致的镜头不动。
+            0 为关闭。视频里有几段来源不同、偏色（偏黄、偏蓝……）、亮度或饱和度和整体不一致时，把不一致的镜头自动校正到和整体一致，一致的镜头不动。这个滑块是统一的自动校正强度。
           </small>
         </label>
         <div v-if="spec.matchColor > 0" class="cm">
+          <div class="cmtitle">统一调节</div>
+          <div class="mute small">没有单独调节的镜头都用这组参数，包括检测不出差异的镜头；全 0 就是不额外调节。</div>
+          <ToneSliders v-model="spec.matchTone" />
+          <div class="cmtitle">按镜头单独调节</div>
           <div class="cmhead">
             <el-button size="small" :loading="colorBusy" :disabled="!files.length" @click="checkColor">检测第一个文件的色彩差异</el-button>
-            <small class="mute">解码一遍关键帧，几秒到几十秒。处理时会自动检测，这里先看一眼，还可以取消不想校正的镜头。</small>
+            <small class="mute">解码一遍关键帧，几秒到几十秒。检测出和整体不一致的镜头后，可以选其中的某几个单独调节，没选的镜头用上面的统一参数。</small>
           </div>
           <template v-if="colorReport">
             <div class="strip" :title="`共 ${colorReport.shotsTotal} 个镜头`">
@@ -387,15 +440,25 @@ const imgSrc = (p: string) => convertFileSrc(p)
               />
             </div>
             <div v-if="colorReport.note" class="mute small">{{ colorReport.note }}</div>
-            <div v-else class="mute small">共 {{ colorReport.shotsTotal }} 个镜头，{{ colorReport.flagged.length }} 个和整体不一致（橙色）。勾选的会被校正。</div>
-            <div v-for="f in colorReport.flagged" :key="f.id" class="shot">
-              <el-checkbox :model-value="!spec.matchExclude.includes(f.id)" @change="(v: string | number | boolean) => toggleShot(f.id, !!v)">
-                {{ formatClock(f.startMs) }} – {{ formatClock(f.endMs) }}
-              </el-checkbox>
-              <span class="chips">
-                <span v-for="d in f.defects" :key="d" class="chip warn">{{ d }}</span>
-              </span>
-              <el-button size="small" link type="primary" :loading="previewing" @click="previewShot(f)">看对比</el-button>
+            <div v-else class="mute small">共 {{ colorReport.shotsTotal }} 个镜头，{{ colorReport.flagged.length }} 个和整体不一致（橙色）。{{ spec.matchShots.length }} 个单独调节。</div>
+            <div v-for="f in colorReport.flagged" :key="f.id" class="shotbox">
+              <div class="shot">
+                <span class="mono when">{{ formatClock(f.startMs) }} – {{ formatClock(f.endMs) }}</span>
+                <span class="chips">
+                  <span v-for="d in f.defects" :key="d" class="chip warn">{{ d }}</span>
+                </span>
+                <el-button size="small" link type="primary" :loading="previewing" @click="previewShot(f)">看对比</el-button>
+                <el-checkbox :model-value="isOwn(f.id)" @change="(v: string | number | boolean) => toggleOwn(f.id, !!v)">单独调节</el-checkbox>
+              </div>
+              <div v-for="o in ownOf(f.id)" :key="o.id" class="own">
+                <div class="orow">
+                  <span class="name">自动校正</span>
+                  <el-slider v-model="o.strength" :min="0" :max="1" :step="0.05" :show-tooltip="false" size="small" class="osl" />
+                  <span class="val mono">{{ pctText(o.strength ?? 0) }}</span>
+                  <small class="mute">0 = 这个镜头不做自动校正</small>
+                </div>
+                <ToneSliders v-model="o.tone" />
+              </div>
             </div>
           </template>
         </div>
@@ -569,6 +632,53 @@ h3 {
   gap: 10px;
   flex-wrap: wrap;
 }
+.shot .when {
+  min-width: 96px;
+  font-size: 12.5px;
+}
+/* 复选框本身是个 label，会吃到表单里 label 的两列网格，这里还原 */
+.shot .chips {
+  min-width: 180px;
+}
+.shot :deep(.el-checkbox) {
+  display: inline-flex;
+  grid-template-columns: none;
+  height: auto;
+}
+.shot :deep(.el-checkbox__label) {
+  font-size: 12.5px;
+}
+.cmtitle {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.shotbox {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.own {
+  margin-left: 24px;
+  padding: 6px 10px;
+  border-left: 2px solid var(--cc-acc);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.orow {
+  display: grid;
+  grid-template-columns: 64px 280px 52px auto;
+  gap: 10px;
+  align-items: center;
+}
+.orow .name {
+  color: var(--cc-mute);
+  font-size: 12.5px;
+}
+.orow .val {
+  font-size: 11.5px;
+  text-align: right;
+}
 h4 {
   margin: 6px 0 0;
   font-size: 13px;
@@ -689,6 +799,7 @@ h5 {
   gap: 10px;
 }
 .form label,
+.form .frow,
 .dir {
   display: grid;
   grid-template-columns: 120px auto;
@@ -697,11 +808,13 @@ h5 {
   justify-content: start;
 }
 .form label > span:first-child,
+.form .frow > span:first-child,
 .dir > span:first-child {
   color: var(--cc-mute);
   font-size: 12.5px;
 }
-.form label small {
+.form label small,
+.form .frow small {
   grid-column: 2;
   font-size: 11.5px;
   max-width: 560px;

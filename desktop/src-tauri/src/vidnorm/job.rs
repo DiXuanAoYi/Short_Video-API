@@ -98,16 +98,19 @@ pub async fn run_normalize(ctx: &JobCtx, job: &ToolJob, spec: &NormSpec) -> AppR
     let mut color_warnings: Vec<String> = vec![];
     if spec.match_color > 0.0 {
         ctx.note("正在分析镜头之间的色彩…");
-        match super::colormatch::analyze_cached(&ffmpeg, &input, &facts, &caps).await {
-            Ok(a) => {
-                let color = a.plan(spec.match_color, &spec.match_exclude);
-                if color.fixes.is_empty() {
-                    color_notes.push(a.note.clone().unwrap_or_else(|| "没有需要校正的镜头".into()));
-                } else {
-                    an.color = Some(color);
-                }
-            }
-            Err(e) => color_warnings.push(format!("分段色彩匹配没有做：{e}")),
+        let analysis = super::colormatch::analyze_cached(&ffmpeg, &input, &facts, &caps).await;
+        let color = match &analysis {
+            Ok(a) => a.plan(spec.match_color, &spec.match_tone, &spec.match_shots),
+            // 分析不了（HDR、太短……）时，统一的手动调节不需要镜头信息，照样做
+            Err(_) => super::colormatch::tone_plan(&spec.match_tone),
+        };
+        match &analysis {
+            Ok(a) if color.fixes.is_empty() => color_notes.push(a.note.clone().unwrap_or_else(|| "没有需要校正的镜头".into())),
+            Err(e) => color_warnings.push(format!("分段色彩匹配没有分析镜头之间的色彩：{e}")),
+            Ok(_) => {}
+        }
+        if !color.fixes.is_empty() {
+            an.color = Some(color);
         }
         ctx.check()?;
     }

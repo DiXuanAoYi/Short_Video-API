@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use super::analyze;
 use super::build::{build, video_graph, NormPlan};
+use super::colormatch::{ShotAdjust, ToneAdjust};
 use super::facts::{self, Facts, Hdr};
 use super::spec::{preset, Analysis, NormSpec};
 use crate::media_tools::muxer_args;
@@ -60,8 +61,12 @@ async fn normalize(ff: &Path, input: &Path, spec: &NormSpec, caps: &Caps, d: &Pa
         an.loudness = analyze::measure_loudness(ff, input, t).await;
     }
     if spec.match_color > 0.0 {
-        if let Ok(a) = super::colormatch::analyze_cached(ff, input, &facts, caps).await {
-            an.color = Some(a.plan(spec.match_color, &spec.match_exclude));
+        let plan = match super::colormatch::analyze_cached(ff, input, &facts, caps).await {
+            Ok(a) => a.plan(spec.match_color, &spec.match_tone, &spec.match_shots),
+            Err(_) => super::colormatch::tone_plan(&spec.match_tone),
+        };
+        if !plan.fixes.is_empty() {
+            an.color = Some(plan);
         }
     }
     let plan = build(input, spec, &facts, &an, caps, &d.join("tmp")).expect("build");
@@ -371,12 +376,12 @@ async fn preview_frames_are_written() {
     let src = need!(hdr_sample(&ff, &d, "smpte2084").await);
     let facts = facts::read(&ff, &src).await.unwrap();
     let vg = video_graph(&preset("compat").unwrap(), &facts, &Analysis::default(), &caps, &d.join("tmp"), "yuv420p", true).unwrap();
-    let (before, after) = analyze::preview(&ff, &src, 500, vg.graph.as_deref(), &d, "k1").await.unwrap();
+    let (before, after) = analyze::preview(&ff, &src, 500, 0, vg.graph.as_deref(), &d, "k1").await.unwrap();
     for p in [&before, &after] {
         assert!(std::fs::metadata(p).unwrap().len() > 500, "{p:?}");
     }
     // 超出视频长度
-    assert!(analyze::preview(&ff, &src, 600_000, vg.graph.as_deref(), &d, "k2").await.is_err());
+    assert!(analyze::preview(&ff, &src, 600_000, 0, vg.graph.as_deref(), &d, "k2").await.is_err());
 }
 
 #[tokio::test]
@@ -562,7 +567,7 @@ async fn color_outliers_between_shots_are_found_and_corrected() {
     let mut spec = preset("mashup").unwrap();
     spec.match_color = 1.0;
     let (out, plan, _) = normalize(&ff, &src, &spec, &caps, &d).await;
-    assert!(plan.notes.iter().any(|n| n.contains("分段色彩匹配：2 个镜头")), "{:?}", plan.notes);
+    assert!(plan.notes.iter().any(|n| n.contains("分段色彩匹配：2 个不一致的镜头自动校正")), "{:?}", plan.notes);
     let f2 = facts::read(&ff, &out).await.unwrap();
     let after = colormatch::analyze(&ff, &out, &f2, &caps).await.expect("analyze after");
     assert!(after.report().flagged.is_empty(), "校正后不应再有不一致的镜头：{:?}", after.report());
@@ -631,7 +636,7 @@ async fn consistent_footage_is_left_alone() {
     let mut spec = preset("mashup").unwrap();
     spec.size = "keep".into();
     let (_, plan, _) = normalize(&ff, &src, &spec, &caps, &d).await;
-    assert!(!plan.notes.iter().any(|n| n.contains("个镜头单独校正")), "{:?}", plan.notes);
+    assert!(!plan.notes.iter().any(|n| n.starts_with("分段色彩匹配")), "{:?}", plan.notes);
 }
 
 #[tokio::test]
@@ -640,17 +645,18 @@ async fn excluded_shots_and_preview_use_the_same_plan() {
     let src = need!(mashup(&ff, &d, "p.mp4", false).await);
     let facts = facts::read(&ff, &src).await.unwrap();
     let a = colormatch::analyze(&ff, &src, &facts, &caps).await.expect("analyze");
-    let full = a.plan(1.0, &[]);
+    let full = a.plan(1.0, &ToneAdjust::default(), &[]);
     assert_eq!(full.fixes.len(), 2);
     // 取消第 2 个镜头（开头约 3000 毫秒）：只剩第 4 个
     let skip = a.report().flagged[0].id;
-    assert_eq!(a.plan(1.0, &[skip]).fixes.len(), 1);
+    let skipped = [ShotAdjust { id: skip, strength: Some(0.0), ..Default::default() }];
+    assert_eq!(a.plan(1.0, &ToneAdjust::default(), &skipped).fixes.len(), 1);
 
     // 预览：在第 2 个镜头里（4 秒处）截一帧，处理后的偏色应该比处理前小得多
     let spec = NormSpec { match_color: 1.0, ..Default::default() };
     let an = Analysis { color: Some(full.shifted(4000)), ..Default::default() };
     let vg = video_graph(&spec, &facts, &an, &caps, &d.join("tmp"), "yuv420p", true).unwrap();
-    let (before, after) = analyze::preview(&ff, &src, 4000, vg.graph.as_deref(), &d, "pv").await.unwrap();
+    let (before, after) = analyze::preview(&ff, &src, 4000, 0, vg.graph.as_deref(), &d, "pv").await.unwrap();
     let stat = |f: &Path| {
         let ff = ff.clone();
         let f = f.to_path_buf();
@@ -680,7 +686,378 @@ async fn excluded_shots_and_preview_use_the_same_plan() {
     // 同一时刻之外（第 3 个镜头，7 秒处）预览不应有任何改动
     let an2 = Analysis { color: Some(full.shifted(7000)), ..Default::default() };
     let vg2 = video_graph(&spec, &facts, &an2, &caps, &d.join("tmp"), "yuv420p", true).unwrap();
-    let (b2, a2) = analyze::preview(&ff, &src, 7000, vg2.graph.as_deref(), &d, "pv2").await.unwrap();
+    let (b2, a2) = analyze::preview(&ff, &src, 7000, 0, vg2.graph.as_deref(), &d, "pv2").await.unwrap();
     let (sb, sa) = (stat(&b2).await, stat(&a2).await);
     assert!((sb.y - sa.y).abs() < 2.0 && (sb.nu - sa.nu).abs() < 2.0, "{sb:?} → {sa:?}");
+}
+
+// ---------- 输出电平 ----------
+
+/// 一条从暗到亮的斜坡（亮度 16→235 或 0→255），用来看电平被拉开还是压缩。
+async fn ramp(ff: &Path, d: &Path, name: &str, full: bool) -> Option<PathBuf> {
+    let (lo, span, tag, pix) = if full { (0, 255, "pc", "yuvj420p") } else { (16, 219, "tv", "yuv420p") };
+    let vf = format!("format=yuv420p,geq=lum='{lo}+{span}*X/319':cb=128:cr=128,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range={tag}");
+    gen(ff, d, name, &["-f", "lavfi", "-i", "nullsrc=s=320x180:r=25:d=2"], &["-vf", &vf, "-c:v", "libx264", "-crf", "8", "-pix_fmt", pix]).await
+}
+
+/// 第一帧亮度的最小值、最大值（signalstats 直接读编码里的数值，不做 yuvj / 电平转换）。
+async fn luma_extremes(ff: &Path, file: &Path) -> (u32, u32) {
+    let a = strs(&[
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        &file.to_string_lossy(),
+        "-vf",
+        "signalstats,metadata=print:file=-",
+        "-frames:v",
+        "1",
+        "-f",
+        "null",
+        "-",
+    ]);
+    let out = String::from_utf8_lossy(&run_ffmpeg_capture(ff, &a, Duration::from_secs(30)).await.unwrap().0).into_owned();
+    let get = |k: &str| -> u32 {
+        out.lines()
+            .find_map(|l| l.split_once(&format!("lavfi.signalstats.{k}=")).map(|(_, v)| v.trim().parse().unwrap()))
+            .unwrap_or_else(|| panic!("没有 {k}：{out}"))
+    };
+    (get("YMIN"), get("YMAX"))
+}
+
+#[tokio::test]
+async fn output_range_16_235_and_0_255_are_both_honoured() {
+    let (ff, d, caps) = need!(setup("range").await);
+    let limited = need!(ramp(&ff, &d, "tv.mp4", false).await);
+    let full = need!(ramp(&ff, &d, "pc.mp4", true).await);
+    let spec = |r: &str| NormSpec { size: "keep".into(), out_range: r.into(), ..Default::default() };
+    let tags = |f: &Facts| f.video.as_ref().unwrap().full_range();
+
+    // 默认 16–235：电视范围的素材不动；全范围的素材压回 16–235，并写成电视范围
+    let (_, plan, _) = normalize(&ff, &limited, &spec("tv"), &caps, &d).await;
+    assert!(plan.unchanged, "{:?}", plan.notes);
+    let (out, plan, _) = normalize(&ff, &full, &spec("tv"), &caps, &d).await;
+    assert!(!plan.unchanged);
+    let (lo, hi) = luma_extremes(&ff, &out).await;
+    assert!(lo >= 14 && (225..=237).contains(&hi), "全范围素材应压进 16–235：{lo}–{hi}");
+    assert!(!tags(&facts::read(&ff, &out).await.unwrap()));
+
+    // 0–255：电视范围的素材拉开，输出标成全范围
+    let (out, plan, _) = normalize(&ff, &limited, &spec("pc"), &caps, &d).await;
+    assert!(!plan.unchanged && plan.notes.iter().any(|n| n.contains("0–255")), "{:?}", plan.notes);
+    let (lo, hi) = luma_extremes(&ff, &out).await;
+    assert!(lo <= 6 && hi >= 249, "电视范围的素材应拉开到接近 0–255：{lo}–{hi}");
+    assert!(tags(&facts::read(&ff, &out).await.unwrap()), "输出应标成全范围");
+
+    // 全范围的素材选 0–255：数值原样保留
+    let (out, plan, _) = normalize(&ff, &full, &spec("pc"), &caps, &d).await;
+    if !plan.unchanged {
+        let (lo, hi) = luma_extremes(&ff, &out).await;
+        assert!(lo <= 6 && hi >= 249, "{lo}–{hi}");
+    }
+
+    // 沿用素材：电视范围还是电视范围
+    let (out, plan, _) = normalize(&ff, &limited, &spec("keep"), &caps, &d).await;
+    assert!(plan.unchanged || !tags(&facts::read(&ff, &out).await.unwrap()));
+}
+
+#[tokio::test]
+async fn full_range_output_survives_lut_levels_and_hdr() {
+    let (ff, d, caps) = need!(setup("range-chain").await);
+    let limited = need!(ramp(&ff, &d, "tv.mp4", false).await);
+    // 一个什么都不改的 LUT（单位 LUT）：电平仍然要落在 0–255
+    let lut = d.join("identity.cube");
+    let mut cube = String::from("LUT_3D_SIZE 2\n");
+    for b in 0..2 {
+        for g in 0..2 {
+            for r in 0..2 {
+                cube.push_str(&format!("{r} {g} {b}\n"));
+            }
+        }
+    }
+    std::fs::write(&lut, cube).unwrap();
+    let spec = NormSpec { size: "keep".into(), out_range: "pc".into(), lut: Some(lut.to_string_lossy().into_owned()), levels: 0.0, ..Default::default() };
+    let (out, _, _) = normalize(&ff, &limited, &spec, &caps, &d).await;
+    let (lo, hi) = luma_extremes(&ff, &out).await;
+    assert!(lo <= 8 && hi >= 247, "LUT 之后仍应是 0–255：{lo}–{hi}");
+    assert!(facts::read(&ff, &out).await.unwrap().video.unwrap().full_range());
+
+    // HDR 转 SDR 后同样按所选电平输出（用一条不太亮的 PQ 灰阶：真实素材的高光不会超出范围）
+    let hdr = need!(
+        gen(
+            &ff,
+            &d,
+            "hdrramp.mp4",
+            &["-f", "lavfi", "-i", "nullsrc=s=320x180:r=25:d=2"],
+            &[
+                "-vf",
+                "format=yuv420p10le,geq=lum='64+576*X/319':cb=512:cr=512,setparams=colorspace=bt2020nc:color_primaries=bt2020:color_trc=smpte2084:range=tv",
+                "-c:v",
+                "libx264",
+                "-crf",
+                "6",
+                "-pix_fmt",
+                "yuv420p10le",
+            ],
+        )
+        .await
+    );
+    let mut got = vec![];
+    for (r, want_full) in [("tv", false), ("pc", true)] {
+        let (out, _, _) = normalize(&ff, &hdr, &NormSpec { out_range: r.into(), ..preset("compat").unwrap() }, &caps, &d).await;
+        let v = facts::read(&ff, &out).await.unwrap().video.unwrap();
+        assert_eq!(v.full_range(), want_full, "{r}: {v:?}");
+        got.push(luma_extremes(&ff, &out).await);
+    }
+    let ((tv_lo, tv_hi), (pc_lo, pc_hi)) = (got[0], got[1]);
+    assert!(tv_lo >= 14 && tv_hi <= 237, "16–235 输出：{tv_lo}–{tv_hi}");
+    assert!(pc_lo <= 4 && pc_hi >= tv_hi + 8, "0–255 输出应该比 16–235 的更宽：{pc_lo}–{pc_hi} 对 {tv_lo}–{tv_hi}");
+}
+
+// ---------- 降噪 ----------
+
+/// 干净画面和加了噪点的画面（同一份内容），都用接近无损的方式编码，再返回两者的路径。
+async fn noisy_pair(ff: &Path, d: &Path) -> Option<(PathBuf, PathBuf)> {
+    let clean = gen(
+        ff,
+        d,
+        "clean.mkv",
+        &["-f", "lavfi", "-i", "testsrc2=s=640x360:r=25:d=2"],
+        &["-vf", "format=yuv420p", "-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv420p"],
+    )
+    .await?;
+    let noisy = gen(
+        ff,
+        d,
+        "noisy.mkv",
+        &["-i", &clean.to_string_lossy()],
+        &["-vf", "noise=alls=16:allf=t+u:all_seed=7,format=yuv420p", "-c:v", "libx264", "-qp", "4", "-pix_fmt", "yuv420p"],
+    )
+    .await?;
+    Some((clean, noisy))
+}
+
+/// 两个视频之间的平均 PSNR（dB，越高越接近）。
+async fn psnr(ff: &Path, a: &Path, b: &Path) -> f64 {
+    let args = strs(&[
+        "-hide_banner",
+        "-i",
+        &a.to_string_lossy(),
+        "-i",
+        &b.to_string_lossy(),
+        "-lavfi",
+        "[0:v]format=yuv420p[a];[1:v]format=yuv420p[b];[a][b]psnr",
+        "-f",
+        "null",
+        "-",
+    ]);
+    let log = run_ffmpeg_capture(ff, &args, Duration::from_secs(120)).await.unwrap().1;
+    let at = log.rfind("average:").unwrap_or_else(|| panic!("没有 PSNR 结果：{log}"));
+    log[at + 8..].split_whitespace().next().unwrap().parse().unwrap()
+}
+
+#[tokio::test]
+async fn every_denoise_level_brings_the_picture_closer_to_the_clean_original() {
+    let (ff, d, caps) = need!(setup("denoise").await);
+    let (clean, noisy) = need!(noisy_pair(&ff, &d).await);
+    let base = NormSpec { size: "keep".into(), ..Default::default() };
+    let (off, _, _) = normalize(&ff, &noisy, &base, &caps, &d).await;
+    let off = {
+        let keep = d.join("off.mkv");
+        std::fs::copy(&off, &keep).ok();
+        if keep.exists() {
+            keep
+        } else {
+            noisy.clone()
+        }
+    };
+    let baseline = psnr(&ff, &off, &clean).await;
+    for level in ["light", "medium", "strong", "best"] {
+        let spec = NormSpec { denoise: level.into(), ..base.clone() };
+        let (out, plan, _) = normalize(&ff, &noisy, &spec, &caps, &d).await;
+        if plan.notes.iter().all(|n| !n.starts_with("降噪")) {
+            // 这个 ffmpeg 一个降噪滤镜都没有：应该有警告而不是失败
+            assert!(plan.warnings.iter().any(|w| w.contains("降噪没有执行")), "{:?}", plan);
+            continue;
+        }
+        let p = psnr(&ff, &out, &clean).await;
+        assert!(p > baseline + 1.0, "{level}：降噪后 PSNR {p:.2} dB，没降噪 {baseline:.2} dB，{:?}", plan.notes);
+        // 同一个 ffmpeg 里降噪不应该把画面糊成一团：和干净原片的差距至少比噪点小
+        assert!(p > 25.0, "{level}：{p:.2} dB");
+    }
+}
+
+#[tokio::test]
+async fn denoise_falls_back_to_the_filters_this_ffmpeg_does_have() {
+    let (ff, d, caps) = need!(setup("denoise-fallback").await);
+    let (clean, noisy) = need!(noisy_pair(&ff, &d).await);
+    let base = NormSpec { size: "keep".into(), ..Default::default() };
+    let (off, _, _) = normalize(&ff, &noisy, &base, &caps, &d).await;
+    let off_copy = d.join("off.mkv");
+    std::fs::copy(&off, &off_copy).unwrap();
+    let baseline = psnr(&ff, &off_copy, &clean).await;
+    // 依次去掉首选滤镜，剩下的备选在真实的 ffmpeg 上也要能跑，并且有效果
+    for (drop, level, want) in [
+        (vec!["nlmeans"], "best", "fftdnoiz"),
+        (vec!["nlmeans", "fftdnoiz"], "medium", "hqdn3d"),
+        (vec!["nlmeans", "fftdnoiz", "hqdn3d"], "medium", "atadenoise"),
+    ] {
+        if !caps.has_filter(want) {
+            continue;
+        }
+        let mut c = caps.clone();
+        for f in &drop {
+            c.filters.remove(*f);
+        }
+        let spec = NormSpec { denoise: level.into(), ..base.clone() };
+        let (out, plan, _) = normalize(&ff, &noisy, &spec, &c, &d).await;
+        assert!(plan.args.iter().any(|a| a.contains(want)), "{want}：{:?}", plan.args);
+        assert!(plan.warnings.iter().any(|w| w.contains("替代")), "{:?}", plan.warnings);
+        let p = psnr(&ff, &out, &clean).await;
+        assert!(p > baseline + 0.5, "{want}：{p:.2} dB，没降噪 {baseline:.2} dB");
+    }
+}
+
+#[tokio::test]
+async fn denoise_works_together_with_resizing_and_other_steps() {
+    let (ff, d, caps) = need!(setup("denoise-chain").await);
+    let (_, noisy) = need!(noisy_pair(&ff, &d).await);
+    if !caps.has_filter("fftdnoiz") {
+        return;
+    }
+    // 缩小、放大、竖屏模糊填充，每种尺寸方式都和降噪一起跑一遍
+    for (size, w, h) in [("limit", 640, 360), ("fit", 1280, 720), ("blur", 360, 640)] {
+        let spec =
+            NormSpec { size: size.into(), short_side: 240, width: w, height: h, follow_orientation: false, denoise: "medium".into(), ..Default::default() };
+        let (out, plan, _) = normalize(&ff, &noisy, &spec, &caps, &d).await;
+        assert!(plan.notes.iter().any(|n| n.starts_with("降噪")), "{:?}", plan.notes);
+        let v = facts::read(&ff, &out).await.unwrap().video.unwrap();
+        match size {
+            "limit" => assert_eq!(v.height, 240, "{v:?}"),
+            _ => assert_eq!((v.width, v.height), (w, h), "{v:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn preview_with_denoise_is_warmed_up_and_cleaner_than_the_original() {
+    let (ff, d, caps) = need!(setup("denoise-preview").await);
+    let (_, noisy) = need!(noisy_pair(&ff, &d).await);
+    if !caps.has_filter("fftdnoiz") {
+        return;
+    }
+    let facts = facts::read(&ff, &noisy).await.unwrap();
+    let spec = NormSpec { size: "keep".into(), denoise: "strong".into(), ..Default::default() };
+    let vg = video_graph(&spec, &facts, &Analysis::default(), &caps, &d.join("tmp"), "yuv420p", true).unwrap();
+    // 预览点在 1 秒处，预热 500 毫秒；也试一个靠近开头的时间点（预热被截到 200 毫秒）
+    for (at, warm) in [(1000, 500), (200, 200), (0, 0)] {
+        let (before, after) = analyze::preview(&ff, &noisy, at, warm, vg.graph.as_deref(), &d, &format!("w{at}")).await.unwrap();
+        let (b, a) = (std::fs::metadata(&before).unwrap().len(), std::fs::metadata(&after).unwrap().len());
+        // 噪点去掉以后画面更“干净”，压缩出来的图片也小得多
+        assert!(a * 10 < b * 8, "时间点 {at}：处理后 {a} 字节，处理前 {b} 字节");
+    }
+}
+
+// ---------- 分段色彩匹配：统一调节 / 单独调节 ----------
+
+#[tokio::test]
+async fn selected_shots_use_their_own_adjustment_and_the_rest_use_the_unified_one() {
+    let (ff, d, caps) = need!(setup("colormatch-tone").await);
+    let src = need!(mashup(&ff, &d, "t.mp4", false).await);
+    let facts = facts::read(&ff, &src).await.unwrap();
+    let a = colormatch::analyze(&ff, &src, &facts, &caps).await.expect("analyze");
+    let rep = a.report();
+    assert_eq!(rep.flagged.len(), 2, "{rep:?}");
+    let (second, fourth) = (rep.flagged[0].id, rep.flagged[1].id);
+
+    // 各个镜头中间时刻的亮度、色彩：处理前
+    let mid = [1.5, 4.5, 7.5, 10.5, 13.5];
+    let mut before = vec![];
+    for t in mid {
+        before.push(stats_at(&ff, &src, t).await);
+    }
+    let run = |tone: ToneAdjust, shots: Vec<ShotAdjust>| {
+        let (ff, d, caps, src) = (ff.clone(), d.clone(), caps.clone(), src.clone());
+        async move {
+            let spec = NormSpec { size: "keep".into(), match_color: 1.0, match_tone: tone, match_shots: shots, ..Default::default() };
+            let (out, plan, _) = normalize(&ff, &src, &spec, &caps, &d).await;
+            let mut now = vec![];
+            for t in mid {
+                now.push(stats_at(&ff, &out, t).await);
+            }
+            (now, plan)
+        }
+    };
+
+    // 1. 只有自动校正：一致的镜头不动
+    let (base, _) = run(ToneAdjust::default(), vec![]).await;
+    for i in [0, 2, 4] {
+        assert!((base[i].y - before[i].y).abs() < 3.0, "镜头 {i}：{:?} → {:?}", before[i], base[i]);
+    }
+
+    // 2. 统一提亮；第 2 个镜头单独调节（自动校正，自己的调节为 0）：其余镜头提亮，它不提亮
+    let bright = ToneAdjust { brightness: 0.5, ..Default::default() };
+    let (now, plan) = run(bright, vec![ShotAdjust { id: second, strength: Some(1.0), tone: ToneAdjust::default() }]).await;
+    assert!(plan.notes.iter().any(|n| n.contains("1 个镜头单独调节") && n.contains("其余镜头用统一的手动调节")), "{:?}", plan.notes);
+    for i in [0, 2, 4] {
+        assert!(now[i].y > before[i].y + 12.0, "镜头 {i} 应按统一参数提亮：{:?} → {:?}", before[i], now[i]);
+    }
+    assert!(now[1].y < base[1].y + 3.0, "单独调节的镜头不该再被统一提亮：自动校正 {:?}，现在 {:?}", base[1], now[1]);
+    // 没被选中的不一致镜头（第 4 个）：自动校正之外也要统一提亮
+    assert!(now[3].y > base[3].y + 12.0, "第 4 个镜头用统一参数：{:?} → {:?}", base[3], now[3]);
+
+    // 3. 单独调节有自己的参数：第 2 个镜头调暗，和统一的提亮方向相反
+    let dark = ToneAdjust { brightness: -0.5, ..Default::default() };
+    let (now, _) = run(bright, vec![ShotAdjust { id: second, strength: Some(1.0), tone: dark }]).await;
+    assert!(now[1].y < base[1].y - 12.0, "单独调暗：自动校正 {:?}，现在 {:?}", base[1], now[1]);
+    for i in [0, 2, 4] {
+        assert!(now[i].y > before[i].y + 12.0, "其余镜头仍按统一参数提亮：{:?} → {:?}", before[i], now[i]);
+    }
+
+    // 4. 单独调节里把自动校正强度设为 0：这个镜头保持原样
+    let (now, _) = run(ToneAdjust::default(), vec![ShotAdjust { id: fourth, strength: Some(0.0), tone: ToneAdjust::default() }]).await;
+    assert!((now[3].y - before[3].y).abs() < 3.0, "第 4 个镜头不处理：{:?} → {:?}", before[3], now[3]);
+    assert!(dist_to_ref(&now[1], &a.looks().1.st) < dist_to_ref(&before[1], &a.looks().1.st) * 0.5, "第 2 个镜头仍按统一强度自动校正");
+}
+
+#[tokio::test]
+async fn unified_adjustment_still_works_when_shots_cannot_be_analysed() {
+    let (ff, d, caps) = need!(setup("colormatch-tone-short").await);
+    // 太短（分析不了镜头）的视频：统一的手动调节照样应用
+    let src = need!(gen(&ff, &d, "short.mp4", &["-f", "lavfi", "-i", "testsrc2=s=320x180:r=25:d=1"], &["-c:v", "libx264", "-pix_fmt", "yuv420p"]).await);
+    let before = stats_at(&ff, &src, 0.5).await;
+    let spec = NormSpec { size: "keep".into(), match_color: 1.0, match_tone: ToneAdjust { saturation: -1.0, ..Default::default() }, ..Default::default() };
+    let (out, plan, _) = normalize(&ff, &src, &spec, &caps, &d).await;
+    let now = stats_at(&ff, &out, 0.5).await;
+    assert!(now.sat < before.sat * 0.3, "饱和度 -1 应该接近黑白：{:?} → {:?}（{:?}）", before, now, plan.notes);
+}
+
+#[tokio::test]
+async fn a_graph_too_long_for_the_command_line_still_runs_from_a_file() {
+    use super::colormatch::{ColorFix, ColorPlan, Curve};
+    let (ff, d, caps) = need!(setup("long-graph").await);
+    let src = need!(gen(&ff, &d, "g.mp4", &["-f", "lavfi", "-i", "testsrc2=s=320x180:r=25:d=2"], &["-c:v", "libx264", "-pix_fmt", "yuv420p"]).await);
+    let facts = facts::read(&ff, &src).await.unwrap();
+    // 250 个只管 8 毫秒的校正，合起来把整段视频提亮 30 级；滤镜图有四万多个字符
+    let fixes: Vec<ColorFix> = (0..250)
+        .map(|i| ColorFix {
+            start_ms: Some(i * 8),
+            end_ms: Some(i * 8 + 8),
+            y: Some(Curve { pivot: 126.0, gain: 1.0, out: 156.0 }),
+            u: None,
+            v: None,
+            except: vec![],
+        })
+        .collect();
+    let an = Analysis { color: Some(ColorPlan { fixes, auto_shots: 250, own_shots: 0, unified: false }), ..Default::default() };
+    let spec = NormSpec { size: "keep".into(), match_color: 1.0, ..Default::default() };
+    let plan = build(&src, &spec, &facts, &an, &caps, &d.join("tmp")).unwrap();
+    assert!(plan.args.iter().all(|a| a.len() < 1000), "滤镜图应该在文件里，不在命令行上");
+    let out = d.join("out.mp4");
+    let mut a = base_args();
+    a.extend(plan.args.clone());
+    a.extend(muxer_args(plan.ext, &out));
+    run_ffmpeg_capture(&ff, &a, Duration::from_secs(120)).await.unwrap_or_else(|e| panic!("ffmpeg 失败：{e}\n参数：{a:?}"));
+    let (before, now) = (stats_at(&ff, &src, 1.0).await, stats_at(&ff, &out, 1.0).await);
+    assert!(now.y > before.y + 20.0, "{before:?} → {now:?}");
 }

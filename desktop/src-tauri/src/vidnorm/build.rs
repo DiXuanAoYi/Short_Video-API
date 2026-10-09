@@ -34,6 +34,8 @@ pub struct VideoGraph {
     pub out_w: u32,
     pub out_h: u32,
     pub out_fps: Option<f64>,
+    /// 输出是全范围（0–255）；否则是电视范围（16–235）
+    pub out_pc: bool,
     /// 需要重新编码的原因
     pub reasons: Vec<&'static str>,
     pub notes: Vec<String>,
@@ -236,7 +238,7 @@ fn plan_size(spec: &NormSpec, w: u32, h: u32) -> (SizeOp, u32, u32, Option<&'sta
 
 // ---------- HDR → SDR ----------
 
-fn tonemap_chain(v: &VideoFacts, caps: &Caps, tmp: &Path, g: &mut VideoGraph) -> Option<String> {
+fn tonemap_chain(v: &VideoFacts, caps: &Caps, tmp: &Path, g: &mut VideoGraph, range: &str) -> Option<String> {
     let tin = match v.hdr {
         Hdr::Pq => "smpte2084",
         Hdr::Hlg => "arib-std-b67",
@@ -249,7 +251,7 @@ fn tonemap_chain(v: &VideoFacts, caps: &Caps, tmp: &Path, g: &mut VideoGraph) ->
         let m = if v.matrix.as_deref() == Some("bt2020c") { "bt2020c" } else { "bt2020nc" };
         g.notes.push(format!("{} 转 SDR（zscale + Hable 色调映射）", v.hdr.label()));
         return Some(format!(
-            "zscale=tin={tin}:min={m}:pin=bt2020:rin=tv:t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
+            "zscale=tin={tin}:min={m}:pin=bt2020:rin=tv:t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r={range},format=yuv420p"
         ));
     }
     if caps.has_filter("lut3d") {
@@ -265,11 +267,61 @@ fn tonemap_chain(v: &VideoFacts, caps: &Caps, tmp: &Path, g: &mut VideoGraph) ->
         ));
         g.notes.push(format!("{} 转 SDR（内置 3D LUT 色调映射）", v.hdr.label()));
         return Some(format!(
-            "scale=in_color_matrix=bt2020:in_range=tv,format=gbrp16le,lut3d=file={}:interp=tetrahedral,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p",
+            "scale=in_color_matrix=bt2020:in_range=tv,format=gbrp16le,lut3d=file={}:interp=tetrahedral,scale=out_color_matrix=bt709:out_range={range},format=yuv420p",
             filter_path(&path)
         ));
     }
     g.warnings.push("当前的 ffmpeg 既没有 zscale 也没有 lut3d，无法把 HDR 转成 SDR。".into());
+    None
+}
+
+// ---------- 降噪 ----------
+
+/// 降噪档位的中文名。
+pub fn denoise_label(level: &str) -> &'static str {
+    match level {
+        "light" => "弱",
+        "medium" => "中",
+        "strong" => "强",
+        "best" => "高质量",
+        _ => "关闭",
+    }
+}
+
+/// 按档位和 ffmpeg 的能力选降噪滤镜，返回 (滤镜, 说明, 是不是退而求其次的做法)。没有任何降噪滤镜时返回 None。
+///
+/// 参数是用加了随机噪点的合成画面标定的（噪点幅度约 5 / 9 / 17 档对应 弱 / 中 / 强），再对照真实素材微调：
+/// - `fftdnoiz`（频域降噪，精简版和完整版 ffmpeg 都有）：按块做 FFT，滤掉幅度低于 σ 的成分，细节损失小，速度约为实时的 1/2（1080p）。
+/// - `nlmeans`（非局部均值）：画质最好但慢得多（约为上面的 1/4 速度），用在“高质量”。
+/// - 没有 `fftdnoiz` 的旧版 ffmpeg 退到 `hqdn3d`（只在完整版里），再退到 `atadenoise`（时域平均，只适合静止镜头）。
+pub fn denoise_filter(level: &str, caps: &Caps) -> Option<(String, String, bool)> {
+    let tier = match level {
+        "light" => 0,
+        "medium" => 1,
+        "strong" => 2,
+        "best" => 3,
+        _ => return None,
+    };
+    let name = denoise_label(level);
+    if tier == 3 && caps.has_filter("nlmeans") {
+        return Some(("nlmeans=s=4:p=3:r=7".into(), format!("降噪（{name}，nlmeans 非局部均值，处理速度慢）"), false));
+    }
+    // “高质量”没有 nlmeans 时按“强”处理
+    let t = tier.min(2);
+    let sigma = [4, 8, 14][t];
+    let fallback = tier == 3;
+    if caps.has_filter("fftdnoiz") {
+        return Some((format!("fftdnoiz=sigma={sigma}"), format!("降噪（{name}，fftdnoiz，强度 {sigma}）"), fallback));
+    }
+    if caps.has_filter("hqdn3d") {
+        let p = ["2:1.5:3:2.25", "4:3:6:4.5", "8:6:10:7.5"][t];
+        return Some((format!("hqdn3d={p}"), format!("降噪（{name}，hqdn3d）"), true));
+    }
+    if caps.has_filter("atadenoise") {
+        let th = [0.02, 0.04, 0.08][t];
+        let f = format!("atadenoise=0a={th}:0b={}:1a={th}:1b={}:2a={th}:2b={}:s=7", th * 2.0, th * 2.0, th * 2.0);
+        return Some((f, format!("降噪（{name}，atadenoise 时域平均）"), true));
+    }
     None
 }
 
@@ -280,6 +332,13 @@ pub fn video_graph(spec: &NormSpec, facts: &Facts, an: &Analysis, caps: &Caps, t
     let v = facts.video.as_ref().ok_or_else(|| AppError::invalid("这个文件里没有视频画面。"))?;
     let mut out = VideoGraph::default();
     let mut g = Graph::new();
+    // 输出电平：tv 16–235、pc 0–255、keep 沿用素材的；`cur_pc` 是滤镜链走到这一步时画面的电平
+    let want_pc: Option<bool> = match spec.out_range.as_str() {
+        "tv" => Some(false),
+        "pc" => Some(true),
+        _ => None,
+    };
+    let mut cur_pc = v.full_range();
 
     // 分段色彩匹配：放在最前面，滤镜看到的时间戳和分析时一致（后面的帧率转换会改写时间戳）。
     // 校正用 lutyuv，只认 8 位的 YUV 平面格式，其他格式先转成 yuv420p。
@@ -296,7 +355,7 @@ pub fn video_graph(spec: &NormSpec, facts: &Facts, an: &Analysis, caps: &Caps, t
                     g.push(&fix.filter());
                 }
                 out.reasons.push("color_match");
-                out.notes.push(format!("分段色彩匹配：{} 个镜头单独校正到和整体一致", plan.fixes.len()));
+                out.notes.push(plan.describe());
             }
         }
     }
@@ -343,12 +402,40 @@ pub fn video_graph(spec: &NormSpec, facts: &Facts, an: &Analysis, caps: &Caps, t
         out.notes.push("非方形像素改为方形".into());
     }
 
-    // 画面尺寸
+    // 画面尺寸；降噪放在缩放前（放大或不缩放时，噪点要在被放大之前去掉），缩小时放在缩放后（更快，缩小本身也会压低噪点）
     let (op, ow, oh, why) = plan_size(spec, w, h);
+    let denoise = if spec.denoise == "off" {
+        None
+    } else {
+        match denoise_filter(&spec.denoise, caps) {
+            Some(d) => Some(d),
+            None => {
+                out.warnings.push("当前的 ffmpeg 没有降噪滤镜（fftdnoiz、nlmeans、hqdn3d、atadenoise），降噪没有执行。".into());
+                None
+            }
+        }
+    };
+    let shrinks = u64::from(ow) * u64::from(oh) < u64::from(w) * u64::from(h);
+    let denoise_push = |g: &mut Graph, out: &mut VideoGraph| {
+        if let Some((f, note, fallback)) = &denoise {
+            g.push(f);
+            out.reasons.push("denoise");
+            out.notes.push(note.clone());
+            if *fallback {
+                out.warnings.push("当前的 ffmpeg 没有所选档位首选的降噪滤镜，改用了效果稍弱的替代做法。".into());
+            }
+        }
+    };
+    if !shrinks {
+        denoise_push(&mut g, &mut out);
+    }
     match op {
         SizeOp::None => {}
         SizeOp::Filter(f) => g.push(&f),
         SizeOp::Blur(tw, th) => g.blur_fill(tw, th),
+    }
+    if shrinks {
+        denoise_push(&mut g, &mut out);
     }
     if let Some(why) = why {
         out.reasons.push("size");
@@ -361,23 +448,25 @@ pub fn video_graph(spec: &NormSpec, facts: &Facts, an: &Analysis, caps: &Caps, t
     // HDR → SDR
     let mut sdr_done = false;
     if spec.hdr && v.hdr != Hdr::None {
-        if let Some(c) = tonemap_chain(v, caps, tmp, &mut out) {
+        if let Some(c) = tonemap_chain(v, caps, tmp, &mut out, if want_pc == Some(true) { "pc" } else { "tv" }) {
             g.push(&c);
             sdr_done = true;
+            cur_pc = want_pc == Some(true);
             out.reasons.push("hdr");
         }
     }
 
-    // 色彩：全范围转电视范围、BT.601 转 BT.709
+    // 色彩：全范围转电视范围（输出电平选了 16–235 时）、BT.601 转 BT.709
     let assumed = assumed_matrix(v).to_string();
-    if spec.fix_color && !sdr_done {
-        let hd_out = oh >= 720;
-        if v.full_range() {
+    if !sdr_done {
+        if want_pc == Some(false) && cur_pc {
             g.push("scale=in_range=pc:out_range=tv");
+            cur_pc = false;
             out.reasons.push("range");
-            out.notes.push("全范围色彩转电视范围".into());
+            out.notes.push("全范围色彩转电视范围（16–235）".into());
         }
-        if hd_out && matches!(assumed.as_str(), "bt470bg" | "smpte170m" | "fcc" | "smpte240m") && caps.has_filter("colorspace") {
+        let hd_out = oh >= 720;
+        if spec.fix_color && hd_out && matches!(assumed.as_str(), "bt470bg" | "smpte170m" | "fcc" | "smpte240m") && caps.has_filter("colorspace") {
             g.push(&format!("colorspace=all=bt709:iall={assumed}"));
             out.reasons.push("matrix");
             out.notes.push("BT.601 转 BT.709".into());
@@ -401,8 +490,9 @@ pub fn video_graph(spec: &NormSpec, facts: &Facts, an: &Analysis, caps: &Caps, t
             return Err(AppError::invalid(format!("找不到 LUT 文件：{lut}")));
         }
         if caps.has_filter("lut3d") {
+            let r = if cur_pc { "pc" } else { "tv" };
             let chain = format!(
-                "scale=in_color_matrix=bt709:in_range=tv,format=gbrp16le,lut3d=file={}:interp=tetrahedral,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p",
+                "scale=in_color_matrix=bt709:in_range={r},format=gbrp16le,lut3d=file={}:interp=tetrahedral,scale=out_color_matrix=bt709:out_range={r},format=yuv420p",
                 filter_path(Path::new(lut))
             );
             if spec.lut_strength >= 0.995 {
@@ -420,6 +510,15 @@ pub fn video_graph(spec: &NormSpec, facts: &Facts, an: &Analysis, caps: &Caps, t
         }
     }
 
+    // 输出电平选了 0–255：色阶、LUT 这些都在电视范围里做完，最后一步再拉开，避免反复取整
+    if want_pc == Some(true) && !cur_pc {
+        g.push("scale=in_range=tv:out_range=pc");
+        cur_pc = true;
+        out.reasons.push("range");
+        out.notes.push("电视范围转全范围（0–255）".into());
+    }
+    out.out_pc = cur_pc;
+
     // 像素格式：转成 8 位 4:2:0
     let pix_change = v.pix_fmt != "yuv420p" && !(v.pix_fmt == "nv12" && pix == "nv12");
     if pix_change && !out.reasons.contains(&"hdr") {
@@ -429,10 +528,14 @@ pub fn video_graph(spec: &NormSpec, facts: &Facts, an: &Analysis, caps: &Caps, t
         }
     }
     if !g.is_empty() || pix_change {
+        // 全范围的画面转 8 位 4:2:0 时，明说“范围不变”：yuvj420p 直接转 yuv420p 会被当成电视范围压缩
+        if pix_change && cur_pc && !sdr_done {
+            g.push("scale=in_range=pc:out_range=pc");
+        }
         g.push(&format!("format={pix}"));
         // 写明输出的色彩标记（没有转成 SDR 的 HDR 保持原标记）
         if let Some(tag) = out_color(v, oh, spec.fix_color, sdr_done).filter(|_| v.hdr == Hdr::None || sdr_done) {
-            g.push(&format!("setparams=colorspace={tag}:color_primaries={tag}:color_trc={tag}:range=tv"));
+            g.push(&format!("setparams=colorspace={tag}:color_primaries={tag}:color_trc={tag}:range={}", if cur_pc { "pc" } else { "tv" }));
         }
         out.graph = Some(g.finish());
     }
@@ -440,6 +543,22 @@ pub fn video_graph(spec: &NormSpec, facts: &Facts, an: &Analysis, caps: &Caps, t
 }
 
 // ---------- 编码 ----------
+
+/// 滤镜图超过这个长度就放进文件（见 `graph_args`）。
+const GRAPH_INLINE_MAX: usize = 12_000;
+
+/// 传滤镜图的参数。分段色彩匹配的镜头很多时滤镜图会很长，Windows 的命令行上限约 32K 字符，
+/// 所以长的滤镜图写进临时文件再让 ffmpeg 去读：新版（7.0 起）是 `-/filter_complex 文件`，旧版是 `-filter_complex_script 文件`。
+fn graph_args(graph: &str, caps: &Caps, tmp: &Path) -> AppResult<Vec<String>> {
+    if graph.len() <= GRAPH_INLINE_MAX {
+        return Ok(s(&["-filter_complex", graph]));
+    }
+    std::fs::create_dir_all(tmp)?;
+    let file = tmp.join("filtergraph.txt");
+    std::fs::write(&file, graph)?;
+    let path = file.to_string_lossy().into_owned();
+    Ok(if caps.major == 0 || caps.major >= 7 { vec!["-/filter_complex".into(), path] } else { vec!["-filter_complex_script".into(), path] })
+}
 
 fn replace_arg(args: &mut [String], key: &str, value: &str) {
     if let Some(i) = args.iter().position(|a| a == key) {
@@ -538,7 +657,8 @@ pub fn build(input: &Path, spec: &NormSpec, facts: &Facts, an: &Analysis, caps: 
         // 没有别的滤镜时也要走一遍 setparams，否则这两项会被写成 unknown。
         if vg.graph.is_none() {
             if let Some(tag) = color_tag {
-                vg.graph = Some(format!("[0:v:0]setparams=colorspace={tag}:color_primaries={tag}:color_trc={tag}:range=tv[v]"));
+                vg.graph =
+                    Some(format!("[0:v:0]setparams=colorspace={tag}:color_primaries={tag}:color_trc={tag}:range={}[v]", if vg.out_pc { "pc" } else { "tv" }));
             }
         }
         let fps = vg.out_fps.or(v.fps).unwrap_or(30.0).clamp(1.0, 240.0);
@@ -559,7 +679,10 @@ pub fn build(input: &Path, spec: &NormSpec, facts: &Facts, an: &Analysis, caps: 
         match hevc {
             Some((args, _)) => {
                 match &vg.graph {
-                    Some(g) => a.extend(["-filter_complex".into(), g.clone(), "-map".into(), "[v]".into()]),
+                    Some(g) => {
+                        a.extend(graph_args(g, caps, tmp)?);
+                        a.extend(s(&["-map", "[v]"]));
+                    }
                     None => a.extend(s(&["-map", "0:v:0"])),
                 }
                 a.extend(args);
@@ -569,7 +692,10 @@ pub fn build(input: &Path, spec: &NormSpec, facts: &Facts, an: &Analysis, caps: 
                 let mut vc = video_codec_for(&caps.encoders, q_for_codec, "mp4", Some(pps));
                 replace_arg(&mut vc.args, "-crf", ["25", "21", "18"][level]);
                 match &vg.graph {
-                    Some(g) => a.extend(["-filter_complex".into(), g.clone(), "-map".into(), "[v]".into()]),
+                    Some(g) => {
+                        a.extend(graph_args(g, caps, tmp)?);
+                        a.extend(s(&["-map", "[v]"]));
+                    }
                     None => a.extend(s(&["-map", "0:v:0"])),
                 }
                 a.extend(vc.args);
@@ -585,7 +711,7 @@ pub fn build(input: &Path, spec: &NormSpec, facts: &Facts, an: &Analysis, caps: 
             a.extend(if caps.has_fps_mode() { s(&["-fps_mode", "vfr"]) } else { s(&["-vsync", "vfr"]) });
         }
         if let Some(tag) = color_tag {
-            a.extend(s(&["-colorspace", tag, "-color_primaries", tag, "-color_trc", tag, "-color_range", "tv"]));
+            a.extend(s(&["-colorspace", tag, "-color_primaries", tag, "-color_trc", tag, "-color_range", if vg.out_pc { "pc" } else { "tv" }]));
         }
         if v.rotation != 0 {
             plan.notes.push(format!("旋转标记 {}° 已转正", v.rotation));
@@ -695,7 +821,8 @@ fn reasons_text(reasons: &[&str]) -> String {
             "sar" => "像素比",
             "size" => "尺寸",
             "hdr" => "HDR 转 SDR",
-            "range" => "色彩范围",
+            "range" => "输出电平",
+            "denoise" => "降噪",
             "matrix" => "色彩空间",
             "levels" => "色阶",
             "lut" => "LUT",
@@ -908,6 +1035,197 @@ mod tests {
         let p = build(Path::new("/m/s.mp4"), &NormSpec { size: "keep".into(), ..Default::default() }, &sd, &Analysis::default(), &caps(true, true), &tmp())
             .unwrap();
         assert!(p.unchanged);
+    }
+
+    fn graph_of(input: &str, spec: &NormSpec, c: &Caps) -> VideoGraph {
+        video_graph(spec, &parse(input), &Analysis::default(), c, &tmp(), "yuv420p", false).unwrap()
+    }
+
+    const LIMITED: &str =
+        "Input #0, mov,mp4, from 's.mp4':\n  Stream #0:0: Video: h264 (High), yuv420p(tv, bt709/bt709/bt709), 1280x720, 30 fps, 30 tbr, 15360 tbn\n";
+    const FULL: &str =
+        "Input #0, mov,mp4, from 's.mp4':\n  Stream #0:0: Video: h264 (High), yuvj420p(pc, bt709/bt709/bt709), 1280x720, 30 fps, 30 tbr, 15360 tbn\n";
+
+    #[test]
+    fn output_range_defaults_to_limited_and_can_be_full_or_kept() {
+        let keep_size = |r: &str| NormSpec { size: "keep".into(), out_range: r.into(), ..Default::default() };
+        // 16–235（默认）：全范围素材压回电视范围，电视范围素材不动
+        let g = graph_of(FULL, &keep_size("tv"), &caps(true, true));
+        assert!(!g.out_pc && g.graph.as_deref().unwrap().contains("scale=in_range=pc:out_range=tv"), "{g:?}");
+        let g = graph_of(LIMITED, &keep_size("tv"), &caps(true, true));
+        assert!(!g.out_pc && g.graph.is_none(), "{g:?}");
+        // 0–255：电视范围素材拉开，并且写成 pc 标记
+        let g = graph_of(LIMITED, &keep_size("pc"), &caps(true, true));
+        let gr = g.graph.as_deref().unwrap();
+        assert!(g.out_pc && gr.contains("scale=in_range=tv:out_range=pc") && gr.contains("range=pc"), "{gr}");
+        assert!(g.notes.iter().any(|n| n.contains("0–255")), "{:?}", g.notes);
+        // 全范围素材选 0–255：已经是了，不重复转换，但要把标记补对
+        let g = graph_of(FULL, &keep_size("pc"), &caps(true, true));
+        assert!(g.out_pc && !g.graph.as_deref().unwrap_or("").contains("in_range=pc:out_range=tv"), "{g:?}");
+        // 沿用：全范围素材保持全范围，电视范围素材保持电视范围
+        assert!(graph_of(FULL, &keep_size("keep"), &caps(true, true)).out_pc);
+        assert!(!graph_of(LIMITED, &keep_size("keep"), &caps(true, true)).out_pc);
+    }
+
+    #[test]
+    fn full_range_sources_keep_their_values_when_the_pixel_format_changes() {
+        // yuvj420p → yuv420p 不明说的话会被压成电视范围，所以输出 0–255 时要写明“范围不变”
+        let spec = NormSpec { size: "keep".into(), out_range: "pc".into(), ..Default::default() };
+        let g = graph_of(FULL, &spec, &caps(true, true)).graph.unwrap();
+        assert!(g.contains("scale=in_range=pc:out_range=pc,format=yuv420p,setparams"), "{g}");
+        // 已经是 yuv420p 的不用多做这一步
+        let g = graph_of(LIMITED, &spec, &caps(true, true)).graph.unwrap();
+        assert!(!g.contains("in_range=pc:out_range=pc"), "{g}");
+    }
+
+    /// 很多个镜头都要校正的计划（每个镜头一个滤镜）。
+    fn many_fixes(n: i64) -> Analysis {
+        use super::super::colormatch::{ColorFix, ColorPlan, Curve};
+        let curve = |gain: f64| Some(Curve { pivot: 126.0, gain, out: 131.5 });
+        let fixes = (0..n)
+            .map(|i| ColorFix { start_ms: Some(i * 3000), end_ms: Some(i * 3000 + 3000), y: curve(1.0123), u: curve(0.9876), v: curve(1.0345), except: vec![] })
+            .collect();
+        Analysis { color: Some(ColorPlan { fixes, auto_shots: n as usize, own_shots: 0, unified: false }), ..Default::default() }
+    }
+
+    #[test]
+    fn a_very_long_filter_graph_goes_into_a_file_instead_of_the_command_line() {
+        let dir = tmp();
+        let spec = NormSpec { size: "keep".into(), match_color: 1.0, ..Default::default() };
+        // 少量镜头：直接放在命令行里
+        let p = build(Path::new("/m/b.mp4"), &spec, &parse(PLAIN), &many_fixes(3), &caps(true, true), &dir).unwrap();
+        assert!(arg_after(&p.args, "-filter_complex").is_some() && !dir.join("filtergraph.txt").exists());
+        // 250 个校正（150 个不一致的镜头加上 100 个单独调节的）：整条命令会超过 Windows 的 32K 上限
+        let big = many_fixes(250);
+        let inline = video_graph(&spec, &parse(PLAIN), &big, &caps(true, true), &dir, "yuv420p", false).unwrap().graph.unwrap();
+        assert!(inline.len() > 32_000, "滤镜图本身 {} 个字符", inline.len());
+        for (major, key) in [(0, "-/filter_complex"), (7, "-/filter_complex"), (6, "-filter_complex_script")] {
+            let mut c = caps(true, true);
+            c.major = major;
+            let p = build(Path::new("/m/b.mp4"), &spec, &parse(PLAIN), &big, &c, &dir).unwrap();
+            assert!(!p.args.iter().any(|a| a == "-filter_complex"), "{major}");
+            let file = arg_after(&p.args, key).unwrap_or_else(|| panic!("ffmpeg {major} 应该用 {key}"));
+            assert_eq!(std::fs::read_to_string(file).unwrap(), inline);
+            let total: usize = p.args.iter().map(|a| a.len() + 3).sum();
+            assert!(total < 3_000, "命令行还有 {total} 个字符");
+        }
+    }
+
+    #[test]
+    fn range_is_tagged_on_the_output_and_stays_consistent_through_the_lut() {
+        let dir = tmp();
+        let lut = dir.join("a.cube");
+        std::fs::write(&lut, "LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n").unwrap();
+        let spec = NormSpec { size: "keep".into(), out_range: "pc".into(), lut: Some(lut.to_string_lossy().into_owned()), ..Default::default() };
+        let g = graph_of(LIMITED, &spec, &caps(true, true)).graph.unwrap();
+        // LUT 在电视范围里做，最后一步才拉开
+        let (lut_at, up_at) = (g.find("lut3d").unwrap(), g.find("scale=in_range=tv:out_range=pc").unwrap());
+        assert!(lut_at < up_at && g.contains("in_range=tv,format=gbrp16le") && g.contains("out_range=tv,format=yuv420p"), "{g}");
+        // 编码参数里的色彩范围标记
+        let p = build(Path::new("/m/s.mp4"), &spec, &parse(LIMITED), &Analysis::default(), &caps(true, true), &dir).unwrap();
+        assert!(!p.video_copy && !p.unchanged);
+        let g = arg_after(&p.args, "-filter_complex").unwrap();
+        assert!(g.contains("range=pc"), "{g}");
+        assert_eq!(arg_after(&p.args, "-color_range"), Some("pc"), "{:?}", p.args);
+        let p = build(
+            Path::new("/m/s.mp4"),
+            &NormSpec { size: "keep".into(), codec: "hevc".into(), ..Default::default() },
+            &parse(FULL),
+            &Analysis::default(),
+            &caps(true, true),
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(arg_after(&p.args, "-color_range"), Some("tv"), "{:?}", p.args);
+        // 16–235 的素材在 16–235 的要求下可以原样复制；改选 0–255 就要重新编码
+        assert!(build(Path::new("/m/s.mp4"), &NormSpec::default(), &parse(PLAIN), &Analysis::default(), &caps(true, true), &dir).unwrap().unchanged);
+        let p = build(
+            Path::new("/m/s.mp4"),
+            &NormSpec { out_range: "pc".into(), ..Default::default() },
+            &parse(PLAIN),
+            &Analysis::default(),
+            &caps(true, true),
+            &dir,
+        )
+        .unwrap();
+        assert!(!p.unchanged && !p.video_copy, "{:?}", p.notes);
+    }
+
+    #[test]
+    fn hdr_tone_mapping_follows_the_output_range() {
+        let f = parse(PHONE_HLG);
+        let tv = video_graph(&NormSpec::default(), &f, &Analysis::default(), &caps(true, true), &tmp(), "yuv420p", false).unwrap();
+        assert!(!tv.out_pc && tv.graph.as_deref().unwrap().contains("range=tv"), "{tv:?}");
+        let pc = video_graph(&NormSpec { out_range: "pc".into(), ..Default::default() }, &f, &Analysis::default(), &caps(true, true), &tmp(), "yuv420p", false)
+            .unwrap();
+        let g = pc.graph.as_deref().unwrap();
+        assert!(pc.out_pc && g.contains("range=pc") && !g.contains("scale=in_range=tv:out_range=pc"), "{g}");
+        // 内置 LUT 的做法（没有 zscale）也要跟着输出电平
+        let pc =
+            video_graph(&NormSpec { out_range: "pc".into(), ..Default::default() }, &f, &Analysis::default(), &caps(false, true), &tmp(), "yuv420p", false)
+                .unwrap();
+        assert!(pc.out_pc && pc.graph.as_deref().unwrap().contains("out_range=pc"), "{pc:?}");
+    }
+
+    fn with_filters(mut c: Caps, names: &[&str]) -> Caps {
+        c.filters.extend(names.iter().map(|s| s.to_string()));
+        c
+    }
+
+    #[test]
+    fn denoise_tiers_use_fftdnoiz_and_nlmeans_and_fall_back() {
+        let c = with_filters(caps(true, false), &["fftdnoiz", "nlmeans"]);
+        let sigma = |l: &str| denoise_filter(l, &c).unwrap().0;
+        assert_eq!(
+            (sigma("light").as_str(), sigma("medium").as_str(), sigma("strong").as_str()),
+            ("fftdnoiz=sigma=4", "fftdnoiz=sigma=8", "fftdnoiz=sigma=14")
+        );
+        let best = denoise_filter("best", &c).unwrap();
+        assert!(best.0.starts_with("nlmeans=") && !best.2, "{best:?}");
+        assert!(denoise_filter("off", &c).is_none() && denoise_filter("whatever", &c).is_none());
+        // 没有 nlmeans：高质量按“强”处理，并标明是替代做法
+        let c2 = with_filters(caps(true, false), &["fftdnoiz"]);
+        assert_eq!(denoise_filter("best", &c2).map(|d| (d.0, d.2)), Some(("fftdnoiz=sigma=14".to_string(), true)));
+        // 没有 fftdnoiz：完整版里的 hqdn3d，再不行用 atadenoise；都没有就是 None
+        let c3 = with_filters(caps(true, true), &["hqdn3d", "atadenoise"]);
+        assert!(denoise_filter("medium", &c3).unwrap().0.starts_with("hqdn3d="));
+        let c4 = with_filters(caps(true, false), &["atadenoise"]);
+        let a = denoise_filter("medium", &c4).unwrap();
+        assert!(a.0.starts_with("atadenoise=") && a.2, "{a:?}");
+        assert!(denoise_filter("medium", &caps(true, false)).is_none());
+    }
+
+    #[test]
+    fn denoise_goes_before_an_upscale_and_after_a_downscale() {
+        let c = with_filters(caps(true, false), &["fftdnoiz"]);
+        let at = |g: &str, k: &str| g.find(k).unwrap_or_else(|| panic!("{k} in {g}"));
+        // 缩小：先缩小再降噪（更快，缩小本身也会压低噪点）
+        let spec = NormSpec { size: "limit".into(), short_side: 720, denoise: "medium".into(), ..Default::default() };
+        let g = graph_of(PLAIN, &spec, &c);
+        let gr = g.graph.as_deref().unwrap();
+        assert!(at(gr, "scale=-2:720") < at(gr, "fftdnoiz"), "{gr}");
+        // 放大：降噪在缩放之前（噪点要在被放大之前去掉）
+        let up = NormSpec { size: "fit".into(), width: 3840, height: 2160, denoise: "medium".into(), ..Default::default() };
+        let gr = graph_of(PLAIN, &up, &c).graph.unwrap();
+        assert!(at(&gr, "fftdnoiz") < at(&gr, "scale="), "{gr}");
+        // 不缩放（或者放大）：先降噪，再做别的
+        let spec = NormSpec { size: "keep".into(), denoise: "medium".into(), ..Default::default() };
+        let g = graph_of(PLAIN, &spec, &c);
+        assert!(g.graph.as_deref().unwrap().starts_with("[0:v:0]fftdnoiz=sigma=8"), "{g:?}");
+        assert!(g.reasons.contains(&"denoise") && g.notes.iter().any(|n| n.starts_with("降噪（中")), "{:?}", g.notes);
+        // 降噪是画面处理，不能原样复制
+        let p = build(Path::new("/m/b.mp4"), &spec, &parse(PLAIN), &Analysis::default(), &c, &tmp()).unwrap();
+        assert!(!p.unchanged && !p.video_copy);
+    }
+
+    #[test]
+    fn denoise_without_any_filter_warns_instead_of_failing() {
+        let spec = NormSpec { size: "keep".into(), denoise: "strong".into(), ..Default::default() };
+        let g = graph_of(PLAIN, &spec, &caps(true, false));
+        assert!(g.graph.is_none() && g.warnings.iter().any(|w| w.contains("降噪没有执行")), "{g:?}");
+        // 用了替代做法时提醒一声
+        let g = graph_of(PLAIN, &spec, &with_filters(caps(true, true), &["hqdn3d"]));
+        assert!(g.graph.as_deref().unwrap().contains("hqdn3d") && g.warnings.iter().any(|w| w.contains("替代")), "{g:?}");
     }
 
     #[test]

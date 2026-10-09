@@ -141,12 +141,20 @@ pub async fn video_preview(state: St<'_>, path: String, spec: crate::vidnorm::No
         an.crop = analyze::detect_crop(&ff, file, &f).await;
     }
     let mut color_warning = None;
+    // 降噪看的是前后几帧：预览从“时间点往前一小段”开始读，再取时间点那一帧，这样画面是降噪稳定之后的样子
+    let warm_ms = if spec.denoise == "off" { 0 } else { at_ms.min(500) };
+    let start_ms = at_ms - warm_ms;
     if spec.match_color > 0.0 {
-        // 预览从 at_ms 处开始读，滤镜看到的时间要减去它
-        match crate::vidnorm::colormatch::analyze_cached(&ff, file, &f, &caps).await {
-            Ok(a) => an.color = Some(a.plan(spec.match_color, &spec.match_exclude).shifted(at_ms as i64)),
-            Err(e) => color_warning = Some(format!("分段色彩匹配没有做：{e}")),
+        // 预览从 start_ms 处开始读，滤镜看到的时间要减去它
+        let analysis = crate::vidnorm::colormatch::analyze_cached(&ff, file, &f, &caps).await;
+        let plan = match &analysis {
+            Ok(a) => a.plan(spec.match_color, &spec.match_tone, &spec.match_shots),
+            Err(_) => crate::vidnorm::colormatch::tone_plan(&spec.match_tone),
+        };
+        if let Err(e) = &analysis {
+            color_warning = Some(format!("分段色彩匹配没有分析镜头之间的色彩：{e}"));
         }
+        an.color = Some(plan.shifted(start_ms as i64));
     }
     let pix = if caps.encoders.h264 == Some("h264_qsv") { "nv12" } else { "yuv420p" };
     let tmp = state.data_dir.join("tmp").join("preview");
@@ -162,7 +170,7 @@ pub async fn video_preview(state: St<'_>, path: String, spec: crate::vidnorm::No
         }
     }
     let key = format!("norm-{}", short_hash(&format!("{path}|{at_ms}|{}", serde_json::to_string(&spec).unwrap_or_default())));
-    let (before, after) = analyze::preview(&ff, file, at_ms, vg.graph.as_deref(), &dir, &key).await?;
+    let (before, after) = analyze::preview(&ff, file, start_ms, warm_ms, vg.graph.as_deref(), &dir, &key).await?;
     for t in vg.temp_files {
         let _ = std::fs::remove_file(t);
     }
