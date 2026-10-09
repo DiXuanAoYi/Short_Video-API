@@ -301,6 +301,12 @@ impl CookieStore {
         self.save()
     }
 
+    /// 删除所有账号和 Cookie（“一键清除”用）。
+    pub fn clear_all(&self) -> AppResult<()> {
+        *self.data.write().unwrap_or_else(|e| e.into_inner()) = StoreData::default();
+        self.save()
+    }
+
     pub fn delete(&self, id: &str) -> AppResult<()> {
         {
             let mut data = self.data.write().unwrap_or_else(|e| e.into_inner());
@@ -674,5 +680,16 @@ mod tests {
         m.insert("bilibili".to_string(), "SESSDATA=x; bili_jct=y".to_string());
         assert_eq!(store.migrate_legacy(&m).unwrap(), 1);
         assert_eq!(store.header_for("https://api.bilibili.com/").as_deref(), Some("SESSDATA=x; bili_jct=y"));
+    }
+
+    #[test]
+    fn clear_all_removes_every_account() {
+        let store = CookieStore::in_memory();
+        store.upsert("bilibili", "主号", vec![ck("SESSDATA", "bilibili.com", false)]).unwrap();
+        store.upsert("youtube.com", "号二", vec![ck("SID", "youtube.com", false)]).unwrap();
+        assert_eq!(store.summaries().len(), 2);
+        store.clear_all().unwrap();
+        assert!(store.summaries().is_empty());
+        assert!(store.header_for("https://www.bilibili.com/video/BV1").is_none());
     }
 }

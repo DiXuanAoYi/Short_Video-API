@@ -20,8 +20,9 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
     let parse = MenuItem::with_id(app, "parse", "解析剪贴板", true, None::<&str>)?;
     let watch = CheckMenuItem::with_id(app, "watch", "监听剪贴板", true, watching, None::<&str>)?;
+    let lock = MenuItem::with_id(app, "lock", "锁定", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出清影", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &parse, &watch, &PredefinedMenuItem::separator(app)?, &quit])?;
+    let menu = Menu::with_items(app, &[&show, &parse, &watch, &lock, &PredefinedMenuItem::separator(app)?, &quit])?;
     app.manage(TrayWatchItem(watch));
 
     let mut builder = TrayIconBuilder::with_id("main").tooltip("清影 ClearClip").menu(&menu).show_menu_on_left_click(false);
@@ -37,6 +38,14 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
                 let paused = st.clipboard_paused.load(Ordering::SeqCst);
                 st.clipboard_paused.store(!paused, Ordering::SeqCst);
                 sync_watch_item(app);
+            }
+            "lock" => {
+                // 没有设置应用锁时，只是把窗口收起来
+                if !crate::security::lock_now(app) {
+                    if let Some(w) = app.get_webview_window("main") {
+                        let _ = w.hide();
+                    }
+                }
             }
             "quit" => app.exit(0),
             _ => {}
@@ -76,6 +85,10 @@ pub fn main_is_focused(app: &AppHandle) -> bool {
 
 /// 在屏幕右下角显示迷你窗（不抢焦点）。
 pub fn show_mini(app: &AppHandle) {
+    // 锁定时迷你窗会露出任务标题，不显示
+    if app.try_state::<Arc<AppState>>().is_some_and(|st| crate::security::status(&st).locked) {
+        return;
+    }
     let Some(w) = app.get_webview_window("mini") else { return };
     if let Ok(Some(monitor)) = w.current_monitor().or_else(|_| w.primary_monitor()) {
         let scale = monitor.scale_factor();

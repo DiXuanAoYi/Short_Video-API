@@ -107,6 +107,31 @@ async function bulkDelete() {
   }
 }
 
+async function bulkSafebox() {
+  const st = await api.safeboxStatus().catch(() => null)
+  if (!st?.unlocked) {
+    ElMessage.info(st?.exists ? '请先到“保险箱”页面输入密码解锁。' : '还没有创建保险箱，请先到“保险箱”页面创建。')
+    app.view = 'safebox'
+    return
+  }
+  try {
+    await ElMessageBox.confirm(`把所选 ${selected.value.size} 项加密放进保险箱？加密完成后，它们会从媒体库里消失，原文件和封面缓存会被覆盖删除。`, '移入保险箱', {
+      confirmButtonText: '移入',
+      cancelButtonText: '取消',
+      type: 'warning',
+    })
+  } catch {
+    return
+  }
+  try {
+    await api.safeboxAddLibrary(selectedIds.value)
+    ElMessage.success('已开始加密，进度在“保险箱”页面查看')
+    stopSelecting()
+  } catch (e) {
+    ElMessage.error(errorText(e))
+  }
+}
+
 async function removeMany(deleteFiles: boolean) {
   try {
     const r = await api.libraryDelete(selectedIds.value, deleteFiles)
@@ -338,6 +363,7 @@ async function clearHistory() {
       <el-button size="small" :disabled="!selected.size" @click="bulkTag(true)">去标签</el-button>
       <el-button size="small" :disabled="!selected.size" @click="bulkFavorite(true)">收藏</el-button>
       <el-button size="small" :disabled="!selected.size" @click="bulkFavorite(false)">取消收藏</el-button>
+      <el-button size="small" :disabled="!selected.size" @click="bulkSafebox">移入保险箱</el-button>
       <el-button size="small" type="danger" plain :disabled="!selected.size" @click="bulkDelete">删除</el-button>
     </div>
 

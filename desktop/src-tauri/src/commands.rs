@@ -78,8 +78,11 @@ pub async fn save_settings(app: AppHandle, state: St<'_>, settings: Settings) ->
     s.phone = old.phone.clone();
     s.save(&state.settings_path)?;
     *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
-    if old.shortcut != s.shortcut {
+    if old.shortcut != s.shortcut || old.security.panic_shortcut != s.security.panic_shortcut {
         apply_shortcut(&app, &s.shortcut);
+    }
+    if old.security.content_protection != s.security.content_protection {
+        crate::security::apply_window_protection(&app, s.security.content_protection);
     }
     if old.network != s.network {
         state.net.invalidate();
@@ -107,17 +110,19 @@ pub async fn save_settings(app: AppHandle, state: St<'_>, settings: Settings) ->
 pub fn apply_shortcut(app: &AppHandle, shortcut: &str) {
     let gs = app.global_shortcut();
     let _ = gs.unregister_all();
-    let shortcut = shortcut.trim();
-    let error = if shortcut.is_empty() {
-        None
-    } else {
-        gs.register(shortcut).err().map(|e| {
-            log::warn!("register shortcut {shortcut} failed: {e}");
-            format!("快捷键 {shortcut} 注册失败，可能格式不对或已被其他软件占用：{e}")
-        })
-    };
+    let panic = app.try_state::<Arc<AppState>>().map(|st| st.settings_raw().security.panic_shortcut).unwrap_or_default();
+    let mut errors = vec![];
+    for (what, sc) in [("快捷键", shortcut.trim()), ("老板键", panic.trim())] {
+        if sc.is_empty() {
+            continue;
+        }
+        if let Err(e) = gs.register(sc) {
+            log::warn!("register shortcut {sc} failed: {e}");
+            errors.push(format!("{what} {sc} 注册失败，可能格式不对或已被其他软件占用：{e}"));
+        }
+    }
     if let Some(st) = app.try_state::<Arc<AppState>>() {
-        *st.shortcut_error.lock().unwrap_or_else(|e| e.into_inner()) = error;
+        *st.shortcut_error.lock().unwrap_or_else(|e| e.into_inner()) = if errors.is_empty() { None } else { Some(errors.join("\n")) };
     }
 }
 
@@ -137,7 +142,9 @@ pub async fn resolve_link(app: AppHandle, state: St<'_>, text: String) -> AppRes
             return Err(e);
         }
     };
-    let _ = state.db.upsert_history(&info);
+    if !settings.security.privacy_mode {
+        let _ = state.db.upsert_history(&info);
+    }
     let _ = state.db.inbox_mark_parsed(&text, &info);
     Ok(info)
 }
@@ -803,7 +810,11 @@ pub fn open_login(app: AppHandle, site: String, url: Option<String>, label: Opti
     let (name, target) = login_target(&site, url.as_deref())?;
     let auto = cookies::login_cookie_names(&site).is_some();
     let hint = if auto { "登录完成后会自动保存并关闭窗口" } else { "登录完成后回到清影点击“保存登录状态”" };
-    WebviewWindowBuilder::new(&app, label_win, WebviewUrl::External(target)).title(format!("登录{name}：{hint}")).inner_size(1100.0, 780.0).build()?;
+    let win =
+        WebviewWindowBuilder::new(&app, label_win, WebviewUrl::External(target)).title(format!("登录{name}：{hint}")).inner_size(1100.0, 780.0).build()?;
+    if app.state::<Arc<AppState>>().settings_raw().security.content_protection {
+        let _ = win.set_content_protected(true);
+    }
     if auto {
         let app = app.clone();
         tauri::async_runtime::spawn(async move { watch_login(app, site, label).await });

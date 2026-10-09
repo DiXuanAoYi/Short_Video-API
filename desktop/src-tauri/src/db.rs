@@ -82,6 +82,16 @@ pub struct PlatformCount {
     pub count: i64,
 }
 
+/// 一键清除要清哪些记录。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DbWipe {
+    pub tasks: bool,
+    pub history: bool,
+    pub library: bool,
+    pub inbox: bool,
+    pub subscriptions: bool,
+}
+
 pub struct NewDownload<'a> {
     pub platform: &'a str,
     pub media_id: &'a str,
@@ -258,6 +268,61 @@ impl Db {
 
     pub fn clear_history(&self) -> AppResult<()> {
         self.conn().execute("DELETE FROM history", [])?;
+        Ok(())
+    }
+
+    /// 一键清除：按选项删除各类记录，并把数据库文件压缩（旧内容不再留在文件里）。
+    /// 返回被跳过的项目说明。回收站记录不动，免得里面的文件变成找不回来的孤儿。
+    pub fn wipe(&self, w: &DbWipe) -> AppResult<Vec<String>> {
+        let mut skipped = vec![];
+        {
+            let conn = self.conn();
+            if w.tasks {
+                conn.execute("DELETE FROM jobs", [])?;
+            }
+            if w.history {
+                conn.execute("DELETE FROM history", [])?;
+            }
+            if w.library {
+                for t in ["downloads", "item_tags", "tags", "cues"] {
+                    conn.execute(&format!("DELETE FROM {t}"), [])?;
+                }
+            }
+            if w.inbox {
+                conn.execute("DELETE FROM inbox", [])?;
+            }
+            if w.subscriptions {
+                conn.execute("DELETE FROM subscription_items", [])?;
+                conn.execute("DELETE FROM subscriptions", [])?;
+                conn.execute("DELETE FROM live_recordings WHERE status <> 'recording'", [])?;
+                let active: i64 = conn.query_row("SELECT COUNT(*) FROM live_recordings WHERE status = 'recording'", [], |r| r.get(0))?;
+                if active > 0 {
+                    skipped.push("有正在录制的直播，直播间列表已保留".to_string());
+                } else {
+                    conn.execute("DELETE FROM live_rooms", [])?;
+                }
+            }
+        }
+        self.checkpoint()?;
+        Ok(skipped)
+    }
+
+    /// 隐私模式退出时清理：解析历史、收件箱、已结束的任务记录。
+    pub fn purge_private(&self) -> AppResult<()> {
+        {
+            let conn = self.conn();
+            conn.execute("DELETE FROM history", [])?;
+            conn.execute("DELETE FROM inbox", [])?;
+            conn.execute("DELETE FROM jobs WHERE status IN ('done', 'failed', 'canceled')", [])?;
+        }
+        self.checkpoint()
+    }
+
+    /// 合并 WAL 并压缩数据库文件。
+    pub fn checkpoint(&self) -> AppResult<()> {
+        let conn = self.conn();
+        let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        conn.execute_batch("VACUUM")?;
         Ok(())
     }
 
@@ -662,5 +727,67 @@ mod tests {
         assert_eq!(db.list_library("", 10).unwrap().len(), 1);
         assert!(!db.list_library("", 10).unwrap()[0].exists);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn seed_everything(db: &Db) {
+        db.upsert_history(&sample("1", "私密作品")).unwrap();
+        db.record_download(&NewDownload {
+            platform: "douyin",
+            media_id: "1",
+            asset_id: "a",
+            title: "私密作品",
+            author: "",
+            cover: None,
+            path: "/x.mp4",
+            size: 1,
+            kind: "video",
+            source: "manual",
+            source_url: "https://v.douyin.com/abc",
+            platform_name: "抖音",
+        })
+        .unwrap();
+        db.inbox_add("phone", "d1", "手机", "https://v.douyin.com/abc", "done").unwrap();
+        for status in ["done", "failed", "canceled", "paused", "running"] {
+            db.insert_job(&JobRow {
+                id: 0,
+                media_json: "{}".into(),
+                asset_json: "{}".into(),
+                file_path: "/x.mp4".into(),
+                status: status.into(),
+                received: 0,
+                total: None,
+                error: None,
+                meta_json: "{}".into(),
+                created_at: 1,
+                finished_at: None,
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn purge_private_clears_history_inbox_and_finished_jobs_only() {
+        let db = Db::open_in_memory().unwrap();
+        seed_everything(&db);
+        db.purge_private().unwrap();
+        assert!(db.list_history("", 10).unwrap().is_empty());
+        assert!(db.inbox_list(&crate::inbox::InboxFilter::default()).unwrap().is_empty());
+        let left: Vec<String> = db.load_jobs().unwrap().into_iter().map(|j| j.status).collect();
+        assert_eq!(left, vec!["paused", "running"], "unfinished tasks are kept so they can resume");
+        assert_eq!(db.list_library("", 10).unwrap().len(), 1, "the library is not touched");
+    }
+
+    #[test]
+    fn wipe_only_removes_what_was_selected() {
+        let db = Db::open_in_memory().unwrap();
+        seed_everything(&db);
+        db.wipe(&DbWipe { history: true, ..Default::default() }).unwrap();
+        assert!(db.list_history("", 10).unwrap().is_empty());
+        assert_eq!(db.list_library("", 10).unwrap().len(), 1);
+        assert_eq!(db.load_jobs().unwrap().len(), 5);
+        db.wipe(&DbWipe { library: true, tasks: true, inbox: true, subscriptions: true, ..Default::default() }).unwrap();
+        assert!(db.list_library("", 10).unwrap().is_empty());
+        assert!(db.load_jobs().unwrap().is_empty());
+        assert!(db.inbox_list(&crate::inbox::InboxFilter::default()).unwrap().is_empty());
     }
 }

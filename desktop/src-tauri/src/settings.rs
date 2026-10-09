@@ -308,6 +308,8 @@ pub struct Settings {
     pub speed_schedule: Vec<SpeedWindow>,
     /// 省流量模式（按流量计费的网络）：一次只下一个任务、默认选低清晰度、订阅不自动下载、不自动上传和 AI 处理
     pub metered_mode: bool,
+    /// 安全与隐私
+    pub security: SecuritySettings,
 }
 
 /// 限速计划里的一个时段。
@@ -445,6 +447,37 @@ pub struct NotifySettings {
 impl Default for NotifySettings {
     fn default() -> Self {
         NotifySettings { channels: vec![], on_done: true, on_failed: true, on_live: true, on_sub: true, on_account: true }
+    }
+}
+
+/// 安全与隐私选项。应用锁的密码不在这里（只保存校验值，放在加密的密钥保险箱里）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SecuritySettings {
+    /// 空闲多少分钟后自动锁定（需要先设置应用锁密码）；0 表示不自动锁定
+    pub auto_lock_minutes: u32,
+    /// 窗口收进托盘时自动锁定
+    pub lock_on_hide: bool,
+    /// 隐私模式：不记录解析历史、不进媒体库、任务结束即清除记录、通知不显示标题
+    pub privacy_mode: bool,
+    /// 禁止截屏和录屏（Windows、macOS 有效）
+    pub content_protection: bool,
+    /// 老板键：立刻隐藏窗口并锁定；留空表示不启用
+    pub panic_shortcut: String,
+    /// 保险箱空闲多少分钟后自动上锁；0 表示不自动上锁
+    pub safebox_auto_lock_minutes: u32,
+}
+
+impl Default for SecuritySettings {
+    fn default() -> Self {
+        SecuritySettings {
+            auto_lock_minutes: 10,
+            lock_on_hide: true,
+            privacy_mode: false,
+            content_protection: false,
+            panic_shortcut: String::new(),
+            safebox_auto_lock_minutes: 15,
+        }
     }
 }
 
@@ -741,6 +774,7 @@ impl Default for Settings {
             rules: vec![],
             speed_schedule: vec![],
             metered_mode: false,
+            security: SecuritySettings::default(),
         }
     }
 }
@@ -850,6 +884,9 @@ impl Settings {
                 *f = f.trim().to_string();
             }
         }
+        self.security.auto_lock_minutes = self.security.auto_lock_minutes.min(24 * 60);
+        self.security.safebox_auto_lock_minutes = self.security.safebox_auto_lock_minutes.min(24 * 60);
+        self.security.panic_shortcut = self.security.panic_shortcut.trim().to_string();
         self.max_size_mb = self.max_size_mb.min(1_000_000);
         self.library.trash_keep_days = self.library.trash_keep_days.min(3650);
         self.library.reorganize_template = self.library.reorganize_template.trim().to_string();

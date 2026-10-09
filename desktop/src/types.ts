@@ -587,6 +587,60 @@ export interface Settings {
   rules: AutoRule[]
   speedSchedule: SpeedWindow[]
   meteredMode: boolean
+  security: SecuritySettings
+}
+
+export interface SecuritySettings {
+  /** 空闲多少分钟后自动锁定，0 表示不自动锁定 */
+  autoLockMinutes: number
+  lockOnHide: boolean
+  privacyMode: boolean
+  contentProtection: boolean
+  /** 老板键：立刻隐藏窗口并锁定；空表示不启用 */
+  panicShortcut: string
+  safeboxAutoLockMinutes: number
+}
+
+export interface LockStatus {
+  enabled: boolean
+  locked: boolean
+  lockedOutSecs: number
+}
+
+export interface SafeStatus {
+  exists: boolean
+  unlocked: boolean
+  count: number
+  totalBytes: number
+  lockedOutSecs: number
+}
+
+export interface SafeEntry {
+  id: string
+  name: string
+  size: number
+  addedAt: number
+  kind: 'video' | 'audio' | 'image' | 'other'
+  from: 'file' | 'library'
+}
+
+export interface WipeOptions {
+  tasks: boolean
+  history: boolean
+  library: boolean
+  inbox: boolean
+  subscriptions: boolean
+  cookies: boolean
+  secrets: boolean
+  thumbnails: boolean
+  logs: boolean
+  safebox: boolean
+  quit: boolean
+}
+
+export interface WipeReport {
+  done: string[]
+  skipped: string[]
 }
 
 export interface TimeWindow {

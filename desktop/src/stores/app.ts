@@ -1,11 +1,11 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { api, errorKind, errorText, events } from '../api'
-import type { AppInfo, ErrorKind, HistoryItem, MediaInfo, Settings, TaskSnapshot } from '../types'
+import type { AppInfo, ErrorKind, HistoryItem, LockStatus, MediaInfo, Settings, TaskSnapshot } from '../types'
 
-export type ViewName = 'parse' | 'queue' | 'subs' | 'live' | 'library' | 'tools' | 'settings'
+export type ViewName = 'parse' | 'queue' | 'subs' | 'live' | 'library' | 'tools' | 'safebox' | 'settings'
 export type LibraryTab = 'files' | 'inbox' | 'history'
-export type SettingsTab = 'download' | 'parse' | 'network' | 'accounts' | 'phone' | 'ai' | 'automation' | 'components' | 'diagnostics' | 'general'
+export type SettingsTab = 'download' | 'parse' | 'network' | 'accounts' | 'phone' | 'ai' | 'automation' | 'security' | 'components' | 'diagnostics' | 'general'
 
 /** 设置、主题与当前页面。 */
 export const useAppStore = defineStore('app', () => {
@@ -19,6 +19,8 @@ export const useAppStore = defineStore('app', () => {
   const inboxUnhandled = ref(0)
   /** 请求账号页打开某个网站的登录（内置平台 ID 或域名）；处理后清空 */
   const loginRequest = ref<string | null>(null)
+  /** 应用锁状态；locked 时界面被锁屏遮住 */
+  const lock = ref<LockStatus>({ enabled: false, locked: false, lockedOutSecs: 0 })
   /** 请求工具箱打开并预选文件（媒体库里的“用工具箱处理”）；处理后清空 */
   const toolboxRequest = ref<{ paths: string[]; tool?: string; tab?: 'video' | 'subtitle' | 'tags' | 'ai'; aiMode?: 'transcribe' | 'translate' | 'summarize' } | null>(null)
 
@@ -41,6 +43,10 @@ export const useAppStore = defineStore('app', () => {
   function goLogin(site: string | null | undefined) {
     loginRequest.value = site || null
     goSettings('accounts')
+  }
+
+  async function refreshLock() {
+    lock.value = await api.lockStatus().catch(() => lock.value)
   }
 
   async function load() {
@@ -71,7 +77,7 @@ export const useAppStore = defineStore('app', () => {
   }
   media.addEventListener('change', applyTheme)
 
-  return { settings, info, view, settingsTab, shortcutError, libraryTab, inboxUnhandled, loginRequest, toolboxRequest, goSettings, goLibrary, goToolbox, goLogin, load, save, patch, applyTheme }
+  return { settings, info, view, settingsTab, shortcutError, libraryTab, inboxUnhandled, loginRequest, lock, toolboxRequest, refreshLock, goSettings, goLibrary, goToolbox, goLogin, load, save, patch, applyTheme }
 })
 
 /** 下载队列，监听后端事件保持同步。 */

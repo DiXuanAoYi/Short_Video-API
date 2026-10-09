@@ -144,7 +144,9 @@ pub async fn resolve_and_enqueue_full(app: &AppHandle, text: &str) -> crate::mod
     let st = app.state::<Arc<AppState>>().inner().clone();
     let settings = st.settings();
     let info = providers::resolve_text(&st.parse_ctx(&settings), text).await?;
-    let _ = st.db.upsert_history(&info);
+    if !settings.security.privacy_mode {
+        let _ = st.db.upsert_history(&info);
+    }
     let _ = st.db.inbox_mark_parsed(text, &info);
     let (ids, post) = crate::quality::auto_selection(&info, &settings);
     let title = info.title.clone();

@@ -703,8 +703,7 @@ pub fn ignore_items(app: &AppHandle, id: i64, item_ids: &[String]) -> AppResult<
 }
 
 fn notify(app: &AppHandle, title: &str, body: &str) {
-    use tauri_plugin_notification::NotificationExt;
-    let _ = app.notification().builder().title(title).body(body).show();
+    crate::security::system_notification(app, title, body, false);
     crate::notify::emit(app, crate::notify::Event::Sub, title, body);
 }
 

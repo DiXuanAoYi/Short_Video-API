@@ -30,7 +30,10 @@ pub mod power;
 pub mod providers;
 pub mod quality;
 pub mod rules;
+pub mod safebox;
 pub mod secret;
+pub mod security;
+pub mod security_cmds;
 pub mod settings;
 pub mod subs;
 pub mod subtitle;
@@ -85,6 +88,10 @@ pub struct AppState {
     pub media_jobs: media_tools::MediaJobs,
     /// 加密保存的密钥（API 密钥、密码等）
     pub vault: vault::Vault,
+    /// 应用锁状态
+    pub lock: security::LockState,
+    /// 加密保险箱
+    pub safebox: safebox::Safebox,
 }
 
 impl AppState {
@@ -197,9 +204,16 @@ pub fn run() {
         )
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, _shortcut, event| {
+                .with_handler(|app, shortcut, event| {
                     if event.state() == tauri_plugin_global_shortcut::ShortcutState::Pressed {
-                        clipboard::parse_clipboard_now(app);
+                        let panic = app
+                            .try_state::<Arc<AppState>>()
+                            .and_then(|st| st.settings_raw().security.panic_shortcut.trim().parse::<tauri_plugin_global_shortcut::Shortcut>().ok());
+                        if panic.as_ref() == Some(shortcut) {
+                            security::panic(app);
+                        } else {
+                            clipboard::parse_clipboard_now(app);
+                        }
                     }
                 })
                 .build(),
@@ -235,6 +249,15 @@ pub fn run() {
                 }
             }
 
+            let vault = vault::Vault::open(data_dir.join("vault.bin"), key.key);
+            // 设置了应用锁的，每次启动都先锁住
+            let locked = vault.has(security::APPLOCK);
+            // 隐私模式：上次异常退出时没来得及清理的记录，启动时补清
+            if settings.security.privacy_mode {
+                security::purge_private(&db);
+            }
+            // 保险箱解密出来临时查看的文件，上次没清掉的也一并清理
+            safebox::shred_dir(&data_dir.join(security::VIEW_DIR));
             app.manage(Arc::new(AppState {
                 settings: RwLock::new(settings.clone()),
                 settings_path,
@@ -257,7 +280,9 @@ pub fn run() {
                 subs: subs::SubsState::default(),
                 live: live::LiveState::default(),
                 media_jobs: media_tools::MediaJobs::default(),
-                vault: vault::Vault::open(data_dir.join("vault.bin"), key.key),
+                vault,
+                lock: security::LockState::new(locked),
+                safebox: safebox::Safebox::new(data_dir.join("safebox")),
             }));
             // 媒体库封面缓存通过 asset 协议显示
             let covers = data_dir.join("covers");
@@ -284,6 +309,8 @@ pub fn run() {
                 });
             }
             library_cmds::spawn_maintenance(&handle);
+            security::spawn_idle_watch(&handle);
+            security::apply_window_protection(&handle, settings.security.content_protection);
             spawn_account_reminders(handle.clone());
 
             tray::create(&handle)?;
@@ -317,6 +344,7 @@ pub fn run() {
                         if to_tray {
                             api.prevent_close();
                             let _ = window.hide();
+                            security::on_hide(app);
                         } else {
                             app.exit(0);
                         }
@@ -474,7 +502,34 @@ pub fn run() {
             commands::save_login_cookies,
             commands::check_update,
             commands::install_update,
+            security_cmds::lock_status,
+            security_cmds::lock_set_password,
+            security_cmds::lock_remove_password,
+            security_cmds::lock_now,
+            security_cmds::lock_unlock,
+            security_cmds::wipe_traces,
+            security_cmds::safebox_status,
+            security_cmds::safebox_create,
+            security_cmds::safebox_unlock,
+            security_cmds::safebox_lock,
+            security_cmds::safebox_change_password,
+            security_cmds::safebox_list,
+            security_cmds::safebox_add_files,
+            security_cmds::safebox_add_library,
+            security_cmds::safebox_open,
+            security_cmds::safebox_export,
+            security_cmds::safebox_remove,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running ClearClip");
+        .build(tauri::generate_context!())
+        .expect("error while building ClearClip")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                if let Some(st) = app.try_state::<Arc<AppState>>() {
+                    security::seal_safebox(&st);
+                    if st.settings_raw().security.privacy_mode {
+                        security::purge_private(&st.db);
+                    }
+                }
+            }
+        });
 }

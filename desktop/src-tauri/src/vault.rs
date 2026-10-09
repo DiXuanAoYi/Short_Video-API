@@ -60,9 +60,9 @@ impl Vault {
         self.set(name, "")
     }
 
-    /// 删除所有密钥（“一键清除”用）。
-    pub fn clear(&self) -> AppResult<()> {
-        self.data.write().unwrap_or_else(|e| e.into_inner()).clear();
+    /// 删除所有密钥，名字以 `keep` 里某个前缀开头的保留（“一键清除”用，保留应用锁的密码记录）。
+    pub fn clear_except(&self, keep: &[&str]) -> AppResult<()> {
+        self.data.write().unwrap_or_else(|e| e.into_inner()).retain(|k, _| keep.iter().any(|p| k.starts_with(p)));
         self.save()
     }
 
@@ -105,5 +105,16 @@ mod tests {
         assert!(v.set("Bad Name", "x").is_err());
         assert!(v.set("", "x").is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_except_keeps_the_app_lock_record() {
+        let v = Vault::in_memory();
+        v.set("applock.hash", "v1$64$1$1$00$00").unwrap();
+        v.set("ai.api_key", "sk-1").unwrap();
+        v.set("notify.tg", "token").unwrap();
+        v.clear_except(&["applock."]).unwrap();
+        assert!(v.has("applock.hash"));
+        assert!(!v.has("ai.api_key") && !v.has("notify.tg"));
     }
 }

@@ -1219,6 +1219,7 @@ fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>
     let mut failed_note: Option<(String, String)> = None;
     let mut sub_touched = false;
     let leftovers: Vec<PathBuf> = inputs.iter().cloned().chain(std::iter::once(part.to_path_buf())).collect();
+    let private = settings.security.privacy_mode;
     let found = with_entry(st, id, |e| {
         e.snap.speed = 0;
         e.snap.note = None;
@@ -1243,26 +1244,31 @@ fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>
                         e.snap.received = size;
                         e.snap.total = Some(size);
                         e.snap.finished_at = Some(db::now());
-                        let _ = st.db.record_download(&NewDownload {
-                            platform: &e.snap.platform,
-                            media_id: &e.snap.media_id,
-                            asset_id: &e.snap.asset_id,
-                            title: &e.snap.title,
-                            author: &e.snap.author,
-                            cover: e.snap.cover.as_deref(),
-                            path: &e.snap.file_path,
-                            size: size as i64,
-                            kind: kind_str(e.snap.asset_kind),
-                            source: e.spec.origin.as_deref().unwrap_or("manual"),
-                            source_url: &e.media.source_url,
-                            platform_name: &e.media.platform_name,
-                        });
+                        // 隐私模式：不进媒体库、不写 nfo / info.json，也不触发后续的自动规则
+                        if !private {
+                            let _ = st.db.record_download(&NewDownload {
+                                platform: &e.snap.platform,
+                                media_id: &e.snap.media_id,
+                                asset_id: &e.snap.asset_id,
+                                title: &e.snap.title,
+                                author: &e.snap.author,
+                                cover: e.snap.cover.as_deref(),
+                                path: &e.snap.file_path,
+                                size: size as i64,
+                                kind: kind_str(e.snap.asset_kind),
+                                source: e.spec.origin.as_deref().unwrap_or("manual"),
+                                source_url: &e.media.source_url,
+                                platform_name: &e.media.platform_name,
+                            });
+                        }
                         notify = Some((e.snap.title.clone(), e.snap.asset_label.clone()));
-                        if matches!(e.snap.asset_kind, AssetKind::Video | AssetKind::Audio) {
+                        if !private && matches!(e.snap.asset_kind, AssetKind::Video | AssetKind::Audio) {
                             crate::organize::write_sidecars(settings, &e.media, e.spec.primary(), &dest);
                         }
                         done_file = Some((dest.clone(), e.media.clone()));
-                        done_key = Some((e.snap.platform.clone(), e.snap.media_id.clone(), e.snap.asset_id.clone()));
+                        if !private {
+                            done_key = Some((e.snap.platform.clone(), e.snap.media_id.clone(), e.snap.asset_id.clone()));
+                        }
                     }
                     Err(err) => {
                         e.snap.status = TaskStatus::Failed;
@@ -1294,6 +1300,10 @@ fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>
             }
         }
         persist(st, e);
+        // 隐私模式：结束的任务不在数据库里留记录（本次运行期间列表里仍可看到）
+        if private && matches!(e.snap.status, TaskStatus::Done | TaskStatus::Failed | TaskStatus::Canceled) {
+            let _ = st.db.delete_job(e.snap.id);
+        }
         // 订阅条目跟随任务结果更新
         if let Some((sub_id, item_id)) = &e.spec.sub_item {
             let status = match e.snap.status {
@@ -1323,7 +1333,7 @@ fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>
             remove_part(p);
         }
     }
-    if let Some((_, media)) = &done_file {
+    if let (Some((_, media)), false) = (&done_file, private) {
         spawn_cover_cache(app, media.clone());
     }
     if let Some((platform, media_id, asset_id)) = done_key {
@@ -1340,8 +1350,7 @@ fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>
     }
     if let Some((title, label)) = notify {
         if settings.notify_on_complete && all_done {
-            use tauri_plugin_notification::NotificationExt;
-            let _ = app.notification().builder().title("下载完成").body(format!("{title}（{label}）")).show();
+            crate::security::system_notification(app, "下载完成", &format!("{title}（{label}）"), true);
         }
     }
     if all_done && done_file.is_some() {
