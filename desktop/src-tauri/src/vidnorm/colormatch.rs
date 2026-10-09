@@ -124,6 +124,7 @@ pub fn frame_stats(y: &[u8], u: &[u8], v: &[u8]) -> FrameStats {
 
 // ---------- 抽样 ----------
 
+#[derive(Debug, Clone)]
 struct Sample {
     t_ms: u64,
     st: FrameStats,
@@ -419,6 +420,55 @@ impl Curve {
     }
 }
 
+/// 不参与色彩匹配的一段时间：既不用来统计“整体”的色调，也不会被校正（保持原样）。`end_ms` 为空表示一直到结尾。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SkipSpan {
+    pub start_ms: u64,
+    pub end_ms: Option<u64>,
+}
+
+/// 最多排除这么多段，避免滤镜图太长
+pub const MAX_SKIPS: usize = 50;
+
+/// 排序、合并重叠或相接的段，去掉空的和反的；最多保留 `MAX_SKIPS` 段。
+pub fn normalize_skips(list: &[SkipSpan]) -> Vec<SkipSpan> {
+    let mut v: Vec<SkipSpan> = list.iter().copied().filter(|s| s.end_ms.map_or(true, |e| e > s.start_ms)).collect();
+    v.sort_by_key(|s| s.start_ms);
+    let mut out: Vec<SkipSpan> = vec![];
+    for s in v {
+        match out.last_mut() {
+            Some(l) if l.end_ms.map_or(true, |e| s.start_ms <= e) => {
+                l.end_ms = match (l.end_ms, s.end_ms) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    _ => None,
+                };
+            }
+            _ => out.push(s),
+        }
+    }
+    out.truncate(MAX_SKIPS);
+    out
+}
+
+/// 排除的段换成滤镜窗口（毫秒，`None` 表示到头 / 到尾）。
+fn skip_windows(skip: &[SkipSpan]) -> Vec<(Option<i64>, Option<i64>)> {
+    skip.iter().map(|s| (Some(s.start_ms as i64), s.end_ms.map(|e| e as i64))).collect()
+}
+
+/// 排除的段里和 `[start, end)` 有交集的那些（滤镜窗口）。
+fn skip_windows_in(skip: &[SkipSpan], start: Option<i64>, end: Option<i64>) -> Vec<(Option<i64>, Option<i64>)> {
+    skip_windows(skip)
+        .into_iter()
+        .filter(|(a, b)| a.map_or(true, |a| end.map_or(true, |e| a < e)) && b.map_or(true, |b| start.map_or(true, |s| b > s)))
+        .collect()
+}
+
+/// `[start, end)` 里有多少毫秒落在排除的段里。
+fn skipped_ms(skip: &[SkipSpan], start: u64, end: u64) -> u64 {
+    skip.iter().map(|s| s.end_ms.unwrap_or(u64::MAX).min(end).saturating_sub(s.start_ms.max(start))).sum()
+}
+
 /// 对一个镜头的校正。时间以毫秒计，`None` 表示从视频开头 / 到视频结尾。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -474,6 +524,8 @@ pub struct ColorPlan {
     pub auto_shots: usize,
     pub own_shots: usize,
     pub unified: bool,
+    /// 排除在外（保持原样）的时间段数（只用来写处理说明）
+    pub skipped: usize,
 }
 
 impl ColorPlan {
@@ -489,6 +541,9 @@ impl ColorPlan {
         if self.unified {
             parts.push(if self.own_shots > 0 { "其余镜头用统一的手动调节".to_string() } else { "统一的手动调节".to_string() });
         }
+        if self.skipped > 0 {
+            parts.push(format!("{} 段排除的时间保持原样", self.skipped));
+        }
         format!("分段色彩匹配：{}", parts.join("，"))
     }
 
@@ -501,6 +556,7 @@ impl ColorPlan {
             auto_shots: self.auto_shots,
             own_shots: self.own_shots,
             unified: self.unified,
+            skipped: self.skipped,
             fixes: self
                 .fixes
                 .iter()
@@ -583,10 +639,16 @@ pub struct ShotAdjust {
 }
 
 /// 没有镜头分析（HDR、太短、分析失败）时也能做的部分：只有统一的手动调节。
-pub fn tone_plan(tone: &ToneAdjust) -> ColorPlan {
+pub fn tone_plan(tone: &ToneAdjust, skip: &[SkipSpan]) -> ColorPlan {
     let (y, u, v) = tone.curves();
     let on = y.is_some() || u.is_some() || v.is_some();
-    ColorPlan { fixes: if on { vec![ColorFix { start_ms: None, end_ms: None, y, u, v, except: vec![] }] } else { vec![] }, unified: on, ..Default::default() }
+    let skip = normalize_skips(skip);
+    ColorPlan {
+        fixes: if on { vec![ColorFix { start_ms: None, end_ms: None, y, u, v, except: skip_windows(&skip) }] } else { vec![] },
+        unified: on,
+        skipped: skip.len(),
+        ..Default::default()
+    }
 }
 
 /// 按强度（0–1）算一个镜头的校正曲线，只改不一致的那几项。
@@ -629,6 +691,10 @@ pub struct ColorAnalysis {
     looks: Vec<FrameStats>,
     reference: Reference,
     flagged: Vec<Flagged>,
+    /// 排除在外的时间段（已整理）；校正不会作用在这些时间里，落在里面的镜头也不参与统计
+    skip: Vec<SkipSpan>,
+    /// 因为排除而没有参与统计的镜头数
+    excluded: usize,
     /// 没法做或没必要做的原因
     pub note: Option<String>,
 }
@@ -642,7 +708,17 @@ pub struct ColorReport {
     /// 时间轴：每一段的起止和是否不一致（相邻的一致镜头已合并）
     pub timeline: Vec<TimelineSeg>,
     pub flagged: Vec<FlaggedShot>,
+    /// 排除在外的时间段（结尾已补成视频时长）和因此没有参与统计的镜头数
+    pub skipped: Vec<SkippedSpan>,
+    pub shots_excluded: usize,
     pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkippedSpan {
+    pub start_ms: u64,
+    pub end_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -676,7 +752,7 @@ impl ColorAnalysis {
             if k > 0.0 {
                 let (y, u, v) = fix_for(&f.st, &self.reference, &f.defects, k);
                 if y.is_some() || u.is_some() || v.is_some() {
-                    fixes.push(ColorFix { start_ms: f.start_ms, end_ms: f.end_ms, y, u, v, except: vec![] });
+                    fixes.push(ColorFix { start_ms: f.start_ms, end_ms: f.end_ms, y, u, v, except: skip_windows_in(&self.skip, f.start_ms, f.end_ms) });
                     if own.is_none() {
                         auto_shots += 1;
                     }
@@ -687,7 +763,7 @@ impl ColorAnalysis {
                 let (y, u, v) = own.tone.curves();
                 let manual = y.is_some() || u.is_some() || v.is_some();
                 if manual {
-                    fixes.push(ColorFix { start_ms: f.start_ms, end_ms: f.end_ms, y, u, v, except: vec![] });
+                    fixes.push(ColorFix { start_ms: f.start_ms, end_ms: f.end_ms, y, u, v, except: skip_windows_in(&self.skip, f.start_ms, f.end_ms) });
                 }
                 if manual || k > 0.0 {
                     own_shots += 1;
@@ -697,9 +773,10 @@ impl ColorAnalysis {
         let (y, u, v) = tone.curves();
         let unified = y.is_some() || u.is_some() || v.is_some();
         if unified {
+            except.extend(skip_windows(&self.skip));
             fixes.push(ColorFix { start_ms: None, end_ms: None, y, u, v, except });
         }
-        ColorPlan { fixes, auto_shots, own_shots, unified }
+        ColorPlan { fixes, auto_shots, own_shots, unified, skipped: self.skip.len() }
     }
 
     pub fn shots_total(&self) -> usize {
@@ -733,7 +810,21 @@ impl ColorAnalysis {
                 f
             })
             .collect();
-        ColorReport { duration_ms: self.duration_ms, shots_total: self.shots.len(), timeline, flagged, note: self.note.clone() }
+        let skipped = self
+            .skip
+            .iter()
+            .map(|s| SkippedSpan { start_ms: s.start_ms.min(self.duration_ms), end_ms: s.end_ms.unwrap_or(self.duration_ms).min(self.duration_ms) })
+            .filter(|s| s.end_ms > s.start_ms)
+            .collect();
+        ColorReport {
+            duration_ms: self.duration_ms,
+            shots_total: self.shots.len(),
+            timeline,
+            flagged,
+            skipped,
+            shots_excluded: self.excluded,
+            note: self.note.clone(),
+        }
     }
 }
 
@@ -773,8 +864,16 @@ async fn refine_cut(ffmpeg: &Path, file: &Path, from_ms: u64, to_ms: u64) -> Opt
 
 // ---------- 分析入口 ----------
 
-/// 分析一个视频的镜头之间色彩是否一致。HDR、太短、取不到画面时返回说明原因的错误。
-pub async fn analyze(ffmpeg: &Path, file: &Path, facts: &Facts, caps: &Caps) -> Result<ColorAnalysis, String> {
+/// 抽样和分镜头的结果：只和文件有关，和排除的时间段无关，所以改排除时间段不用重新解码。
+#[derive(Debug, Clone)]
+struct Scan {
+    duration_ms: u64,
+    samples: Vec<Sample>,
+    shots: Vec<Shot>,
+}
+
+/// 抽样并分镜头。HDR、太短、取不到画面时返回说明原因的错误。
+async fn scan(ffmpeg: &Path, file: &Path, facts: &Facts, caps: &Caps) -> Result<Scan, String> {
     let v = facts.video.as_ref().ok_or("这个文件里没有视频画面。")?;
     if v.hdr != Hdr::None {
         return Err("HDR 素材要先转成 SDR，目前不支持对 HDR 画面做分段色彩匹配。".into());
@@ -802,28 +901,58 @@ pub async fn analyze(ffmpeg: &Path, file: &Path, facts: &Facts, caps: &Caps) -> 
         return Err("取到的画面太少，无法分析色彩。".into());
     }
     let shots = split_shots(&samples, duration_ms);
+    Ok(Scan { duration_ms, samples, shots })
+}
+
+/// 分析一个视频的镜头之间色彩是否一致（不排除任何时间段）。
+pub async fn analyze(ffmpeg: &Path, file: &Path, facts: &Facts, caps: &Caps) -> Result<ColorAnalysis, String> {
+    let sc = scan(ffmpeg, file, facts, caps).await?;
+    Ok(evaluate(ffmpeg, file, &sc, &[]).await)
+}
+
+/// 在抽样结果上找出和整体不一致的镜头。`skip` 里的时间段不参与统计（镜头大半落在里面就整个不算），也不会被校正。
+async fn evaluate(ffmpeg: &Path, file: &Path, sc: &Scan, skip: &[SkipSpan]) -> ColorAnalysis {
+    let Scan { duration_ms, samples, shots: all } = sc;
+    let duration_ms = *duration_ms;
+    let skip = normalize_skips(skip);
+    // 大半（一半以上）落在排除时间里的镜头：不参与统计，也不标记
+    let covered: Vec<bool> = all.iter().map(|s| skipped_ms(&skip, s.start_ms, s.end_ms) * 2 >= (s.end_ms - s.start_ms).max(1)).collect();
+    let kept: Vec<usize> = (0..all.len()).filter(|i| !covered[*i]).collect();
+    let excluded = all.len() - kept.len();
+    let shots: Vec<Shot> = kept.iter().map(|i| all[*i].clone()).collect();
+    let timeline: Vec<(u64, u64)> = all.iter().map(|s| (s.start_ms, s.end_ms)).collect();
+    let looks: Vec<FrameStats> = all.iter().map(|s| s.st).collect();
+    let done = |flag: &[bool], reference: Reference, flagged: Vec<Flagged>, note: Option<String>| ColorAnalysis {
+        duration_ms,
+        shots: timeline.iter().zip(flag).map(|((a, b), f)| (*a, *b, *f)).collect(),
+        looks: looks.clone(),
+        reference,
+        flagged,
+        skip: skip.clone(),
+        excluded,
+        note,
+    };
     if shots.len() < 3 {
-        return Ok(ColorAnalysis {
-            duration_ms,
-            shots: shots.iter().map(|s| (s.start_ms, s.end_ms, false)).collect(),
-            looks: shots.iter().map(|s| s.st).collect(),
-            reference: reference(&shots),
-            flagged: vec![],
-            note: Some("镜头太少（不到 3 个），没有可以和“整体”比较的对象。".into()),
-        });
+        let note = if excluded > 0 {
+            "排除掉一些时间之后，剩下的镜头太少（不到 3 个），没有可以和“整体”比较的对象。"
+        } else {
+            "镜头太少（不到 3 个），没有可以和“整体”比较的对象。"
+        };
+        return done(&vec![false; all.len()], reference(&shots), vec![], Some(note.into()));
     }
     let r = reference(&shots);
     let marks: Vec<Defects> = shots.iter().map(|s| defects(&s.st, &r)).collect();
+    let kept_ms: u64 = shots.iter().map(|s| s.end_ms - s.start_ms).sum();
     let off_ms: u64 = shots.iter().zip(&marks).filter(|(_, d)| d.any()).map(|(s, _)| s.end_ms - s.start_ms).sum();
     let mut note = None;
-    let mut flag = vec![false; shots.len()];
-    if off_ms as f64 > duration_ms as f64 * 0.6 {
+    let mut flag = vec![false; all.len()];
+    if off_ms as f64 > kept_ms as f64 * 0.6 {
         note = Some("超过六成的镜头都和“整体”不一样，没有明确的主体色调可以对齐，没有做处理。".into());
     } else if marks.iter().filter(|d| d.any()).count() > 150 {
         note = Some("有差异的镜头太多（超过 150 个），没有做处理。".into());
     } else {
-        for (i, d) in marks.iter().enumerate() {
-            flag[i] = d.any();
+        for (k, d) in marks.iter().enumerate() {
+            flag[kept[k]] = d.any();
         }
         if !flag.iter().any(|f| *f) {
             note = Some("各个镜头的色彩和整体一致，没有需要校正的镜头。".into());
@@ -831,22 +960,20 @@ pub async fn analyze(ffmpeg: &Path, file: &Path, facts: &Facts, caps: &Caps) -> 
     }
 
     // 只对需要校正的镜头精确定位分界：开头在“上一个镜头最后一个样本”和“这个镜头第一个样本”之间，结尾同理
-    let todo: Vec<usize> = (0..shots.len()).filter(|i| flag[*i]).collect();
-    let samples_ref = &samples;
-    let shots_ref = &shots;
+    let todo: Vec<usize> = (0..all.len()).filter(|i| flag[*i]).collect();
     let jobs = todo.iter().map(|&i| async move {
-        let s = &shots_ref[i];
+        let s = &all[i];
         let start = if i == 0 {
             None
         } else {
-            let prev_last = samples_ref[shots_ref[i - 1].last].t_ms;
+            let prev_last = samples[all[i - 1].last].t_ms;
             Some(refine_cut(ffmpeg, file, prev_last, s.start_ms).await.unwrap_or(s.start_ms) as i64)
         };
-        let end = if i + 1 >= shots_ref.len() {
+        let end = if i + 1 >= all.len() {
             None
         } else {
-            let last = samples_ref[s.last].t_ms;
-            let next_first = shots_ref[i + 1].start_ms;
+            let last = samples[s.last].t_ms;
+            let next_first = all[i + 1].start_ms;
             Some(refine_cut(ffmpeg, file, last, next_first).await.unwrap_or(next_first) as i64)
         };
         (i, start, end)
@@ -859,22 +986,21 @@ pub async fn analyze(ffmpeg: &Path, file: &Path, facts: &Facts, caps: &Caps) -> 
         refined.extend(futures_util::future::join_all(batch).await);
     }
     refined.sort_by_key(|r| r.0);
-    let flagged: Vec<Flagged> =
-        refined.iter().map(|(i, start, end)| Flagged { start_ms: *start, end_ms: *end, st: shots[*i].st, defects: marks[*i] }).collect();
-    Ok(ColorAnalysis {
-        duration_ms,
-        shots: shots.iter().enumerate().map(|(i, s)| (s.start_ms, s.end_ms, flag[i])).collect(),
-        looks: shots.iter().map(|s| s.st).collect(),
-        reference: r,
-        flagged,
-        note,
-    })
+    let flagged: Vec<Flagged> = refined
+        .iter()
+        .map(|(i, start, end)| {
+            let k = kept.iter().position(|x| x == i).unwrap_or(0);
+            Flagged { start_ms: *start, end_ms: *end, st: all[*i].st, defects: marks[k] }
+        })
+        .collect();
+    done(&flag, r, flagged, note)
 }
 
 // ---------- 缓存 ----------
 
 type Entry = (String, Arc<ColorAnalysis>);
 static CACHE: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
+static SCANS: Mutex<Vec<(String, Arc<Scan>)>> = Mutex::new(Vec::new());
 
 fn key_of(file: &Path) -> String {
     let meta = std::fs::metadata(file).ok();
@@ -882,17 +1008,34 @@ fn key_of(file: &Path) -> String {
     format!("{}|{}|{}", file.display(), meta.map(|m| m.len()).unwrap_or(0), mtime)
 }
 
-/// 同一个文件分析过就直接用（界面检测、预览、真正处理共用一份结果）。
-pub async fn analyze_cached(ffmpeg: &Path, file: &Path, facts: &Facts, caps: &Caps) -> Result<Arc<ColorAnalysis>, String> {
-    let key = key_of(file);
+/// 同一个文件、同样的排除时间段分析过就直接用（界面检测、预览、真正处理共用一份结果）；
+/// 抽样那一步只和文件有关，改排除时间段时不用重新解码。
+pub async fn analyze_cached(ffmpeg: &Path, file: &Path, facts: &Facts, caps: &Caps, skip: &[SkipSpan]) -> Result<Arc<ColorAnalysis>, String> {
+    let skip = normalize_skips(skip);
+    let file_key = key_of(file);
+    let key = format!("{file_key}|{}", serde_json::to_string(&skip).unwrap_or_default());
     if let Some(hit) = CACHE.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _)| *k == key) {
         return Ok(hit.1.clone());
     }
-    let a = Arc::new(analyze(ffmpeg, file, facts, caps).await?);
+    let cached_scan = SCANS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _)| *k == file_key).map(|(_, s)| s.clone());
+    let sc = match cached_scan {
+        Some(sc) => sc,
+        None => {
+            let sc = Arc::new(scan(ffmpeg, file, facts, caps).await?);
+            let mut c = SCANS.lock().unwrap_or_else(|e| e.into_inner());
+            c.retain(|(k, _)| *k != file_key);
+            c.push((file_key, sc.clone()));
+            if c.len() > 4 {
+                c.remove(0);
+            }
+            sc
+        }
+    };
+    let a = Arc::new(evaluate(ffmpeg, file, &sc, &skip).await);
     let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     c.retain(|(k, _)| *k != key);
     c.push((key, a.clone()));
-    if c.len() > 6 {
+    if c.len() > 8 {
         c.remove(0);
     }
     Ok(a)
@@ -1033,8 +1176,72 @@ mod tests {
             looks: vec![off, base()],
             reference: r,
             flagged: vec![Flagged { start_ms: None, end_ms: Some(5000), st: off, defects: defects(&off, &r) }],
+            skip: vec![],
+            excluded: 0,
             note: None,
         }
+    }
+
+    fn span(a: u64, b: Option<u64>) -> SkipSpan {
+        SkipSpan { start_ms: a, end_ms: b }
+    }
+
+    #[test]
+    fn skip_spans_are_tidied_and_measured() {
+        // 空的、反的去掉；重叠、相接的合并；"到结尾"吃掉后面所有的
+        let v = normalize_skips(&[
+            span(9000, Some(9000)),
+            span(8000, Some(7000)),
+            span(5000, Some(7000)),
+            span(1000, Some(3000)),
+            span(7000, Some(8000)),
+            span(20_000, None),
+            span(30_000, Some(31_000)),
+        ]);
+        assert_eq!(v, vec![span(1000, Some(3000)), span(5000, Some(8000)), span(20_000, None)]);
+        assert_eq!(normalize_skips(&[span(0, None), span(5, Some(9))]), vec![span(0, None)]);
+        let many: Vec<SkipSpan> = (0..80).map(|i| span(i * 100, Some(i * 100 + 50))).collect();
+        assert_eq!(normalize_skips(&many).len(), MAX_SKIPS);
+        // 一个镜头有多少毫秒在排除的时间里
+        let v = [span(1000, Some(3000)), span(5000, None)];
+        assert_eq!(skipped_ms(&v, 0, 2000), 1000);
+        assert_eq!(skipped_ms(&v, 2000, 5000), 1000);
+        assert_eq!(skipped_ms(&v, 4000, 9000), 4000);
+        assert_eq!(skipped_ms(&v, 3000, 5000), 0);
+        // 只留和这段有交集的窗口
+        assert_eq!(skip_windows_in(&v, Some(2500), Some(4000)), vec![(Some(1000), Some(3000))]);
+        assert_eq!(skip_windows_in(&v, None, Some(900)), vec![]);
+        assert_eq!(skip_windows_in(&v, Some(3000), Some(5000)), vec![]);
+        assert_eq!(skip_windows_in(&v, Some(4000), None), vec![(Some(5000), None)]);
+    }
+
+    #[test]
+    fn plans_keep_clear_of_the_skipped_time() {
+        let mut a = flagged_analysis();
+        a.skip = vec![span(2000, Some(3000)), span(9000, Some(10_000))];
+        let warm = ToneAdjust { temperature: 0.5, ..Default::default() };
+        let p = a.plan(0.8, &warm, &[]);
+        assert_eq!(p.skipped, 2);
+        // 自动校正的镜头（0–5 秒）只避开和它有交集的那一段
+        assert_eq!(p.fixes[0].except, vec![(Some(2000), Some(3000))]);
+        assert!(p.fixes[0].filter().ends_with("enable='lt(t,4.9995)*not(gte(t,1.9995)*lt(t,2.9995))'"), "{}", p.fixes[0].filter());
+        // 统一的手动调节避开全部排除的时间
+        assert_eq!(p.fixes[1].except, vec![(Some(2000), Some(3000)), (Some(9000), Some(10_000))]);
+        assert!(p.describe().contains("2 段排除的时间保持原样"), "{}", p.describe());
+        // 分析失败时统一调节照样避开
+        let t = tone_plan(&warm, &a.skip);
+        assert_eq!((t.fixes[0].except.len(), t.skipped), (2, 2));
+        assert!(tone_plan(&ToneAdjust::default(), &a.skip).fixes.is_empty());
+        // 单独调节的镜头：自己的手动调节也避开排除的时间
+        let own = ShotAdjust { id: 0, strength: Some(0.0), tone: ToneAdjust { brightness: 0.4, ..Default::default() } };
+        let p = a.plan(0.8, &ToneAdjust::default(), &[own]);
+        assert_eq!(p.fixes[0].except, vec![(Some(2000), Some(3000))]);
+        // 预览从 1 秒处读起：窗口往前移 1 秒
+        let sh = a.plan(0.8, &ToneAdjust::default(), &[]).shifted(1000);
+        assert_eq!(sh.fixes[0].except, vec![(Some(1000), Some(2000))]);
+        // 报告里有排除的时间段，结尾补成视频时长
+        a.skip = vec![span(18_000, None)];
+        assert_eq!(a.report().skipped.iter().map(|s| (s.start_ms, s.end_ms)).collect::<Vec<_>>(), vec![(18_000, 20_000)]);
     }
 
     #[test]
@@ -1093,6 +1300,7 @@ mod tests {
             auto_shots: 3,
             own_shots: 0,
             unified: true,
+            skipped: 0,
         };
         // 预览从 3.2 秒处读起：只剩第 2 个镜头和统一调节，统一调节只留下和预览有交集的排除窗口
         let p = plan.shifted(3200);
@@ -1108,7 +1316,7 @@ mod tests {
     #[test]
     fn tone_adjust_maps_to_curves() {
         assert!(ToneAdjust::default().is_neutral());
-        assert!(tone_plan(&ToneAdjust::default()).fixes.is_empty());
+        assert!(tone_plan(&ToneAdjust::default(), &[]).fixes.is_empty());
         let (y, u, v) = ToneAdjust::default().curves();
         assert!(y.is_none() && u.is_none() && v.is_none());
         // 亮度、对比度只动 Y

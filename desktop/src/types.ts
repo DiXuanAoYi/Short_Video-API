@@ -311,6 +311,8 @@ export interface NormSpec {
   matchTone: ToneAdjust
   /** 单独调节的镜头（只能选检测出来和整体不一致的镜头） */
   matchShots: ShotAdjust[]
+  /** 排除在外的时间段：不参与统计，也不被校正，保持原样 */
+  matchSkip: SkipSpan[]
   lut: string | null
   lutStrength: number
   autocrop: boolean
@@ -338,6 +340,12 @@ export interface ShotAdjust {
   tone: ToneAdjust
 }
 
+/** 排除的一段时间（毫秒）；`endMs` 为 null 表示一直到结尾。 */
+export interface SkipSpan {
+  startMs: number
+  endMs: number | null
+}
+
 export interface ColorTimelineSeg {
   startMs: number
   endMs: number
@@ -357,6 +365,9 @@ export interface ColorReport {
   shotsTotal: number
   timeline: ColorTimelineSeg[]
   flagged: ColorFlaggedShot[]
+  /** 排除的时间段（结尾已补成视频时长）和因此没有参与统计的镜头数 */
+  skipped: { startMs: number; endMs: number }[]
+  shotsExcluded: number
   note: string | null
 }
 

@@ -98,11 +98,11 @@ pub async fn run_normalize(ctx: &JobCtx, job: &ToolJob, spec: &NormSpec) -> AppR
     let mut color_warnings: Vec<String> = vec![];
     if spec.match_color > 0.0 {
         ctx.note("正在分析镜头之间的色彩…");
-        let analysis = super::colormatch::analyze_cached(&ffmpeg, &input, &facts, &caps).await;
+        let analysis = super::colormatch::analyze_cached(&ffmpeg, &input, &facts, &caps, &spec.match_skip).await;
         let color = match &analysis {
             Ok(a) => a.plan(spec.match_color, &spec.match_tone, &spec.match_shots),
             // 分析不了（HDR、太短……）时，统一的手动调节不需要镜头信息，照样做
-            Err(_) => super::colormatch::tone_plan(&spec.match_tone),
+            Err(_) => super::colormatch::tone_plan(&spec.match_tone, &spec.match_skip),
         };
         match &analysis {
             Ok(a) if color.fixes.is_empty() => color_notes.push(a.note.clone().unwrap_or_else(|| "没有需要校正的镜头".into())),

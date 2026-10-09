@@ -95,7 +95,11 @@ pub async fn video_analyze(state: St<'_>, path: String, hint: Option<String>) ->
 
 /// 检查一个视频里各个镜头的色彩是否一致：哪些镜头和整体的偏色、亮度、对比度、饱和度不一样。要解码一遍关键帧，几秒到几十秒。
 #[tauri::command]
-pub async fn video_color(state: St<'_>, path: String) -> AppResult<crate::vidnorm::colormatch::ColorReport> {
+pub async fn video_color(
+    state: St<'_>,
+    path: String,
+    skip: Option<Vec<crate::vidnorm::colormatch::SkipSpan>>,
+) -> AppResult<crate::vidnorm::colormatch::ColorReport> {
     use crate::vidnorm::{colormatch, facts};
     let (ff, caps) =
         crate::vidcaps::current(&state).await.ok_or_else(|| AppError::new(ErrorKind::NeedUpdate, "需要 ffmpeg。请在“设置 → 组件”里安装 ffmpeg 后重试。"))?;
@@ -104,7 +108,8 @@ pub async fn video_color(state: St<'_>, path: String) -> AppResult<crate::vidnor
         return Err(AppError::not_found("找不到文件。"));
     }
     let f = facts::read(&ff, file).await.ok_or_else(|| AppError::invalid("无法读取这个文件。"))?;
-    let a = colormatch::analyze_cached(&ff, file, &f, &caps).await.map_err(AppError::invalid)?;
+    let skip = skip.unwrap_or_default();
+    let a = colormatch::analyze_cached(&ff, file, &f, &caps, &skip).await.map_err(AppError::invalid)?;
     Ok(a.report())
 }
 
@@ -146,10 +151,10 @@ pub async fn video_preview(state: St<'_>, path: String, spec: crate::vidnorm::No
     let start_ms = at_ms - warm_ms;
     if spec.match_color > 0.0 {
         // 预览从 start_ms 处开始读，滤镜看到的时间要减去它
-        let analysis = crate::vidnorm::colormatch::analyze_cached(&ff, file, &f, &caps).await;
+        let analysis = crate::vidnorm::colormatch::analyze_cached(&ff, file, &f, &caps, &spec.match_skip).await;
         let plan = match &analysis {
             Ok(a) => a.plan(spec.match_color, &spec.match_tone, &spec.match_shots),
-            Err(_) => crate::vidnorm::colormatch::tone_plan(&spec.match_tone),
+            Err(_) => crate::vidnorm::colormatch::tone_plan(&spec.match_tone, &spec.match_skip),
         };
         if let Err(e) = &analysis {
             color_warning = Some(format!("分段色彩匹配没有分析镜头之间的色彩：{e}"));

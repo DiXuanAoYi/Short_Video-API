@@ -5,7 +5,7 @@ import { open } from '@tauri-apps/plugin-dialog'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { api, errorText } from '../../api'
 import { useAppStore } from '../../stores/app'
-import type { CapsSummary, ColorFlaggedShot, ColorReport, NormPreset, NormSpec, ToneAdjust, VideoFactsInfo, VideoPreview, VideoReport } from '../../types'
+import type { CapsSummary, ColorFlaggedShot, ColorReport, NormPreset, NormSpec, SkipSpan, ToneAdjust, VideoFactsInfo, VideoPreview, VideoReport } from '../../types'
 import { formatClock, parseClock } from '../../utils/time'
 import FileInput from './FileInput.vue'
 import ToneSliders from './ToneSliders.vue'
@@ -21,7 +21,7 @@ const presetId = ref('compat')
 const noTone = (): ToneAdjust => ({ brightness: 0, contrast: 0, saturation: 0, temperature: 0, tint: 0 })
 const spec = reactive<NormSpec>({
   size: 'limit', width: 1920, height: 1080, shortSide: 1080, followOrientation: true, fps: 'auto', fpsValue: 30, hdr: true, fixColor: true, levels: 0, outRange: 'tv', denoise: 'off',
-  matchColor: 0, matchTone: noTone(), matchShots: [], lut: null,
+  matchColor: 0, matchTone: noTone(), matchShots: [], matchSkip: [], lut: null,
   lutStrength: 1, autocrop: false, audioRate: 0, audioChannels: 0, loudness: null, fixSync: true, codec: 'h264', quality: 'balanced',
 })
 const reports = ref<Record<string, VideoReport | { error: string }>>({})
@@ -37,30 +37,143 @@ const previewing = ref(false)
 const colorReport = ref<ColorReport | null>(null)
 const colorBusy = ref(false)
 let token = 0
+let colorSeq = 0
+const isReport = (r: VideoReport | { error: string } | undefined): r is VideoReport => !!r && 'facts' in r
 
-// 换了第一个文件：旧的色彩检测结果和单独调节的镜头都作废（统一调节不跟文件走，保留）
+// 排除的时间段 / 帧区间：按文件时间记，只对第一个文件有效（勾选“所有文件”时对每个文件都用）
+interface SkipRow {
+  id: number
+  mode: 'time' | 'frame'
+  a: string
+  b: string
+}
+let skipSeq = 0
+const skipRows = ref<SkipRow[]>([])
+const skipAll = ref(false)
+
+// 换了第一个文件：旧的色彩检测结果、单独调节的镜头和排除的时间都作废（统一调节不跟文件走，保留）
 watch(
   () => files.value[0],
   () => {
+    colorSeq++
+    colorBusy.value = false
     colorReport.value = null
     spec.matchShots = []
+    skipRows.value = []
+  },
+)
+
+const firstFacts = computed(() => {
+  const r = reports.value[files.value[0]]
+  return isReport(r) ? r.facts : null
+})
+
+/** 把毫秒写成能被 parseClock 原样读回的样子（不丢掉毫秒）。 */
+function clockExact(ms: number): string {
+  const rest = ms % 1000
+  const base = formatClock(ms - rest)
+  return rest ? `${base}.${String(rest).padStart(3, '0').replace(/0+$/, '')}` : base
+}
+
+interface SkipInfo {
+  span: SkipSpan | null
+  /** 写错了：显示在这一行，这一行不参与 */
+  error: string
+  /** 换算后的结果，给用户核对 */
+  text: string
+}
+
+/** 一行 → 毫秒区间。帧号从 1 开始、含首尾两帧；`fps` 是这个文件的帧率。 */
+function skipOf(r: SkipRow, fps: number | null, durationMs: number | null): SkipInfo {
+  const a = r.a.trim()
+  const b = r.b.trim()
+  const none = (error = '', text = ''): SkipInfo => ({ span: null, error, text })
+  if (!a && !b) return none()
+  let start: number
+  let end: number | null
+  if (r.mode === 'time') {
+    const s = a ? parseClock(a) : 0
+    const e = b ? parseClock(b) : null
+    if (s === null || (b && e === null)) return none('时间的写法不对，请用 5、0:05 或 1:02:03.5 这样的格式。')
+    start = s
+    end = e
+  } else {
+    if (!fps) return none('读不出这个视频的帧率，帧区间用不了，请改用时间。')
+    const fa = a ? Number(a) : 1
+    const fb = b ? Number(b) : null
+    if (!Number.isInteger(fa) || fa < 1 || (fb !== null && (!Number.isInteger(fb) || fb < 1))) return none('帧号要填整数，从 1 开始。')
+    start = Math.round(((fa - 1) / fps) * 1000)
+    end = fb === null ? null : Math.round((fb / fps) * 1000)
+  }
+  if (end !== null && end <= start) return none('结束要晚于开始。')
+  if (durationMs !== null && start >= durationMs) return none(`开始已经超出视频长度（${formatClock(durationMs)}）。`)
+  const text = r.mode === 'frame' ? `= ${clockExact(start)} – ${end === null ? '结尾' : clockExact(end)}` : ''
+  return { span: { startMs: start, endMs: end }, error: '', text }
+}
+
+const skipInfos = computed(() => skipRows.value.map((r) => skipOf(r, firstFacts.value?.video?.fps ?? null, firstFacts.value?.durationMs ?? null)))
+const skipSpans = computed(() => skipInfos.value.flatMap((i) => (i.span ? [i.span] : [])))
+const vfrFrames = computed(() => {
+  const r = reports.value[files.value[0]]
+  return isReport(r) && !!r.analysis.vfr?.variable && skipRows.value.some((x) => x.mode === 'frame')
+})
+
+/** 某个文件要排除的时间段：帧区间按这个文件自己的帧率换算。 */
+function skipFor(file: string): SkipSpan[] {
+  const r = reports.value[file]
+  const facts = isReport(r) ? r.facts : null
+  return skipRows.value.flatMap((x) => {
+    const sp = skipOf(x, facts?.video?.fps ?? null, facts?.durationMs ?? null).span
+    return sp ? [sp] : []
+  })
+}
+
+function addSkip(mode: SkipRow['mode'] = 'time', a = '', b = '') {
+  skipRows.value.push({ id: ++skipSeq, mode, a, b })
+}
+function removeSkip(id: number) {
+  skipRows.value = skipRows.value.filter((x) => x.id !== id)
+}
+const skipBar = (a: number, b: number) => {
+  const total = Math.max(1, colorReport.value?.durationMs ?? 1)
+  return { left: `${(a / total) * 100}%`, width: `${Math.max(0.6, ((b - a) / total) * 100)}%` }
+}
+
+/** 把一个检测出来的镜头加进排除列表（不一致的镜头不想校正时用）。 */
+function excludeShot(s: ColorFlaggedShot) {
+  addSkip('time', clockExact(s.startMs), clockExact(s.endMs))
+}
+
+// 预览和处理用的排除时间跟着输入走；改了之后，已经检测过的结果自动重新检测
+let redetect: ReturnType<typeof setTimeout> | undefined
+watch(
+  () => JSON.stringify(skipSpans.value),
+  (json) => {
+    spec.matchSkip = JSON.parse(json) as SkipSpan[]
+    if (!colorReport.value) return
+    clearTimeout(redetect)
+    redetect = setTimeout(() => void checkColor(), 700)
   },
 )
 
 async function checkColor() {
   const f = files.value[0]
   if (!f) return
+  const my = ++colorSeq
   colorBusy.value = true
   try {
-    colorReport.value = await api.videoColor(f)
+    const rep = await api.videoColor(f, spec.matchSkip)
+    if (my !== colorSeq) return // 排除的时间又改了，这次的结果已经过时
+    colorReport.value = rep
     // 重新检测后，已经不在结果里的镜头不再单独调节
-    const ids = new Set(colorReport.value.flagged.map((x) => x.id))
+    const ids = new Set(rep.flagged.map((x) => x.id))
     spec.matchShots = spec.matchShots.filter((x) => ids.has(x.id))
   } catch (e) {
+    if (my !== colorSeq) return
     colorReport.value = null
     ElMessage.error(errorText(e))
   } finally {
-    colorBusy.value = false
+    if (my === colorSeq) colorBusy.value = false
   }
 }
 
@@ -109,6 +222,7 @@ function applyPreset(p: NormPreset) {
     denoise: spec.denoise,
     matchTone: spec.matchTone,
     matchShots: spec.matchShots,
+    matchSkip: spec.matchSkip,
   })
 }
 
@@ -119,7 +233,6 @@ onMounted(async () => {
   if (first) applyPreset(first)
 })
 
-const isReport = (r: VideoReport | { error: string } | undefined): r is VideoReport => !!r && 'facts' in r
 
 /** 分析选中的文件（逐个，避免同时跑太多 ffmpeg）；按多数文件的推荐自动选预设。 */
 watch(
@@ -235,8 +348,13 @@ async function start() {
   busy.value = true
   try {
     for (const f of files.value) {
-      // 单独调节的镜头是按第一个文件的检测结果记的，别的文件用不上；统一调节对每个文件都有效
-      const own = { ...spec, matchShots: f === files.value[0] ? spec.matchShots.map((x) => ({ ...x, tone: { ...x.tone } })) : [] }
+      // 单独调节的镜头和排除的时间是按第一个文件记的，别的文件用不上（排除的时间可以选择对所有文件生效）；统一调节对每个文件都有效
+      const first = f === files.value[0]
+      const own = {
+        ...spec,
+        matchShots: first ? spec.matchShots.map((x) => ({ ...x, tone: { ...x.tone } })) : [],
+        matchSkip: first || skipAll.value ? skipFor(f) : [],
+      }
       await api.mediaJobStart({ op: 'normalize', spec: own, preset: presetId.value, inputs: [f], outputDir: outDir.value || null })
     }
     ElMessage.success(files.value.length > 1 ? `已加入 ${files.value.length} 个任务，可以在下方查看进度。` : '已开始处理，可以在下方查看进度。')
@@ -424,6 +542,27 @@ const imgSrc = (p: string) => convertFileSrc(p)
           <div class="cmtitle">统一调节</div>
           <div class="mute small">没有单独调节的镜头都用这组参数，包括检测不出差异的镜头；全 0 就是不额外调节。</div>
           <ToneSliders v-model="spec.matchTone" />
+          <div class="cmtitle">排除的时间段</div>
+          <div class="mute small">
+            这些时间不参与匹配：不计入“整体”的基准，也不会被校正，保持原样。适合片头片尾的 Logo、黑场、故意调过色的段落。可以填时间（如 0:03 – 0:06），也可以填帧号（第几帧到第几帧，从 1 开始、含首尾两帧）；结束留空 = 一直到结尾。
+          </div>
+          <div v-for="(r, i) in skipRows" :key="r.id" class="skiprow">
+            <el-select v-model="r.mode" size="small" class="skmode">
+              <el-option value="time" label="时间" />
+              <el-option value="frame" label="帧号" />
+            </el-select>
+            <el-input v-model="r.a" size="small" class="skin" :placeholder="r.mode === 'time' ? '开始，如 0:03' : '起始帧，如 1'" clearable />
+            <span class="mute">–</span>
+            <el-input v-model="r.b" size="small" class="skin" :placeholder="r.mode === 'time' ? '结束，留空 = 到结尾' : '结束帧，留空 = 到结尾'" clearable />
+            <span v-if="skipInfos[i]?.error" class="skerr">{{ skipInfos[i].error }}</span>
+            <span v-else-if="skipInfos[i]?.text" class="mute small mono">{{ skipInfos[i].text }}</span>
+            <el-button size="small" link type="danger" @click="removeSkip(r.id)">删除</el-button>
+          </div>
+          <div class="cmhead">
+            <el-button size="small" @click="addSkip()">添加一段</el-button>
+            <el-checkbox v-if="files.length > 1 && skipRows.length" v-model="skipAll">对所有文件都排除这些时间</el-checkbox>
+            <small v-if="vfrFrames" class="mute">这个视频是可变帧率，帧号换算成时间只是近似值，要求精确时请直接填时间。</small>
+          </div>
           <div class="cmtitle">按镜头单独调节</div>
           <div class="cmhead">
             <el-button size="small" :loading="colorBusy" :disabled="!files.length" @click="checkColor">检测第一个文件的色彩差异</el-button>
@@ -438,9 +577,17 @@ const imgSrc = (p: string) => convertFileSrc(p)
                 :style="{ width: segPercent(seg.startMs, seg.endMs) }"
                 :title="`${formatClock(seg.startMs)} – ${formatClock(seg.endMs)}${seg.off ? '（和整体不一致）' : ''}`"
               />
+              <i
+                v-for="(k, i) in colorReport.skipped"
+                :key="`k${i}`"
+                class="skipbar"
+                :style="skipBar(k.startMs, k.endMs)"
+                :title="`排除：${formatClock(k.startMs)} – ${formatClock(k.endMs)}`"
+              />
             </div>
             <div v-if="colorReport.note" class="mute small">{{ colorReport.note }}</div>
             <div v-else class="mute small">共 {{ colorReport.shotsTotal }} 个镜头，{{ colorReport.flagged.length }} 个和整体不一致（橙色）。{{ spec.matchShots.length }} 个单独调节。</div>
+            <div v-if="colorReport.skipped.length" class="mute small">斜线是排除的时间段，其中 {{ colorReport.shotsExcluded }} 个镜头没有参与统计。</div>
             <div v-for="f in colorReport.flagged" :key="f.id" class="shotbox">
               <div class="shot">
                 <span class="mono when">{{ formatClock(f.startMs) }} – {{ formatClock(f.endMs) }}</span>
@@ -448,6 +595,7 @@ const imgSrc = (p: string) => convertFileSrc(p)
                   <span v-for="d in f.defects" :key="d" class="chip warn">{{ d }}</span>
                 </span>
                 <el-button size="small" link type="primary" :loading="previewing" @click="previewShot(f)">看对比</el-button>
+                <el-button size="small" link @click="excludeShot(f)">排除这个镜头</el-button>
                 <el-checkbox :model-value="isOwn(f.id)" @change="(v: string | number | boolean) => toggleOwn(f.id, !!v)">单独调节</el-checkbox>
               </div>
               <div v-for="o in ownOf(f.id)" :key="o.id" class="own">
@@ -612,6 +760,7 @@ h3 {
   flex-wrap: wrap;
 }
 .strip {
+  position: relative;
   display: flex;
   height: 10px;
   border-radius: 5px;
@@ -625,6 +774,30 @@ h3 {
 }
 .strip span.off {
   background: var(--cc-acc);
+}
+.skipbar {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--cc-fg) 55%, transparent) 0 2px, transparent 2px 5px);
+  border-left: 1px solid var(--cc-fg);
+  border-right: 1px solid var(--cc-fg);
+}
+.skiprow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.skiprow .skmode {
+  width: 76px;
+}
+.skiprow .skin {
+  width: 150px;
+}
+.skerr {
+  color: var(--cc-warn, #b26a00);
+  font-size: 11.5px;
 }
 .shot {
   display: flex;
@@ -640,12 +813,12 @@ h3 {
 .shot .chips {
   min-width: 180px;
 }
-.shot :deep(.el-checkbox) {
+.cm :deep(.el-checkbox) {
   display: inline-flex;
   grid-template-columns: none;
   height: auto;
 }
-.shot :deep(.el-checkbox__label) {
+.cm :deep(.el-checkbox__label) {
   font-size: 12.5px;
 }
 .cmtitle {

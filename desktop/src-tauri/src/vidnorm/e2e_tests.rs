@@ -61,9 +61,9 @@ async fn normalize(ff: &Path, input: &Path, spec: &NormSpec, caps: &Caps, d: &Pa
         an.loudness = analyze::measure_loudness(ff, input, t).await;
     }
     if spec.match_color > 0.0 {
-        let plan = match super::colormatch::analyze_cached(ff, input, &facts, caps).await {
+        let plan = match super::colormatch::analyze_cached(ff, input, &facts, caps, &spec.match_skip).await {
             Ok(a) => a.plan(spec.match_color, &spec.match_tone, &spec.match_shots),
-            Err(_) => super::colormatch::tone_plan(&spec.match_tone),
+            Err(_) => super::colormatch::tone_plan(&spec.match_tone, &spec.match_skip),
         };
         if !plan.fixes.is_empty() {
             an.color = Some(plan);
@@ -691,6 +691,63 @@ async fn excluded_shots_and_preview_use_the_same_plan() {
     assert!((sb.y - sa.y).abs() < 2.0 && (sb.nu - sa.nu).abs() < 2.0, "{sb:?} → {sa:?}");
 }
 
+#[tokio::test]
+async fn skipped_time_is_neither_counted_nor_corrected() {
+    let (ff, d, caps) = need!(setup("colormatch-skip").await);
+    let src = need!(mashup(&ff, &d, "k.mp4", false).await);
+    let facts = facts::read(&ff, &src).await.unwrap();
+    let span = |a: u64, b: u64| colormatch::SkipSpan { start_ms: a, end_ms: Some(b) };
+
+    // 1. 整个镜头排除：偏黄的第 2 个镜头不再被标记，也不统计；偏亮的第 4 个镜头照常
+    let a = colormatch::analyze_cached(&ff, &src, &facts, &caps, &[span(3000, 6000)]).await.expect("analyze");
+    let rep = a.report();
+    assert_eq!((rep.shots_total, rep.shots_excluded), (5, 1), "{rep:?}");
+    assert_eq!(rep.flagged.len(), 1, "{rep:?}");
+    assert!(ms_close(rep.flagged[0].start_ms, 9000, 45), "{rep:?}");
+    assert_eq!(rep.skipped.iter().map(|s| (s.start_ms, s.end_ms)).collect::<Vec<_>>(), vec![(3000, 6000)]);
+    // 不排除时两个都标记；换了排除的时间段不用重新分析整个文件（结果各自缓存）
+    let none = colormatch::analyze_cached(&ff, &src, &facts, &caps, &[]).await.expect("analyze");
+    assert_eq!(none.report().flagged.len(), 2);
+    assert_eq!(none.report().shots_excluded, 0);
+
+    // 处理：被排除的时间原样不动，其余的不一致镜头照常校正
+    let mut spec = preset("mashup").unwrap();
+    spec.match_color = 1.0;
+    spec.match_skip = vec![span(3000, 6000)];
+    let (out, plan, _) = normalize(&ff, &src, &spec, &caps, &d).await;
+    assert!(plan.notes.iter().any(|n| n.contains("1 个不一致的镜头自动校正") && n.contains("1 段排除的时间保持原样")), "{:?}", plan.notes);
+    let (b_skip, n_skip) = (stats_at(&ff, &src, 4.5).await, stats_at(&ff, &out, 4.5).await);
+    assert!(
+        (b_skip.y - n_skip.y).abs() < 3.0 && (b_skip.nu - n_skip.nu).abs() < 2.5 && (b_skip.nv - n_skip.nv).abs() < 2.5,
+        "排除的镜头不该被改：{b_skip:?} → {n_skip:?}"
+    );
+    let (b_bad, n_bad) = (stats_at(&ff, &src, 10.5).await, stats_at(&ff, &out, 10.5).await);
+    assert!((b_bad.y - n_bad.y).abs() > 15.0, "第 4 个镜头应该被校正：{b_bad:?} → {n_bad:?}");
+
+    // 2. 只排除镜头中间的一小段：镜头照样校正，排除的那一段保持原样
+    spec.match_skip = vec![span(3600, 4600)];
+    let (out, _, _) = normalize(&ff, &src, &spec, &caps, &d).await;
+    let (b_in, n_in) = (stats_at(&ff, &src, 4.1).await, stats_at(&ff, &out, 4.1).await);
+    assert!((b_in.nu - n_in.nu).abs() < 2.5 && (b_in.nv - n_in.nv).abs() < 2.5, "排除的一段不该被改：{b_in:?} → {n_in:?}");
+    let (b_out, n_out) = (stats_at(&ff, &src, 5.5).await, stats_at(&ff, &out, 5.5).await);
+    assert!((b_out.nu - n_out.nu).abs() > 6.0, "同一个镜头排除之外的部分应该被校正：{b_out:?} → {n_out:?}");
+
+    // 3. 统一的手动调节同样避开排除的时间
+    spec.match_color = 1.0;
+    spec.match_tone = ToneAdjust { brightness: 0.5, ..Default::default() };
+    spec.match_skip = vec![span(3000, 6000)];
+    let (out, _, _) = normalize(&ff, &src, &spec, &caps, &d).await;
+    let (b1, n1) = (stats_at(&ff, &src, 1.5).await, stats_at(&ff, &out, 1.5).await);
+    assert!(n1.y - b1.y > 12.0, "排除之外的时间应该变亮：{b1:?} → {n1:?}");
+    let (b2, n2) = (stats_at(&ff, &src, 4.5).await, stats_at(&ff, &out, 4.5).await);
+    assert!((n2.y - b2.y).abs() < 3.0, "排除的时间不该变亮：{b2:?} → {n2:?}");
+    // 结尾留空 = 一直到视频结尾
+    spec.match_skip = vec![colormatch::SkipSpan { start_ms: 12_000, end_ms: None }];
+    let (out, _, _) = normalize(&ff, &src, &spec, &caps, &d).await;
+    let (b3, n3) = (stats_at(&ff, &src, 13.5).await, stats_at(&ff, &out, 13.5).await);
+    assert!((n3.y - b3.y).abs() < 3.0, "{b3:?} → {n3:?}");
+}
+
 // ---------- 输出电平 ----------
 
 /// 一条从暗到亮的斜坡（亮度 16→235 或 0→255），用来看电平被拉开还是压缩。
@@ -1049,7 +1106,7 @@ async fn a_graph_too_long_for_the_command_line_still_runs_from_a_file() {
             except: vec![],
         })
         .collect();
-    let an = Analysis { color: Some(ColorPlan { fixes, auto_shots: 250, own_shots: 0, unified: false }), ..Default::default() };
+    let an = Analysis { color: Some(ColorPlan { fixes, auto_shots: 250, own_shots: 0, unified: false, skipped: 0 }), ..Default::default() };
     let spec = NormSpec { size: "keep".into(), match_color: 1.0, ..Default::default() };
     let plan = build(&src, &spec, &facts, &an, &caps, &d.join("tmp")).unwrap();
     assert!(plan.args.iter().all(|a| a.len() < 1000), "滤镜图应该在文件里，不在命令行上");

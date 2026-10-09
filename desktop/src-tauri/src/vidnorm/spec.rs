@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::colormatch::{ShotAdjust, ToneAdjust};
+use super::colormatch::{normalize_skips, ShotAdjust, SkipSpan, ToneAdjust};
 use super::facts::{Facts, Hdr};
 
 /// 想把视频规整成的样子。字段都有默认值（等于“通用兼容”预设），界面只需要传改动过的。
@@ -38,6 +38,8 @@ pub struct NormSpec {
     pub match_tone: ToneAdjust,
     /// 单独调节的镜头：用检测结果里镜头开头的毫秒数标识，只用自己的参数，不再用统一的
     pub match_shots: Vec<ShotAdjust>,
+    /// 不参与分段色彩匹配的时间段：不统计、不校正，保持原样
+    pub match_skip: Vec<SkipSpan>,
     /// `.cube` LUT 文件和强度
     pub lut: Option<String>,
     pub lut_strength: f64,
@@ -74,6 +76,7 @@ impl Default for NormSpec {
             match_color: 0.0,
             match_tone: ToneAdjust::default(),
             match_shots: vec![],
+            match_skip: vec![],
             lut: None,
             lut_strength: 1.0,
             autocrop: false,
@@ -120,6 +123,7 @@ impl NormSpec {
         }
         shots.truncate(100);
         self.match_shots = shots;
+        self.match_skip = normalize_skips(&self.match_skip);
         self.lut_strength = self.lut_strength.clamp(0.0, 1.0);
         self.lut = self.lut.take().filter(|p| !p.trim().is_empty());
         self.loudness = self.loudness.map(|l| l.clamp(-30.0, -5.0));
@@ -462,6 +466,15 @@ mod tests {
         assert_eq!((c.match_tone.brightness, c.match_tone.contrast, c.match_tone.saturation), (1.0, 0.0, -1.0));
         assert_eq!(c.match_shots.len(), 1, "{:?}", c.match_shots);
         assert_eq!((c.match_shots[0].strength, c.match_shots[0].tone.tint), (Some(0.5), 1.0));
+        // 排除的时间段：去掉空的和反的、排序、合并重叠的
+        let skip = |a: u64, b: Option<u64>| SkipSpan { start_ms: a, end_ms: b };
+        let c = NormSpec {
+            match_skip: vec![skip(9000, Some(9000)), skip(5000, Some(7000)), skip(1000, Some(3000)), skip(6000, Some(8000)), skip(20000, None)],
+            ..Default::default()
+        }
+        .checked()
+        .unwrap();
+        assert_eq!(c.match_skip, vec![skip(1000, Some(3000)), skip(5000, Some(8000)), skip(20000, None)]);
     }
 
     #[test]

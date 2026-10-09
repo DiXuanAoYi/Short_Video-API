@@ -1085,7 +1085,7 @@ mod tests {
         let fixes = (0..n)
             .map(|i| ColorFix { start_ms: Some(i * 3000), end_ms: Some(i * 3000 + 3000), y: curve(1.0123), u: curve(0.9876), v: curve(1.0345), except: vec![] })
             .collect();
-        Analysis { color: Some(ColorPlan { fixes, auto_shots: n as usize, own_shots: 0, unified: false }), ..Default::default() }
+        Analysis { color: Some(ColorPlan { fixes, auto_shots: n as usize, own_shots: 0, unified: false, skipped: 0 }), ..Default::default() }
     }
 
     #[test]
