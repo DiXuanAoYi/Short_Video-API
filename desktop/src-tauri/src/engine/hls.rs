@@ -408,7 +408,7 @@ mod tests {
     }
 
     /// /master.m3u8 → /v/media.m3u8（相对地址、AES-128、媒体序号从 10 开始）；/ads.m3u8 含另一主机的广告段；
-    /// /live.m3u8 无 ENDLIST；/drm.m3u8 使用 SAMPLE-AES；`/slow/` 前缀的分片每个延迟 150 毫秒。
+    /// /live.m3u8 无 ENDLIST；/drm.m3u8 使用 SAMPLE-AES；`/slow/` 前缀的分片每个延迟 400 毫秒。
     async fn serve() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -433,7 +433,7 @@ mod tests {
                         p if p.starts_with("/p/s") => plain(p[4..5].parse().unwrap()),
                         p if p.starts_with("/v/s") || p.starts_with("/slow/s") => {
                             if p.starts_with("/slow/") {
-                                tokio::time::sleep(Duration::from_millis(150)).await;
+                                tokio::time::sleep(Duration::from_millis(400)).await;
                             }
                             let i: usize = p.trim_start_matches("/v/s").trim_start_matches("/slow/s")[..1].parse().unwrap();
                             encrypted(i, 10 + i as u64)
@@ -531,7 +531,13 @@ mod tests {
             let opts = HlsOptions { concurrency: 1, ..Default::default() };
             download(&client(), &HttpRequest::new(url), &p2, &mut rx, &opts, |_, _| {}).await
         });
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // 等第一个分片落盘后再暂停（固定等待时间在繁忙的 CI 机器上可能一个分片都没下完）
+        let seg_dir = segment_dir(&part);
+        let have_seg = || std::fs::read_dir(&seg_dir).map(|d| d.flatten().any(|e| e.path().extension().is_some_and(|x| x == "seg"))).unwrap_or(false);
+        let started = std::time::Instant::now();
+        while !have_seg() && started.elapsed() < Duration::from_secs(20) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         tx.send(CTRL_PAUSE).unwrap();
         assert!(matches!(h.await.unwrap(), Err(DlError::Paused)));
         let kept = std::fs::read_dir(segment_dir(&part)).unwrap().filter(|e| e.as_ref().unwrap().path().extension().is_some_and(|x| x == "seg")).count();
