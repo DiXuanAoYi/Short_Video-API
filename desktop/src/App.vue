@@ -87,7 +87,9 @@ const navs: { id: ViewName; label: string }[] = [
 
 const footer = computed(() => {
   if (queue.active > 0) return `下载中 ${queue.counts.running} · 等待 ${queue.counts.queued}`
-  return app.info ? `v${app.info.version}` : ''
+  if (!app.info) return ''
+  // 调试版带上提交号，和正式版、其他调试包一眼就能分开
+  return app.info.debug ? `v${app.info.version} · 调试版 ${app.info.commit}` : `v${app.info.version}`
 })
 
 // 空闲自动锁定：记录最近一次键盘 / 鼠标操作

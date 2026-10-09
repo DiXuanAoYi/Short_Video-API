@@ -1,19 +1,23 @@
 <script setup lang="ts">
 import { onMounted, ref, watch } from 'vue'
-import { useAppStore } from '../stores/app'
+import { useAppStore, type ToolboxTab } from '../stores/app'
 import VideoTools from '../components/toolbox/VideoTools.vue'
 import NormalizeTools from '../components/toolbox/NormalizeTools.vue'
+import LutTools from '../components/toolbox/LutTools.vue'
 import SubtitleTools from '../components/toolbox/SubtitleTools.vue'
 import TagTools from '../components/toolbox/TagTools.vue'
 import AiTools from '../components/toolbox/AiTools.vue'
 import JobList from '../components/toolbox/JobList.vue'
 
 const app = useAppStore()
-const tab = ref<'video' | 'normalize' | 'subtitle' | 'tags' | 'ai'>('video')
+const tab = ref<ToolboxTab>('video')
 const preset = ref<string[] | undefined>()
 const tool = ref<string | undefined>()
 const aiMode = ref<'transcribe' | 'translate' | 'summarize' | undefined>()
 const hint = ref<string | undefined>()
+const lut = ref<string | undefined>()
+/** LUT 工作室看过一次之后一直保留，切到别的标签再回来，调了一半的东西还在。 */
+const lutSeen = ref(false)
 
 function consume() {
   const r = app.toolboxRequest
@@ -22,11 +26,19 @@ function consume() {
   tool.value = r.tool
   aiMode.value = r.aiMode
   hint.value = r.hint
+  lut.value = r.lut
   tab.value = r.tab ?? 'video'
   app.toolboxRequest = null
 }
 onMounted(consume)
 watch(() => app.toolboxRequest, consume)
+watch(
+  tab,
+  (t) => {
+    if (t === 'lut') lutSeen.value = true
+  },
+  { immediate: true },
+)
 </script>
 
 <template>
@@ -36,6 +48,7 @@ watch(() => app.toolboxRequest, consume)
       <el-radio-group v-model="tab" size="small">
         <el-radio-button value="video">视频与音频</el-radio-button>
         <el-radio-button value="normalize">视频规整</el-radio-button>
+        <el-radio-button value="lut">LUT 工作室</el-radio-button>
         <el-radio-button value="subtitle">字幕</el-radio-button>
         <el-radio-button value="tags">音频标签</el-radio-button>
         <el-radio-button value="ai">AI</el-radio-button>
@@ -43,11 +56,12 @@ watch(() => app.toolboxRequest, consume)
     </div>
     <p class="mute note">所有处理都在本机完成，会生成新文件并登记到媒体库，不会修改原文件。需要 ffmpeg（在“设置 → 组件”里安装）。</p>
     <VideoTools v-if="tab === 'video'" :preset="preset" :tool="tool" />
-    <NormalizeTools v-else-if="tab === 'normalize'" :preset="preset" :hint="hint" />
+    <NormalizeTools v-else-if="tab === 'normalize'" :preset="preset" :hint="hint" :lut="lut" />
     <SubtitleTools v-else-if="tab === 'subtitle'" />
     <TagTools v-else-if="tab === 'tags'" />
-    <AiTools v-else :preset="preset" :mode="aiMode" />
-    <JobList v-if="tab !== 'subtitle'" class="joblist" />
+    <AiTools v-else-if="tab === 'ai'" :preset="preset" :mode="aiMode" />
+    <LutTools v-if="lutSeen" v-show="tab === 'lut'" :preset="tab === 'lut' ? preset : undefined" />
+    <JobList v-if="tab !== 'subtitle' && tab !== 'lut'" class="joblist" />
   </div>
 </template>
 

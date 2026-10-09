@@ -1018,6 +1018,10 @@ export interface AppInfo {
   os: string
   keyInKeyring: boolean
   shortcutError: string | null
+  /** 构建所对应的提交（短哈希） */
+  commit: string
+  /** 调试版 */
+  debug: boolean
 }
 
 export interface UpdateInfo {
@@ -1130,4 +1134,76 @@ export interface PlayerSource {
   kind: 'video' | 'audio'
   ext: string
   tracks: PlayerTrack[]
+}
+
+// ---------- LUT 工作室 ----------
+
+export interface SplitTone {
+  /** 色相 0–360 */
+  hue: number
+  /** 0–1，0 为不染色 */
+  amount: number
+}
+
+export interface LutAdjust {
+  exposure: number
+  black: number
+  white: number
+  gamma: number
+  contrast: number
+  shadows: number
+  highlights: number
+  temperature: number
+  tint: number
+  saturation: number
+  vibrance: number
+  hue: number
+  shadowTone: SplitTone
+  highlightTone: SplitTone
+  strength: number
+}
+
+export interface LutLayer {
+  path: string
+  strength: number
+}
+
+export interface LutReference {
+  path: string
+  /** 明暗匹配强度 0–1 */
+  tone: number
+  /** 色彩匹配强度 0–1 */
+  color: number
+}
+
+export interface LutSample {
+  path: string
+  atMs: number
+}
+
+export interface LutRecipe {
+  name: string
+  size: 17 | 33 | 65
+  base: LutLayer[]
+  adjust: LutAdjust
+  reference: LutReference | null
+  sample: LutSample | null
+}
+
+export interface LutLook {
+  id: string
+  name: string
+  desc: string
+  adjust: LutAdjust
+}
+
+export interface LutInfo {
+  title: string
+  size: number
+}
+
+export interface LutSaved {
+  path: string
+  size: number
+  bytes: number
 }

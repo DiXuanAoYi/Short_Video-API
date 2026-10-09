@@ -34,6 +34,10 @@ import type {
   CapsSummary,
   NormPreset,
   NormSpec,
+  LutInfo,
+  LutLook,
+  LutRecipe,
+  LutSaved,
   VideoPreview,
   VideoReport,
   SubJob,
@@ -205,6 +209,14 @@ export const api = {
   videoAnalyze: (path: string, hint?: string | null) => invoke<VideoReport>('video_analyze', { path, hint: hint ?? null }),
   videoColor: (path: string) => invoke<ColorReport>('video_color', { path }),
   videoPreview: (path: string, spec: NormSpec, atMs: number) => invoke<VideoPreview>('video_preview', { path, spec, atMs }),
+  lutLooks: () => invoke<LutLook[]>('lut_looks'),
+  lutInspect: (path: string) => invoke<LutInfo>('lut_inspect', { path }),
+  /** 示例图片（或视频一帧）的原图像素：8 字节头（宽、高，小端）+ RGBA */
+  lutSample: (path: string, atMs: number) => invoke<ArrayBuffer>('lut_sample', { path, atMs }),
+  /** 套上当前配方后的像素，格式同 lutSample */
+  lutPreview: (recipe: LutRecipe) => invoke<ArrayBuffer>('lut_preview', { recipe }),
+  lutSave: (recipe: LutRecipe, dest: string) => invoke<LutSaved>('lut_save', { recipe, dest }),
+  lutExportImage: (recipe: LutRecipe, dest: string) => invoke<string>('lut_export_image', { recipe, dest }),
   subtitleTool: (job: SubJob) => invoke<{ output: string; count: number }>('subtitle_tool', { job }),
 
   copyText: (text: string) => invoke<void>('copy_text', { text }),

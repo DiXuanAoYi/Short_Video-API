@@ -18,6 +18,7 @@ pub mod library;
 pub mod library_cmds;
 pub mod library_media;
 pub mod live;
+pub mod lut;
 pub mod media_cmds;
 pub mod media_server;
 pub mod media_tools;
@@ -172,6 +173,9 @@ fn spawn_account_reminders(app: tauri::AppHandle) {
     });
 }
 
+/// 构建所对应的提交（短哈希），由 build.rs 写入。
+pub const COMMIT: &str = env!("CLEARCLIP_COMMIT");
+
 /// 便携模式：程序目录下有 `portable` 文件（或 `data` 目录）时，设置、数据和日志都保存在程序目录的 `data` 下。
 pub fn portable_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
@@ -243,7 +247,19 @@ pub fn run() {
             let mut settings = Settings::load(&settings_path, &default_dl);
             let db = Db::open(&data_dir.join("clearclip.db")).map_err(|e| e.to_string())?;
             let log_dir = if portable_dir().is_some() { data_dir.join("logs") } else { app.path().app_log_dir().unwrap_or_else(|_| data_dir.join("logs")) };
-            log::info!("ClearClip {} starting on {}", app.package_info().version, std::env::consts::OS);
+            log::info!(
+                "ClearClip {} ({COMMIT}{}) starting on {}, identifier {}",
+                app.package_info().version,
+                if cfg!(debug_assertions) { ", debug" } else { "" },
+                std::env::consts::OS,
+                app.config().identifier
+            );
+            // 调试版：标题栏写上版本和提交号，和正式版、其他调试包一眼就能分开
+            if cfg!(debug_assertions) {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.set_title(&format!("清影 ClearClip 调试版 {} · {COMMIT}", app.package_info().version));
+                }
+            }
 
             let key = secret::load_or_create_key(&data_dir);
             let cookie_store = CookieStore::open(cookies::store_path(&data_dir), key.key, key.in_keyring);
@@ -493,6 +509,12 @@ pub fn run() {
             media_cmds::video_analyze,
             media_cmds::video_color,
             media_cmds::video_preview,
+            lut::cmds::lut_looks,
+            lut::cmds::lut_inspect,
+            lut::cmds::lut_sample,
+            lut::cmds::lut_preview,
+            lut::cmds::lut_save,
+            lut::cmds::lut_export_image,
             media_cmds::subtitle_tool,
             commands::list_orphan_parts,
             commands::delete_orphan_parts,

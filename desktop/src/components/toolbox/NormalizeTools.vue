@@ -9,7 +9,7 @@ import type { CapsSummary, ColorFlaggedShot, ColorReport, NormPreset, NormSpec, 
 import { formatClock, parseClock } from '../../utils/time'
 import FileInput from './FileInput.vue'
 
-const props = defineProps<{ preset?: string[]; hint?: string }>()
+const props = defineProps<{ preset?: string[]; hint?: string; lut?: string }>()
 const emit = defineEmits<{ started: [] }>()
 const app = useAppStore()
 
@@ -75,6 +75,18 @@ const segPercent = (a: number, b: number) => `${Math.max(0.4, ((b - a) / Math.ma
 watch(
   () => props.preset,
   (p) => p && (files.value = [...p]),
+)
+
+// 从 LUT 工作室带过来的 LUT
+watch(
+  () => props.lut,
+  (l) => {
+    if (l) {
+      spec.lut = l
+      spec.lutStrength = 1
+    }
+  },
+  { immediate: true },
 )
 
 function applyPreset(p: NormPreset) {
