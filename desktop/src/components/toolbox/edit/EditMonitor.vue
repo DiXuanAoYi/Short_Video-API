@@ -351,6 +351,31 @@ const focusBox = computed(() => {
   return focusRect(r, rt.value, win)
 })
 
+/**
+ * 跟随聚焦在实时画面里的样子：不在“区域”标签里编辑时，把取景窗口放大到铺满画面（取景窗口的位置没有做镜头平滑，只是近似；
+ * 在“区域”标签里编辑时看到的是完整画面加一个虚线窗口，方便框选）。
+ */
+const focusZoom = computed<{ clip: number; css: string } | null>(() => {
+  const m = curMain.value
+  const src = curSrc.value
+  const g = geom.value
+  if (props.mode !== 'live' || rg.tabActive.value || !m || !src || !g || m.clip.kind !== 'video') return null
+  const r = m.clip.regions.find((x) => x.effect === 'focus')
+  if (!r) return null
+  const o = size.value
+  const win = focusWindow(r.zoom, { w: src.width, h: src.height }, r.reframe ? aspectInSource(o.w, o.h, m.clip.rotate) : null)
+  const fr = focusRect(r, m.srcMs, win)
+  if (!fr) return null
+  const pts = [g.fromNorm(fr.x, fr.y), g.fromNorm(fr.x + fr.w, fr.y), g.fromNorm(fr.x, fr.y + fr.h), g.fromNorm(fr.x + fr.w, fr.y + fr.h)]
+  const ww = Math.max(...pts.map((p) => p.px)) - Math.min(...pts.map((p) => p.px))
+  const hh = Math.max(...pts.map((p) => p.py)) - Math.min(...pts.map((p) => p.py))
+  if (ww < 1 || hh < 1) return null
+  const k = ed.project.value.out.fit === 'cover' ? Math.max(stage.value.w / ww, stage.value.h / hh) : Math.min(stage.value.w / ww, stage.value.h / hh)
+  if (k <= 1.001) return null
+  const c = g.fromNorm(fr.x + fr.w / 2, fr.y + fr.h / 2)
+  return { clip: m.clip.id, css: `translate(${stage.value.w / 2}px, ${stage.value.h / 2}px) scale(${k.toFixed(4)}) translate(${(-c.px).toFixed(2)}px, ${(-c.py).toFixed(2)}px)` }
+})
+
 const path = computed(() => {
   const r = rg.region.value
   if (!r || r.track.length < 2) return null
@@ -448,11 +473,13 @@ const empty = computed(() => !clips.value.length && !ed.project.value.overlays.l
   <div ref="wrap" class="mon">
     <div ref="stageEl" class="stage" :style="{ width: stage.w + 'px', height: stage.h + 'px' }">
       <template v-if="mode === 'live'">
-        <EditLive ref="live" :ed="ed" :stage="stage" :fit="ed.project.value.out.fit">
+        <EditLive ref="live" :ed="ed" :stage="stage" :fit="ed.project.value.out.fit" :zoom="focusZoom">
           <template #fx>
-            <div v-if="fxList.length && geom" class="fxl" :style="geoBox">
-              <div class="rcont" :style="geoContent">
-                <div v-for="f in fxList" :key="'f' + f.id" class="fx" :style="f.style" />
+            <div v-if="fxList.length && geom" class="fxz" :style="{ transform: focusZoom?.css ?? 'none' }">
+              <div class="fxl" :style="geoBox">
+                <div class="rcont" :style="geoContent">
+                  <div v-for="f in fxList" :key="'f' + f.id" class="fx" :style="f.style" />
+                </div>
               </div>
             </div>
           </template>
@@ -546,6 +573,12 @@ const empty = computed(() => !clips.value.length && !ed.project.value.overlays.l
 .txt.on {
   outline: 1px dashed #fff;
   outline-offset: 2px;
+}
+.fxz {
+  position: absolute;
+  inset: 0;
+  transform-origin: 0 0;
+  pointer-events: none;
 }
 .fxl {
   position: absolute;

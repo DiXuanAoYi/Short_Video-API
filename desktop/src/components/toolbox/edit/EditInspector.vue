@@ -351,7 +351,7 @@ async function pickDir() {
         <el-checkbox :model-value="overlay.flipH" @update:model-value="(v: unknown) => po({ flipH: !!v }, 'ofh')">左右翻转</el-checkbox>
         <el-checkbox :model-value="overlay.flipV" @update:model-value="(v: unknown) => po({ flipV: !!v }, 'ofv')">上下翻转</el-checkbox>
       </EditField>
-      <EditField label="淡入（秒）" hint="变透明再出现，声音同步">
+      <EditField label="淡入（秒）" hint="从透明逐渐显现，声音同步">
         <el-input-number :model-value="overlay.fadeInMs / 1000" :min="0" :max="overlayDuration(overlay) / 1000" :step="0.1" :precision="1" size="small" controls-position="right" @update:model-value="(v: number | undefined) => po({ fadeInMs: Math.round((v ?? 0) * 1000) }, 'ofi')" />
       </EditField>
       <EditField label="淡出（秒）" hint="逐渐变透明，声音同步">

@@ -832,7 +832,19 @@ mod tests {
         // 1.5 + (2.5 - 0.5 转场重叠) + 5.003 = 8.503 秒，和界面显示的总长一致
         assert_eq!(total_ms(&p.clips), 8503);
         assert!((p.clips[0].volume - 1.05).abs() < 1e-9);
-        assert_eq!(p.media_paths(), vec!["/media/red.webm", "/media/green.webm", "/media/music.ogg"]);
+        assert_eq!(
+            p.media_paths(),
+            vec!["/media/red.webm", "/media/green.webm", "/media/sticker.png", "/media/anim.gif", "/media/blue.webm", "/media/music.ogg"]
+        );
+        // 叠加轨：界面导出的字段名后端都认得（轨号、开始时间、位置 / 大小 / 旋转、GIF 的循环和静音）
+        assert_eq!(p.overlays.len(), 3);
+        let by = |name: &str| p.overlays.iter().find(|o| o.path.ends_with(name)).unwrap();
+        let (st, gif, blue) = (by("sticker.png"), by("anim.gif"), by("blue.webm"));
+        assert_eq!((st.kind, st.track, st.start_ms, st.in_ms, st.out_ms), (ClipKind::Image, 1, 1000, 0, 5000));
+        assert!((st.scale - 0.281).abs() < 1e-9 && (st.x - 0.5).abs() < 1e-9 && st.opacity == 1.0 && st.rotate == 0.0);
+        assert_eq!((gif.kind, gif.track, gif.start_ms, gif.out_ms, gif.looped, gif.mute), (ClipKind::Video, 3, 2400, 3600, true, true));
+        assert_eq!((blue.track, blue.start_ms, blue.out_ms), (2, 3000, 4000));
+        assert!((blue.x - 0.64).abs() < 1e-9 && (blue.y - 0.64).abs() < 1e-9);
         // 区域：界面导出的字段名（含手动点 pin、追踪不到 lost）后端都认得；没有 regions 字段的旧片段读出来是空的
         assert_eq!(p.clips.iter().map(|c| c.regions.len()).collect::<Vec<_>>(), vec![1, 1, 0]);
         let (a, b) = (&p.clips[0].regions[0], &p.clips[1].regions[0]);

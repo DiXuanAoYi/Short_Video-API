@@ -291,7 +291,16 @@ mod tests {
     #[test]
     fn only_media_files_are_accepted() {
         let d = dir("kinds");
-        for (n, k) in [("a.mp4", "video"), ("a.MP3", "audio"), ("a.png", "image"), ("a.gif", "image"), ("a.m2ts", "video"), ("a.Tiff", "image"), ("a.avif", "image"), ("a.aiff", "audio")] {
+        for (n, k) in [
+            ("a.mp4", "video"),
+            ("a.MP3", "audio"),
+            ("a.png", "image"),
+            ("a.gif", "image"),
+            ("a.m2ts", "video"),
+            ("a.Tiff", "image"),
+            ("a.avif", "image"),
+            ("a.aiff", "audio"),
+        ] {
             std::fs::write(d.join(n), "x").unwrap();
             assert_eq!(media_kind(&d.join(n)).unwrap(), k);
         }

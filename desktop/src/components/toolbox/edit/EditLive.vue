@@ -9,7 +9,13 @@ import type { EditClip, EditOverlay } from '../../../types'
 import { audioSpan, clamp, isGif, liveFrame, mainGain, overlayBox, overlayEnd, overlayGain, transitionLook } from '../../../utils/edit'
 import type { LiveMain, LiveOverlay, TransitionLook } from '../../../utils/edit'
 
-const props = defineProps<{ ed: EditApi; stage: { w: number; h: number }; fit: 'contain' | 'cover' | 'blur' }>()
+const props = defineProps<{
+  ed: EditApi
+  stage: { w: number; h: number }
+  fit: 'contain' | 'cover' | 'blur'
+  /** 这一段画面要放大到“聚焦窗口”（跟随聚焦的近似效果）：片段 id 和整层的 transform */
+  zoom?: { clip: number; css: string } | null
+}>()
 const ed = props.ed
 
 /** 往后多久内要用到的素材先装好，往前多久内的还留着（拖回去不用重新加载） */
@@ -116,6 +122,8 @@ function layerStyle(it: Item): Record<string, string> {
   if (!l) return {}
   return { zIndex: String(10 + l.rank), opacity: String(clamp(l.overlay.opacity * l.fade, 0, 1)) }
 }
+
+const zoomStyle = (it: Item): Record<string, string> => (it.main && props.zoom && props.zoom.clip === it.id ? { transform: props.zoom.css, transformOrigin: '0 0' } : {})
 
 function mediaStyle(it: Item): Record<string, string> {
   const { w, h } = props.stage
@@ -267,18 +275,20 @@ defineExpose({ sync, pause })
 <template>
   <div class="live" :style="{ background: look.backdrop ?? 'transparent' }">
     <div v-for="it in items" :key="it.key" class="lay" :class="{ off: !isLive(it) }" :data-key="it.key" :style="layerStyle(it)">
-      <video
-        v-if="!it.still && !isFailed(it)"
-        :ref="(el) => setEl(it.key, el)"
-        :src="it.url"
-        :style="mediaStyle(it)"
-        muted
-        preload="auto"
-        playsinline
-        @loadedmetadata="onMeta(it)"
-        @error="onError(it)"
-      />
-      <img v-else-if="stillSrc(it)" :src="stillSrc(it)" :style="mediaStyle(it)" alt="" draggable="false" @error="onError(it)" />
+      <div class="zoom" :style="zoomStyle(it)">
+        <video
+          v-if="!it.still && !isFailed(it)"
+          :ref="(el) => setEl(it.key, el)"
+          :src="it.url"
+          :style="mediaStyle(it)"
+          muted
+          preload="auto"
+          playsinline
+          @loadedmetadata="onMeta(it)"
+          @error="onError(it)"
+        />
+        <img v-else-if="stillSrc(it)" :src="stillSrc(it)" :style="mediaStyle(it)" alt="" draggable="false" @error="onError(it)" />
+      </div>
     </div>
     <div class="fxslot"><slot name="fx" /></div>
     <audio v-for="a in ed.project.value.audio" :key="a.id" :ref="(el) => setAudio(a.id, el)" :src="ed.sources[a.path]?.url" preload="auto" />
@@ -300,6 +310,10 @@ defineExpose({ sync, pause })
 }
 .lay.off {
   visibility: hidden;
+}
+.zoom {
+  position: absolute;
+  inset: 0;
 }
 .lay :is(video, img) {
   background: transparent;
