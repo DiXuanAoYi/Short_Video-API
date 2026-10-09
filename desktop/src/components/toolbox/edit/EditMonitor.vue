@@ -1,10 +1,12 @@
 <script setup lang="ts">
-// 监视器：直接播放素材文件来预览（不含转场，转场请用“生成预览”），或者播放生成好的预览成片。
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+// 监视器：默认是“实时画面”——直接把时间线上的东西叠在一起播放（转场、叠加轨、文字、配乐都在，不用等渲染）；
+// 也可以播放生成好的“精确预览”（用导出同一套流程渲染，一帧不差）。
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import type { EditApi } from '../../../composables/useEditProject'
 import type { RegionApi } from '../../../composables/useRegions'
-import type { EditClip, EditRegion, EditText, NRect } from '../../../types'
-import { aspectInSource, audioSpan, boxFromCorners, clamp, clampBox, clipIndexAt, fadeFactor, focusRect, focusWindow, grownBox, monitorGeom, outputSize, regionActiveAt, sourceTimeAt, thin, trackAt } from '../../../utils/edit'
+import type { EditOverlay, EditRegion, EditText, NRect } from '../../../types'
+import { aspectInSource, boxFromCorners, clamp, clampBox, focusRect, focusWindow, grownBox, liveFrame, monitorGeom, outputSize, overlayBox, regionActiveAt, thin, trackAt } from '../../../utils/edit'
+import EditLive from './EditLive.vue'
 
 const props = defineProps<{ ed: EditApi; rg: RegionApi; mode: 'live' | 'preview'; previewUrl: string | null }>()
 const ed = props.ed
@@ -35,121 +37,25 @@ const stage = computed(() => {
 })
 
 // ---------- 播放 ----------
+// 时间线的时钟由这里走；实时画面（EditLive）负责让各个视频、音频跟上这个时钟。
 
-interface Slot {
-  path: string
-}
-const slots = reactive<Slot[]>([{ path: '' }, { path: '' }])
-const vEls: (HTMLVideoElement | null)[] = [null, null]
-const pending: (number | null)[] = [null, null]
-const aEls = new Map<number, HTMLAudioElement>()
+const live = ref<InstanceType<typeof EditLive> | null>(null)
 const pv = ref<HTMLVideoElement | null>(null)
-const activeSlot = ref(0)
-const curIdx = ref(-1)
-const playError = ref('')
 
 const total = computed(() => ed.total.value)
 const clips = computed(() => ed.project.value.clips)
-
-function setVideoEl(i: number, el: unknown) {
-  vEls[i] = (el as HTMLVideoElement | null) ?? null
-}
-function setAudioEl(id: number, el: unknown) {
-  if (el) aEls.set(id, el as HTMLAudioElement)
-  else aEls.delete(id)
-}
-
-function onMeta(i: number) {
-  const el = vEls[i]
-  if (el && pending[i] !== null) {
-    el.currentTime = pending[i] as number
-    pending[i] = null
-  }
-}
-
-function load(i: number, c: EditClip, at: number) {
-  const el = vEls[i]
-  const src = ed.sources[c.path]
-  if (!el || !src) return
-  slots[i].path = c.path
-  pending[i] = at
-  playError.value = ''
-  el.src = src.url
-  el.load()
-  el.currentTime = at
-}
+const frame = computed(() => liveFrame(ed.project.value, ed.placed.value, ed.playhead.value, (path) => ed.sources[path]?.durationMs))
+/** 主轨上“现在算哪一段”：转场中算进来的那一段 */
+const curMain = computed(() => frame.value.main[frame.value.main.length - 1])
+const curIdx = computed(() => curMain.value?.idx ?? -1)
 
 function sync(t: number, seek: boolean) {
   if (props.mode === 'preview') return
-  const list = clips.value
-  const pl = ed.placed.value
-  let i = clipIndexAt(pl, t)
-  let tt = t
-  if (i < 0 && list.length) {
-    i = list.length - 1
-    tt = pl[i].endMs - 1
-  }
-  curIdx.value = i
-  const c = list[i]
-  const playing = ed.playing.value
-  if (!c || c.kind === 'image' || !ed.sources[c.path]) {
-    for (const el of vEls) if (el && !el.paused) el.pause()
-  } else {
-    const want = sourceTimeAt(c, pl[i], tt) / 1000
-    const near = (s: number) => slots[s].path === c.path && vEls[s] !== null && Math.abs((vEls[s] as HTMLVideoElement).currentTime - want) < 0.35
-    const cur = activeSlot.value
-    let s = near(cur) ? cur : near(1 - cur) ? 1 - cur : -1
-    if (s < 0 && !playing && slots[cur].path === c.path) s = cur
-    if (s < 0) {
-      s = 1 - cur
-      load(s, c, want)
-    }
-    activeSlot.value = s
-    const el = vEls[s]
-    if (el) {
-      el.playbackRate = clamp(c.speed, 0.25, 4)
-      el.muted = c.mute || !playing
-      el.volume = clamp(c.volume, 0, 1)
-      if (pending[s] === null && (seek || Math.abs(el.currentTime - want) > 0.35)) el.currentTime = want
-      if (playing && el.paused) el.play().catch(() => undefined)
-      else if (!playing && !el.paused) el.pause()
-    }
-    const other = vEls[1 - s]
-    if (other && !other.paused) other.pause()
-    // 预先装好下一个片段，切换时不会卡
-    const nx = list[i + 1]
-    if (nx && nx.kind === 'video' && ed.sources[nx.path] && slots[1 - s].path !== nx.path) load(1 - s, nx, nx.inMs / 1000)
-  }
-  syncMusic(t, playing)
-}
-
-function syncMusic(t: number, playing: boolean) {
-  const end = total.value
-  for (const a of ed.project.value.audio) {
-    const el = aEls.get(a.id)
-    const src = ed.sources[a.path]
-    if (!el || !src) continue
-    const span = audioSpan(a, src, end)
-    const active = playing && t >= a.startMs && t < a.startMs + span
-    if (!active) {
-      if (!el.paused) el.pause()
-      continue
-    }
-    const seg = a.outMs !== null ? a.outMs - a.inMs : Math.max(1, (src.durationMs ?? 1) - a.inMs)
-    const local = t - a.startMs
-    const want = (a.inMs + (a.looped ? local % Math.max(1, seg) : local)) / 1000
-    let f = 1
-    if (a.fadeInMs > 0) f = Math.min(f, local / a.fadeInMs)
-    if (a.fadeOutMs > 0) f = Math.min(f, (span - local) / a.fadeOutMs)
-    el.volume = clamp(a.volume * clamp(f, 0, 1), 0, 1)
-    if (Math.abs(el.currentTime - want) > 0.35) el.currentTime = want
-    if (el.paused) el.play().catch(() => undefined)
-  }
+  live.value?.sync(t, seek)
 }
 
 function pauseAll() {
-  for (const el of vEls) if (el && !el.paused) el.pause()
-  for (const el of aEls.values()) if (!el.paused) el.pause()
+  live.value?.pause()
   if (pv.value && !pv.value.paused) pv.value.pause()
 }
 
@@ -221,7 +127,7 @@ watch(
   () => {
     ed.playing.value = false
     pauseAll()
-    queueMicrotask(() => seekTo(ed.playhead.value))
+    nextTick(() => seekTo(ed.playhead.value))
   },
 )
 let resyncQueued = false
@@ -237,7 +143,7 @@ watch(
   },
   { deep: true },
 )
-onMounted(() => sync(ed.playhead.value, true))
+onMounted(() => nextTick(() => sync(ed.playhead.value, true)))
 onBeforeUnmount(() => {
   cancelAnimationFrame(raf)
   ro?.disconnect()
@@ -246,39 +152,8 @@ onBeforeUnmount(() => {
 
 // ---------- 画面 ----------
 
-const cur = computed(() => (curIdx.value >= 0 ? clips.value[curIdx.value] : undefined))
-const curPl = computed(() => (curIdx.value >= 0 ? ed.placed.value[curIdx.value] : undefined))
+const cur = computed(() => curMain.value?.clip)
 const curSrc = computed(() => (cur.value ? ed.sources[cur.value.path] : undefined))
-
-function mediaStyle(c: EditClip, pl: { startMs: number; durMs: number; overlapMs: number; endMs: number }): Record<string, string> {
-  const { w, h } = stage.value
-  const turned = c.rotate === 90 || c.rotate === 270
-  const bw = turned ? h : w
-  const bh = turned ? w : h
-  const f: string[] = []
-  if (Math.abs(c.brightness) > 1e-6) f.push(`brightness(${(1 + c.brightness).toFixed(3)})`)
-  if (Math.abs(c.contrast - 1) > 1e-6) f.push(`contrast(${c.contrast.toFixed(3)})`)
-  if (Math.abs(c.saturation - 1) > 1e-6) f.push(`saturate(${c.saturation.toFixed(3)})`)
-  return {
-    position: 'absolute',
-    left: `${(w - bw) / 2}px`,
-    top: `${(h - bh) / 2}px`,
-    width: `${bw}px`,
-    height: `${bh}px`,
-    objectFit: ed.project.value.out.fit === 'cover' ? 'cover' : 'contain',
-    transform: `scale(${c.flipH ? -1 : 1}, ${c.flipV ? -1 : 1}) rotate(${c.rotate}deg)`,
-    filter: f.join(' ') || 'none',
-    opacity: String(fadeFactor(c, pl, clamp(ed.playhead.value, pl.startMs, pl.endMs))),
-  }
-}
-
-const videoStyle = (slot: number) => {
-  const c = cur.value
-  const pl = curPl.value
-  if (slot !== activeSlot.value || !c || !pl || c.kind !== 'video' || props.mode !== 'live') return { visibility: 'hidden' } as Record<string, string>
-  return mediaStyle(c, pl)
-}
-const imageStyle = computed(() => (cur.value && curPl.value && cur.value.kind === 'image' ? mediaStyle(cur.value, curPl.value) : { display: 'none' }))
 
 // ---------- 文字 ----------
 
@@ -334,18 +209,105 @@ function textUp() {
   dragText = null
 }
 
+// ---------- 叠加素材：在画面上直接选中、拖动、缩放、旋转 ----------
+
+/** 只有在实时画面、并且不在“区域”标签里改区域时才能碰叠加素材 */
+const ovEditable = computed(() => props.mode === 'live' && !rg.tabActive.value)
+const ovBoxOf = (o: EditOverlay) => {
+  const s = ed.sources[o.path]
+  return overlayBox(o, s ? { w: s.width, h: s.height } : undefined, stage.value)
+}
+const boxCss = (o: EditOverlay, transform: string): Record<string, string> => {
+  const b = ovBoxOf(o)
+  return { left: `${b.cx - b.ew / 2}px`, top: `${b.cy - b.eh / 2}px`, width: `${b.ew}px`, height: `${b.eh}px`, transform }
+}
+/** 此刻看得见的叠加素材，从下到上；每个配一块透明的“点击区”，和素材同样的位置、旋转、翻转 */
+const hits = computed(() => frame.value.overlays.map((l) => ({ id: l.overlay.id, style: boxCss(l.overlay, ovBoxOf(l.overlay).transform) })))
+const selOv = computed(() => {
+  const s = ed.sel.value
+  if (!ovEditable.value || !s || s.kind !== 'overlay') return null
+  const l = frame.value.overlays.find((x) => x.overlay.id === s.id)
+  return l ? { o: l.overlay, style: boxCss(l.overlay, `rotate(${l.overlay.rotate}deg)`) } : null
+})
+
+type OvDrag =
+  | { kind: 'move'; id: number; x0: number; y0: number; px: number; py: number }
+  | { kind: 'scale'; id: number; scale0: number; d0: number; cx: number; cy: number }
+  | { kind: 'rotate'; id: number; rot0: number; a0: number; cx: number; cy: number }
+let ovDrag: OvDrag | null = null
+const CENTER_SNAP = 0.012
+
+function ovPoint(o: EditOverlay): { cx: number; cy: number } | null {
+  const r = stageEl.value?.getBoundingClientRect()
+  return r ? { cx: r.left + o.x * r.width, cy: r.top + o.y * r.height } : null
+}
+const pointerAngle = (e: PointerEvent, cx: number, cy: number) => (Math.atan2(e.clientX - cx, -(e.clientY - cy)) * 180) / Math.PI
+
+function ovDown(e: PointerEvent, id: number) {
+  const o = ed.overlayOf(id)
+  const r = stageEl.value?.getBoundingClientRect()
+  if (!o || !r || !r.width) return
+  ed.sel.value = { kind: 'overlay', id }
+  ed.playing.value = false
+  ovDrag = { kind: 'move', id, x0: o.x, y0: o.y, px: e.clientX, py: e.clientY }
+  ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
+  e.preventDefault()
+}
+function ovHandleDown(e: PointerEvent, what: 'scale' | 'rotate') {
+  const sel = selOv.value
+  const c = sel && ovPoint(sel.o)
+  if (!sel || !c) return
+  ed.playing.value = false
+  if (what === 'scale') {
+    const d0 = Math.hypot(e.clientX - c.cx, e.clientY - c.cy)
+    if (d0 < 4) return
+    ovDrag = { kind: 'scale', id: sel.o.id, scale0: sel.o.scale, d0, cx: c.cx, cy: c.cy }
+  } else ovDrag = { kind: 'rotate', id: sel.o.id, rot0: sel.o.rotate, a0: pointerAngle(e, c.cx, c.cy), cx: c.cx, cy: c.cy }
+  ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
+  e.preventDefault()
+  e.stopPropagation()
+}
+function ovMove(e: PointerEvent) {
+  const d = ovDrag
+  const r = stageEl.value?.getBoundingClientRect()
+  if (!d || !r || !r.width) return
+  if (d.kind === 'move') {
+    let x = clamp(d.x0 + (e.clientX - d.px) / r.width, -1, 2)
+    let y = clamp(d.y0 + (e.clientY - d.py) / r.height, -1, 2)
+    if (!e.altKey) {
+      if (Math.abs(x - 0.5) < CENTER_SNAP) x = 0.5
+      if (Math.abs(y - 0.5) < CENTER_SNAP) y = 0.5
+    }
+    ed.patchOverlay(d.id, { x: Math.round(x * 1000) / 1000, y: Math.round(y * 1000) / 1000 }, `ovpos:${d.id}`)
+  } else if (d.kind === 'scale') {
+    const k = Math.hypot(e.clientX - d.cx, e.clientY - d.cy) / d.d0
+    ed.patchOverlay(d.id, { scale: Math.round(clamp(d.scale0 * k, 0.02, 3) * 1000) / 1000 }, `ovscale:${d.id}`)
+  } else {
+    let a = d.rot0 + (pointerAngle(e, d.cx, d.cy) - d.a0)
+    a = ((((a + 180) % 360) + 360) % 360) - 180
+    // 接近 0 / 90 / 180 度就吸过去（正好是直角时导出不用重新采样，更清晰）；按住 Shift 每 15 度一档
+    const step = e.shiftKey ? 15 : 90
+    const near = Math.round(a / step) * step
+    if (e.shiftKey || Math.abs(a - near) < 3) a = near
+    ed.patchOverlay(d.id, { rotate: Math.round(a * 10) / 10 }, `ovrot:${d.id}`)
+  }
+}
+function ovUp() {
+  ovDrag = null
+}
+
 // ---------- 区域（跟着物体走） ----------
 // 框、路径都画在一个和视频元素摆法完全一样的层里（同样的位置、旋转、翻转），里面再套一个对准“画面内容”的层，
 // 所以框的坐标直接用相对素材画面的比例（0–1）；鼠标位置则按同样的变换反推回来。
 
 const showRegions = computed(() => props.mode === 'live' && rg.tabActive.value && !!rg.clip.value && rg.here.value && curIdx.value === rg.index.value && !!curSrc.value && cur.value?.kind === 'video')
 const geom = computed(() => (cur.value && curSrc.value ? monitorGeom(stage.value, cur.value, { w: curSrc.value.width, h: curSrc.value.height }, ed.project.value.out.fit) : null))
-const ovBox = computed(() => {
+const geoBox = computed(() => {
   const g = geom.value
   if (!g) return {}
   return { left: `${g.box.left}px`, top: `${g.box.top}px`, width: `${g.box.w}px`, height: `${g.box.h}px`, transform: g.transform }
 })
-const ovContent = computed(() => {
+const geoContent = computed(() => {
   const g = geom.value
   if (!g) return {}
   return { left: `${g.content.left}px`, top: `${g.content.top}px`, width: `${g.content.w}px`, height: `${g.content.h}px` }
@@ -362,18 +324,21 @@ const others = computed(() =>
     .map((r) => ({ id: r.id, off: r.effect !== 'focus' && !regionActiveAt(r, rt.value), style: pct(trackAt(r.track, rt.value) ?? { x: 0, y: 0, w: 0, h: 0 }) })),
 )
 
-/** 效果的示意：马赛克 / 模糊 / 局部调色用“透过去看”的滤镜近似，精确的效果以“生成预览”和导出为准 */
-const fxList = computed(() =>
-  regionList.value
-    .filter((r) => r.effect !== 'focus' && !r.invert && regionActiveAt(r, rt.value))
+/** 效果的示意：马赛克 / 模糊 / 局部调色用“透过去看”的滤镜近似（实时画面里一直显示），精确的效果以“精确预览”和导出为准 */
+const fxList = computed(() => {
+  const m = curMain.value
+  if (props.mode !== 'live' || !m || m.clip.kind !== 'video' || !m.clip.regions.length) return []
+  const t = m.srcMs
+  return m.clip.regions
+    .filter((r) => r.effect !== 'focus' && !r.invert && regionActiveAt(r, t))
     .map((r) => {
-      const b = grownBox(r, rt.value)
+      const b = grownBox(r, t)
       if (!b) return null
       const f = r.effect === 'tone' ? `brightness(${(1 + r.brightness).toFixed(3)}) contrast(${r.contrast.toFixed(3)}) saturate(${r.saturation.toFixed(3)})` : `blur(${(2 + r.strength * 16).toFixed(1)}px)`
       return { id: r.id, style: { ...pct(b), backdropFilter: f, WebkitBackdropFilter: f, borderRadius: r.shape === 'ellipse' ? '50%' : '0' } as Record<string, string> }
     })
-    .filter((x): x is { id: number; style: Record<string, string> } => x !== null),
-)
+    .filter((x): x is { id: number; style: Record<string, string> } => x !== null)
+})
 const growBox = computed(() => (rg.region.value && rg.region.value.effect !== 'focus' && rg.region.value.grow !== 0 ? grownBox(rg.region.value, rt.value) : null))
 
 const focusBox = computed(() => {
@@ -427,7 +392,7 @@ function norm(e: PointerEvent): { x: number; y: number } | null {
 const inFrame = (p: { x: number; y: number }, tol = 0.02) => p.x >= -tol && p.x <= 1 + tol && p.y >= -tol && p.y <= 1 + tol
 const clamp01 = (p: { x: number; y: number }) => ({ x: clamp(p.x, 0, 1), y: clamp(p.y, 0, 1) })
 
-function ovDown(e: PointerEvent) {
+function regDown(e: PointerEvent) {
   const p = norm(e)
   if (!p) return
   const t = e.target as HTMLElement
@@ -453,7 +418,7 @@ function ovDown(e: PointerEvent) {
   ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
   e.preventDefault()
 }
-function ovMove(e: PointerEvent) {
+function regMove(e: PointerEvent) {
   const d = drag.value
   const p = norm(e)
   if (!d || !p) return
@@ -464,7 +429,7 @@ function ovMove(e: PointerEvent) {
     rg.place(d.id, clampBox(boxFromCorners(d.fixed.x, d.fixed.y, q.x, q.y)), { resize: true, only: e.shiftKey })
   }
 }
-function ovUp() {
+function regUp() {
   const d = drag.value
   drag.value = null
   if (!d || d.kind !== 'draw') return
@@ -476,25 +441,25 @@ function ovUp() {
   else rg.add(clampBox({ x: d.a.x - 0.075, y: d.a.y - 0.075, w: 0.15, h: 0.15 }))
 }
 
-const empty = computed(() => !clips.value.length)
-const onError = () => (playError.value = '这个素材在预览里播不出来（可能是系统不支持它的编码），导出不受影响。')
+const empty = computed(() => !clips.value.length && !ed.project.value.overlays.length)
 </script>
 
 <template>
   <div ref="wrap" class="mon">
     <div ref="stageEl" class="stage" :style="{ width: stage.w + 'px', height: stage.h + 'px' }">
       <template v-if="mode === 'live'">
-        <video
-          v-for="n in 2"
-          :key="n"
-          :ref="(el) => setVideoEl(n - 1, el)"
-          :style="videoStyle(n - 1)"
-          preload="auto"
-          playsinline
-          @loadedmetadata="onMeta(n - 1)"
-          @error="onError"
-        />
-        <img v-if="cur && cur.kind === 'image' && curSrc" :src="curSrc.url" :style="imageStyle" alt="" draggable="false" />
+        <EditLive ref="live" :ed="ed" :stage="stage" :fit="ed.project.value.out.fit">
+          <template #fx>
+            <div v-if="fxList.length && geom" class="fxl" :style="geoBox">
+              <div class="rcont" :style="geoContent">
+                <div v-for="f in fxList" :key="'f' + f.id" class="fx" :style="f.style" />
+              </div>
+            </div>
+          </template>
+        </EditLive>
+        <template v-if="ovEditable">
+          <div v-for="h in hits" :key="'h' + h.id" class="ohit" :style="h.style" @pointerdown="ovDown($event, h.id)" @pointermove="ovMove" @pointerup="ovUp" @pointercancel="ovUp" />
+        </template>
         <div
           v-for="t in visibleTexts"
           :key="t.id"
@@ -509,9 +474,16 @@ const onError = () => (playError.value = '这个素材在预览里播不出来�
         >
           {{ t.text }}
         </div>
-        <div v-if="showRegions && geom" class="rov" :class="{ draw: rg.drawing.value }" :style="ovBox" @pointerdown="ovDown" @pointermove="ovMove" @pointerup="ovUp" @pointercancel="ovUp">
-          <div class="rcont" :style="ovContent">
-            <div v-for="f in fxList" :key="'f' + f.id" class="fx" :style="f.style" />
+        <div v-if="selOv" class="ofr" :style="selOv.style">
+          <i class="hd nw" data-no-i18n @pointerdown="ovHandleDown($event, 'scale')" @pointermove="ovMove" @pointerup="ovUp" @pointercancel="ovUp" />
+          <i class="hd ne" data-no-i18n @pointerdown="ovHandleDown($event, 'scale')" @pointermove="ovMove" @pointerup="ovUp" @pointercancel="ovUp" />
+          <i class="hd sw" data-no-i18n @pointerdown="ovHandleDown($event, 'scale')" @pointermove="ovMove" @pointerup="ovUp" @pointercancel="ovUp" />
+          <i class="hd se" data-no-i18n @pointerdown="ovHandleDown($event, 'scale')" @pointermove="ovMove" @pointerup="ovUp" @pointercancel="ovUp" />
+          <i class="stem" />
+          <i class="rot" data-no-i18n title="拖动旋转（按住 Shift 每 15 度一档）" @pointerdown="ovHandleDown($event, 'rotate')" @pointermove="ovMove" @pointerup="ovUp" @pointercancel="ovUp" />
+        </div>
+        <div v-if="showRegions && geom" class="rov" :class="{ draw: rg.drawing.value }" :style="geoBox" @pointerdown="regDown" @pointermove="regMove" @pointerup="regUp" @pointercancel="regUp">
+          <div class="rcont" :style="geoContent">
             <template v-if="rg.drawing.value">
               <div v-for="(c, i) in rg.candidates.value" :key="'c' + i" class="cand" :style="pct(c.rect)" />
             </template>
@@ -534,9 +506,7 @@ const onError = () => (playError.value = '这个素材在预览里播不出来�
       <video v-show="mode === 'preview'" ref="pv" class="pv" :src="mode === 'preview' ? (previewUrl ?? undefined) : undefined" preload="auto" playsinline />
       <div v-if="showRegions && rg.drawing.value" class="rhint">{{ rg.detecting.value ? '正在感知运动的物体…' : rg.candidates.value.length ? '点虚线框选中那个物体，或在画面上拖出一个框' : '在画面上拖出一个框，或点一下放一个框' }}</div>
       <div v-if="empty" class="hint">添加素材后，在这里预览</div>
-      <div v-else-if="playError" class="warn">{{ playError }}</div>
     </div>
-    <audio v-for="a in ed.project.value.audio" :key="a.id" :ref="(el) => setAudioEl(a.id, el)" :src="ed.sources[a.path]?.url" preload="auto" />
   </div>
 </template>
 
@@ -576,6 +546,55 @@ const onError = () => (playError.value = '这个素材在预览里播不出来�
 .txt.on {
   outline: 1px dashed #fff;
   outline-offset: 2px;
+}
+.fxl {
+  position: absolute;
+  pointer-events: none;
+}
+.ohit {
+  position: absolute;
+  cursor: move;
+  touch-action: none;
+}
+.ofr {
+  position: absolute;
+  box-sizing: border-box;
+  border: 1.5px dashed #fff;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55);
+  pointer-events: none;
+}
+.ofr .hd.nw,
+.ofr .hd.se {
+  cursor: nwse-resize;
+}
+.ofr .hd.ne,
+.ofr .hd.sw {
+  cursor: nesw-resize;
+}
+.ofr .stem {
+  position: absolute;
+  left: 50%;
+  top: -18px;
+  height: 16px;
+  border-left: 1.5px solid #fff;
+  pointer-events: none;
+}
+.ofr .rot {
+  position: absolute;
+  left: 50%;
+  top: -29px;
+  width: 12px;
+  height: 12px;
+  margin-left: -6px;
+  border-radius: 50%;
+  background: #fff;
+  border: 1.5px solid #3ea6ff;
+  cursor: grab;
+  pointer-events: auto;
+  touch-action: none;
+}
+.ofr .hd {
+  touch-action: none;
 }
 .rov {
   position: absolute;

@@ -1,10 +1,10 @@
 <script setup lang="ts">
-// 时间线：标尺、文字行、主轨（视频 / 图片）、音频行。拖动调整顺序和长度，点击定位播放位置。
+// 时间线：标尺、文字行、叠加轨（画中画、贴纸、GIF，可以有多条）、主轨（视频 / 图片）、音频行。拖动调整顺序、位置和长度，点击定位播放位置。
 import { computed, nextTick, ref, watch } from 'vue'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import type { EditApi } from '../../../composables/useEditProject'
-import type { EditAudio, EditClip, EditText } from '../../../types'
-import { MIN_MS, audioSpan, clamp, snap, textLanes, tickStep } from '../../../utils/edit'
+import type { EditAudio, EditClip, EditOverlay, EditText } from '../../../types'
+import { MAX_OVERLAY_TRACKS, MIN_MS, audioSpan, clamp, overlayDuration, overlayEnd, overlaySourceLimit, snap, textLanes, tickStep } from '../../../utils/edit'
 
 const props = defineProps<{ ed: EditApi; pps: number }>()
 const ed = props.ed
@@ -37,9 +37,29 @@ function tickLabel(ms: number, step: number): string {
 
 // ---------- 行 ----------
 
+const LANE_H = 30
+
 const textLane = computed(() => textLanes(ed.project.value.texts))
 const textRows = computed(() => Math.max(1, ...textLane.value.map((l) => l + 1)))
 const audioRows = computed(() => Math.max(1, ed.project.value.audio.length))
+
+/** 拖动叠加素材期间锁定显示几条轨：不然拖进最上面那条空轨时又冒出新的一条，鼠标底下的轨道一直在变，素材会一路往上跳。 */
+const dragTop = ref<number | null>(null)
+/** 显示哪几条叠加轨（从上到下）：用到的最高一条再多一条空的（拖进去就新建），至少一条。 */
+const overlayTracks = computed(() => {
+  const used = ed.project.value.overlays.reduce((m, o) => Math.max(m, o.track), 0)
+  const top = dragTop.value ?? Math.min(MAX_OVERLAY_TRACKS, Math.max(1, used + (used > 0 ? 1 : 0)))
+  return Array.from({ length: top }, (_, i) => top - i)
+})
+/** 每条叠加轨里的素材（同一轨道上时间重叠的会错开成多行） */
+const byTrack = computed(() => {
+  const m = new Map<number, { o: EditOverlay; lane: number }[]>()
+  ed.project.value.overlays.forEach((o, i) => m.set(o.track, [...(m.get(o.track) ?? []), { o, lane: ed.overlayLane.value[i] ?? 0 }]))
+  return m
+})
+const laneCount = (tr: number) => Math.max(1, ...(byTrack.value.get(tr) ?? []).map((x) => x.lane + 1))
+const trackH = (tr: number) => laneCount(tr) * LANE_H
+const anyOverlay = computed(() => ed.project.value.overlays.length > 0)
 
 /** 点时间线时让输入框失去焦点，这样空格、S、Delete 等快捷键马上可用。 */
 function blurInput() {
@@ -47,7 +67,7 @@ function blurInput() {
   if (a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)) a.blur()
 }
 
-const isSel = (kind: 'clip' | 'text' | 'audio', id: number) => ed.sel.value?.kind === kind && ed.sel.value.id === id
+const isSel = (kind: 'clip' | 'overlay' | 'text' | 'audio', id: number) => ed.sel.value?.kind === kind && ed.sel.value.id === id
 
 // ---------- 拖动 ----------
 
@@ -91,10 +111,11 @@ function bgDown(e: PointerEvent) {
   scrub(e)
 }
 
-/** 吸附用的候选时间：主轨片段边界、播放位置、文字的起止。 */
-function snapPoints(skip?: { kind: 'text' | 'audio'; id: number }): number[] {
+/** 吸附用的候选时间：主轨片段边界、播放位置、叠加素材和文字的起止。 */
+function snapPoints(skip?: { kind: 'text' | 'audio' | 'overlay'; id: number }): number[] {
   const v: number[] = [0, ed.playhead.value]
   for (const p of ed.placed.value) v.push(p.startMs, p.endMs)
+  for (const o of ed.project.value.overlays) if (!(skip?.kind === 'overlay' && skip.id === o.id)) v.push(o.startMs, overlayEnd(o))
   for (const t of ed.project.value.texts) if (!(skip?.kind === 'text' && skip.id === t.id)) v.push(t.startMs, t.endMs)
   for (const a of ed.project.value.audio) if (!(skip?.kind === 'audio' && skip.id === a.id)) v.push(a.startMs)
   return v
@@ -169,6 +190,77 @@ const thumbOf = (c: EditClip) => {
 }
 const clipName = (c: EditClip) => ed.sources[c.path]?.name ?? c.path.split(/[\\/]/).pop() ?? c.path
 const isBroken = (path: string) => path in ed.broken
+
+// ---------- 叠加素材 ----------
+
+/** 鼠标在哪条叠加轨上（按纵向位置）：在最上面一条之上算最上面一条，在最下面一条之下算 1 号。 */
+function trackAtY(clientY: number, fallback: number): number {
+  const rows = [...(scroller.value?.querySelectorAll<HTMLElement>('.ov-row') ?? [])]
+  if (!rows.length) return fallback
+  for (const r of rows) {
+    const b = r.getBoundingClientRect()
+    if (clientY >= b.top && clientY < b.bottom) return Number(r.dataset.track)
+  }
+  return clientY < rows[0].getBoundingClientRect().top ? Number(rows[0].dataset.track) : Number(rows[rows.length - 1].dataset.track)
+}
+
+function overlayDown(e: PointerEvent, o: EditOverlay) {
+  ed.sel.value = { kind: 'overlay', id: o.id }
+  const s0 = o.startMs
+  const len = overlayDuration(o)
+  const pts = snapPoints({ kind: 'overlay', id: o.id })
+  const t0 = timeAt(e.clientX)
+  dragTop.value = overlayTracks.value[0]
+  drag(
+    e,
+    (dx, ev) => {
+      let s = Math.max(0, s0 + msOf(dx))
+      const a = snap(s, pts, snapMs())
+      const b = snap(s + len, pts, snapMs()) - len
+      s = a !== s ? a : b !== s ? b : s
+      ed.patchOverlay(o.id, { startMs: Math.max(0, Math.round(s)), track: trackAtY(ev.clientY, o.track) }, `omove:${o.id}`)
+    },
+    (moved) => {
+      dragTop.value = null
+      if (!moved) seek(t0)
+    },
+  )
+}
+
+function overlayTrim(e: PointerEvent, o: EditOverlay, side: 'l' | 'r') {
+  const o0 = { s: o.startMs, i: o.inMs, o: o.outMs, dur: overlayDuration(o) }
+  const limit = overlaySourceLimit(o, ed.sources[o.path])
+  const speed = o.kind === 'image' ? 1 : o.speed
+  const minSpan = Math.max(MIN_MS, MIN_MS * speed)
+  const pts = snapPoints({ kind: 'overlay', id: o.id })
+  ed.sel.value = { kind: 'overlay', id: o.id }
+  drag(e, (dx) => {
+    if (side === 'r') {
+      const end0 = o0.s + o0.dur
+      const d = snap(end0 + msOf(dx), pts, snapMs()) - end0
+      ed.patchOverlay(o.id, { outMs: Math.round(clamp(o0.o + d * speed, o0.i + minSpan, limit)) }, `otrim:${o.id}`)
+      return
+    }
+    // 左边缘：开头往后收（或往前放开）。能从素材里多取一点的（没循环的视频）改入点，否则缩短出点
+    const from = snap(o0.s + msOf(dx), pts, snapMs()) - o0.s
+    const lowest = o.kind === 'video' && !o.looped ? -Math.min(o0.s, o0.i / speed) : -o0.s
+    const delta = clamp(from, lowest, o0.dur - minSpan / speed)
+    if (o.kind === 'video' && !o.looped) ed.patchOverlay(o.id, { startMs: Math.round(o0.s + delta), inMs: Math.round(o0.i + delta * speed) }, `otrim:${o.id}`)
+    else ed.patchOverlay(o.id, { startMs: Math.round(o0.s + delta), outMs: Math.round(o0.o - delta * speed) }, `otrim:${o.id}`)
+  })
+}
+
+const ovName = (o: EditOverlay) => ed.sources[o.path]?.name ?? o.path.split(/[\\/]/).pop() ?? o.path
+const ovThumb = (o: EditOverlay) => {
+  const t = ed.sources[o.path]?.thumb
+  return t ? `url("${convertFileSrc(t)}")` : 'none'
+}
+/** 叠加素材超出主轨结尾的那段（像素宽度，没有超出返回 0）：成片里没有这一段 */
+function cutW(o: EditOverlay): number {
+  const total = ed.total.value
+  if (!total) return 0
+  return Math.max(0, px(Math.min(overlayEnd(o) - total, overlayDuration(o))))
+}
 
 // ---------- 文字 ----------
 
@@ -258,6 +350,40 @@ watch(
   },
 )
 
+// ---------- 从资源管理器拖文件进来 ----------
+
+export interface DropTarget {
+  lane: 'main' | 'overlay' | 'audio' | 'text'
+  /** 叠加轨编号（lane 为 overlay 时） */
+  track?: number
+  /** 落点的时间（毫秒） */
+  ms: number
+  /** 落在主轨第几个位置之前（lane 为 main 时） */
+  index?: number
+}
+
+/** 这个屏幕位置（CSS 像素）落在时间线的哪一行、哪个时间。不在时间线里返回 null。 */
+function targetAt(clientX: number, clientY: number): DropTarget | null {
+  const box = scroller.value?.getBoundingClientRect()
+  if (!box || clientX < box.left || clientX > box.right || clientY < box.top || clientY > box.bottom) return null
+  const lane = (document.elementFromPoint(clientX, clientY) as HTMLElement | null)?.closest<HTMLElement>('[data-lane]')
+  const kind = lane?.dataset.lane as DropTarget['lane'] | 'ruler' | undefined
+  if (!lane || !kind || kind === 'ruler') return null
+  const ms = Math.round(timeAt(clientX))
+  if (kind === 'main') {
+    const index = ed.placed.value.filter((p) => (p.startMs + p.endMs) / 2 < ms).length
+    return { lane: 'main', ms, index }
+  }
+  return { lane: kind, ms, track: kind === 'overlay' ? Number(lane.dataset.track) : undefined }
+}
+
+/** 正在拖文件时高亮落点所在的行。 */
+const hot = ref('')
+function hover(clientX: number | null, clientY = 0) {
+  const t = clientX === null ? null : targetAt(clientX, clientY)
+  hot.value = t ? (t.lane === 'overlay' ? `overlay:${t.track}` : t.lane) : ''
+}
+
 /** 滚到让播放位置可见（跳到某处时用）。 */
 function reveal() {
   const el = scroller.value
@@ -265,7 +391,7 @@ function reveal() {
   const x = px(ed.playhead.value) + LABEL_W
   if (x < el.scrollLeft + LABEL_W || x > el.scrollLeft + el.clientWidth - 40) el.scrollLeft = Math.max(0, x - el.clientWidth / 2)
 }
-defineExpose({ reveal })
+defineExpose({ reveal, targetAt, hover })
 </script>
 
 <template>
@@ -274,7 +400,7 @@ defineExpose({ reveal })
       <!-- 标尺 -->
       <div class="row ruler-row">
         <div class="lab" />
-        <div ref="rulerLane" class="lane ruler" :style="{ width: contentW + 'px' }" @pointerdown.prevent="scrub">
+        <div ref="rulerLane" class="lane ruler" data-lane="ruler" :style="{ width: contentW + 'px' }" @pointerdown.prevent="scrub">
           <span v-for="t in ticks" :key="t.ms" class="tick" :style="{ left: t.x + 'px' }">{{ t.label }}</span>
         </div>
       </div>
@@ -282,7 +408,7 @@ defineExpose({ reveal })
       <!-- 文字 -->
       <div v-for="r in textRows" :key="'t' + r" class="row text-row">
         <div class="lab">{{ r === 1 ? '文字' : '' }}</div>
-        <div class="lane" :style="{ width: contentW + 'px' }" @pointerdown.prevent="bgDown">
+        <div class="lane" data-lane="text" :style="{ width: contentW + 'px' }" @pointerdown.prevent="bgDown">
           <div
             v-for="(t, i) in ed.project.value.texts"
             v-show="textLane[i] === r - 1"
@@ -301,10 +427,39 @@ defineExpose({ reveal })
         </div>
       </div>
 
+      <!-- 叠加轨：轨号越大越在上面，盖在主轨画面上 -->
+      <div v-for="tr in overlayTracks" :key="'o' + tr" class="row ov-row" :class="{ hot: hot === 'overlay:' + tr }" :data-track="tr">
+        <div class="lab" :style="{ height: trackH(tr) + 'px' }">叠加 {{ tr }}</div>
+        <div class="lane" data-lane="overlay" :data-track="tr" :style="{ width: contentW + 'px', height: trackH(tr) + 'px' }" @pointerdown.prevent="bgDown">
+          <div v-if="tr === overlayTracks[0] && !anyOverlay" class="empty">点上方“添加叠加素材”，或把文件拖到这里（画中画、贴纸、GIF 动图）</div>
+          <div
+            v-for="x in byTrack.get(tr) ?? []"
+            :key="x.o.id"
+            class="blk ovl"
+            :class="{ sel: isSel('overlay', x.o.id), img: x.o.kind === 'image', bad: isBroken(x.o.path) }"
+            :style="{
+              left: px(x.o.startMs) + 'px',
+              width: Math.max(10, px(overlayDuration(x.o))) + 'px',
+              top: x.lane * LANE_H + 2 + 'px',
+              height: LANE_H - 4 + 'px',
+              bottom: 'auto',
+              backgroundImage: ovThumb(x.o),
+            }"
+            :title="ovName(x.o)"
+            @pointerdown.stop.prevent="overlayDown($event, x.o)"
+          >
+            <i class="h l" @pointerdown.stop.prevent="overlayTrim($event, x.o, 'l')" />
+            <span class="cap ellipsis">{{ isBroken(x.o.path) ? '找不到文件 · ' : '' }}{{ ovName(x.o) }}</span>
+            <span v-if="cutW(x.o) > 0" class="cut" :style="{ width: cutW(x.o) + 'px' }" title="超出了主轨的结尾，成片里没有这一段" />
+            <i class="h r" @pointerdown.stop.prevent="overlayTrim($event, x.o, 'r')" />
+          </div>
+        </div>
+      </div>
+
       <!-- 主轨 -->
-      <div class="row main-row">
+      <div class="row main-row" :class="{ hot: hot === 'main' }">
         <div class="lab">视频</div>
-        <div class="lane" :style="{ width: contentW + 'px' }" @pointerdown.prevent="bgDown">
+        <div class="lane" data-lane="main" :style="{ width: contentW + 'px' }" @pointerdown.prevent="bgDown">
           <div v-if="!ed.project.value.clips.length" class="empty">点上方“添加片段”，把视频或图片放到这里</div>
           <div
             v-for="(c, i) in ed.project.value.clips"
@@ -331,9 +486,9 @@ defineExpose({ reveal })
       </div>
 
       <!-- 音频 -->
-      <div v-for="r in audioRows" :key="'a' + r" class="row audio-row">
+      <div v-for="r in audioRows" :key="'a' + r" class="row audio-row" :class="{ hot: hot === 'audio' }">
         <div class="lab">{{ r === 1 ? '音频' : '' }}</div>
-        <div class="lane" :style="{ width: contentW + 'px' }" @pointerdown.prevent="bgDown">
+        <div class="lane" data-lane="audio" :style="{ width: contentW + 'px' }" @pointerdown.prevent="bgDown">
           <div v-if="r === 1 && !ed.project.value.audio.length" class="empty">点上方“添加配乐”</div>
           <div
             v-if="ed.project.value.audio[r - 1]"
@@ -483,7 +638,31 @@ defineExpose({ reveal })
 .clip.img {
   background-color: #6b5a8e;
 }
+.ovl {
+  background-color: #2f6f8f;
+  background-repeat: no-repeat;
+  background-position: left center;
+  background-size: auto 100%;
+  border: 1px solid rgba(0, 0, 0, 0.25);
+}
+.ovl.img {
+  background-color: #8a5a7c;
+}
+.cut {
+  position: absolute;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  background: repeating-linear-gradient(135deg, rgba(0, 0, 0, 0.55) 0 4px, rgba(0, 0, 0, 0.25) 4px 8px);
+  pointer-events: none;
+}
+.hot .lane {
+  outline: 2px dashed var(--cc-acc);
+  outline-offset: -2px;
+  background: color-mix(in srgb, var(--cc-acc) 10%, transparent);
+}
 .clip.bad,
+.ovl.bad,
 .aud.bad {
   background-color: #8c3b36;
   background-image: repeating-linear-gradient(135deg, rgba(255, 255, 255, 0.12) 0 6px, transparent 6px 12px) !important;

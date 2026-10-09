@@ -185,7 +185,7 @@ const noteClass = computed(() => (rg.note.value ? `note ${rg.note.value.kind}` :
             </EditField>
             <div class="mute small pad">这里的时间是素材自己的时间，和“入点 / 出点”一致。</div>
           </template>
-          <div class="mute small pad">监视器里的马赛克 / 模糊 / 调色只是近似的示意（也不显示“作用于区域以外”），准确效果点“生成预览”或导出查看。</div>
+          <div class="mute small pad">监视器里的马赛克 / 模糊 / 调色只是近似的示意（也不显示“作用于区域以外”），准确效果请生成“精确预览”或导出查看。</div>
         </template>
       </template>
     </template>

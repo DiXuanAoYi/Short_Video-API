@@ -2,13 +2,17 @@
 // 排布规则和后端 `src-tauri/src/edit/spec.rs` 的 `layout` 保持一致，改那边时要一起改这里。
 // 这个文件不要引入别的运行时模块（用 node 直接跑 scripts 里的检查时需要）。
 
-import type { EditAudio, EditClip, EditOutput, EditProject, EditRegion, EditSource, EditText, NRect, RegionEffect, TrackPt } from '../types'
+import type { EditAudio, EditClip, EditOutput, EditOverlay, EditProject, EditRegion, EditSource, EditText, NRect, RegionEffect, TrackPt } from '../types'
 
 export const MIN_MS = 100
 export const MIN_TRANSITION_MS = 100
 export const MAX_CLIPS = 300
 export const MAX_TEXTS = 100
 export const MAX_AUDIO = 20
+/** 叠加素材最多几个、几条轨道、最晚从哪里开始（和后端 `MAX_OVERLAYS` / `MAX_OVERLAY_TRACKS` / `MAX_START_MS` 一致） */
+export const MAX_OVERLAYS = 100
+export const MAX_OVERLAY_TRACKS = 8
+export const MAX_START_MS = 36_000_000
 /** 一个片段最多几个区域（和后端 `MAX_REGIONS` 一致） */
 export const MAX_REGIONS = 8
 /** 图片、文字默认的时长 */
@@ -34,6 +38,20 @@ export const TRANSITIONS: { id: string; label: string }[] = [
   { id: 'pixelize', label: '马赛克' },
 ]
 
+/** 剪辑能读的文件格式（扩展名）。要和后端 `edit/cmds.rs` 的 `media_kind` 保持一致；真正能不能解码最后以 ffmpeg 为准，读不出来会说明原因。 */
+export const EDIT_VIDEO_EXTS = ['mp4', 'mkv', 'webm', 'mov', 'avi', 'flv', 'ts', 'm4v', 'wmv', 'mpg', 'mpeg', '3gp', '3g2', 'm2ts', 'mts', 'ogv', 'vob', 'f4v', 'asf', 'divx', 'mxf']
+export const EDIT_IMAGE_EXTS = ['jpg', 'jpeg', 'jfif', 'png', 'webp', 'gif', 'bmp', 'tif', 'tiff', 'avif', 'heic', 'heif']
+export const EDIT_AUDIO_EXTS = ['mp3', 'm4a', 'flac', 'wav', 'ogg', 'opus', 'aac', 'wma', 'aif', 'aiff', 'ac3', 'mka', 'amr']
+
+/** 按扩展名判断文件是视频、图片还是音频；不是剪辑能用的格式返回 null。 */
+export function editMediaKind(path: string): 'video' | 'image' | 'audio' | null {
+  const ext = /\.([^./\\]+)$/.exec(path)?.[1]?.toLowerCase() ?? ''
+  if (EDIT_VIDEO_EXTS.includes(ext)) return 'video'
+  if (EDIT_IMAGE_EXTS.includes(ext)) return 'image'
+  if (EDIT_AUDIO_EXTS.includes(ext)) return 'audio'
+  return null
+}
+
 export interface Placed {
   startMs: number
   durMs: number
@@ -49,7 +67,7 @@ export function defaultOutput(): EditOutput {
 }
 
 export function emptyProject(): EditProject {
-  return { title: '', clips: [], texts: [], audio: [], out: defaultOutput() }
+  return { title: '', clips: [], overlays: [], texts: [], audio: [], out: defaultOutput() }
 }
 
 /** 补全旧版本或手改过的工程文件里缺的字段。 */
@@ -59,6 +77,7 @@ export function normalizeProject(raw: Partial<EditProject> | null | undefined): 
   p.title = typeof r.title === 'string' ? r.title : ''
   p.out = { ...defaultOutput(), ...(r.out ?? {}) }
   p.clips = (r.clips ?? []).map((c, i) => ({ ...blankClip(), ...c, id: c.id ?? i + 1, regions: (c.regions ?? []).map((g, j) => ({ ...blankRegion(), ...g, id: g.id ?? j + 1 })) }))
+  p.overlays = (r.overlays ?? []).map((o, i) => ({ ...blankOverlay(), ...o, id: o.id ?? i + 1 }))
   p.texts = (r.texts ?? []).map((t, i) => ({ ...blankText(), ...t, id: t.id ?? i + 1 }))
   p.audio = (r.audio ?? []).map((a, i) => ({ ...blankAudio(), ...a, id: a.id ?? i + 1 }))
   return p
@@ -84,6 +103,34 @@ function blankClip(): EditClip {
     saturation: 1,
     regions: [],
     transition: null,
+  }
+}
+
+export function blankOverlay(): EditOverlay {
+  return {
+    id: 0,
+    path: '',
+    kind: 'video',
+    track: 1,
+    startMs: 0,
+    inMs: 0,
+    outMs: 0,
+    speed: 1,
+    looped: false,
+    volume: 1,
+    mute: false,
+    fadeInMs: 0,
+    fadeOutMs: 0,
+    x: 0.5,
+    y: 0.5,
+    scale: 0.4,
+    rotate: 0,
+    opacity: 1,
+    flipH: false,
+    flipV: false,
+    brightness: 0,
+    contrast: 1,
+    saturation: 1,
   }
 }
 
@@ -114,6 +161,7 @@ function blankAudio(): EditAudio {
 export function nextId(p: EditProject): number {
   let m = 0
   for (const c of p.clips) m = Math.max(m, c.id)
+  for (const o of p.overlays) m = Math.max(m, o.id)
   for (const t of p.texts) m = Math.max(m, t.id)
   for (const a of p.audio) m = Math.max(m, a.id)
   return m + 1
@@ -268,6 +316,7 @@ export function outputSize(p: EditProject, sources: Record<string, EditSource | 
 export function mediaPaths(p: EditProject): string[] {
   const set = new Set<string>()
   for (const c of p.clips) if (c.path) set.add(c.path)
+  for (const o of p.overlays) if (o.path) set.add(o.path)
   for (const a of p.audio) if (a.path) set.add(a.path)
   for (const t of p.texts) if (t.font) set.add(t.font)
   return [...set]
@@ -321,6 +370,379 @@ export function snap(v: number, candidates: number[], range: number): number {
   return best
 }
 
+
+// ---------- 叠加轨 ----------
+// 叠加素材（画中画、贴纸、GIF、水印）自己有起点和轨道，不跟主轨排队。规则和后端 `spec.rs` 的 `Overlay` / `overlay_order` 保持一致：
+// 轨号小的在下、大的在上；同一轨道上开始早的在下；叠加素材不会撑长成片，超出主轨结尾的部分被截掉。
+
+export const isGif = (path: string) => /\.gif$/i.test(path)
+
+/** 叠加素材在时间线上占的时长（毫秒）：图片就是显示时长，视频按速度折算。 */
+export function overlayDuration(o: EditOverlay): number {
+  const span = Math.max(0, o.outMs - o.inMs)
+  return o.kind === 'image' ? span : Math.round(span / Math.max(0.01, o.speed))
+}
+
+export const overlayEnd = (o: EditOverlay) => o.startMs + overlayDuration(o)
+
+/** 旋转角度换算到 0–360 度。 */
+export const overlayAngle = (o: EditOverlay) => ((o.rotate % 360) + 360) % 360
+
+/** 恰好是 90 / 180 / 270 度（后端用转置做，不重采样）。 */
+export function quarterTurn(o: { rotate: number }): 90 | 180 | 270 | null {
+  const a = ((o.rotate % 360) + 360) % 360
+  for (const q of [90, 180, 270] as const) if (Math.abs(a - q) < 1e-6) return q
+  return null
+}
+
+/** 从下到上的叠放顺序（下标）：轨号小的在下，同一轨道上开始早的在下；和后端 `overlay_order` 一致。 */
+export function overlayOrder(list: EditOverlay[]): number[] {
+  return list.map((_, i) => i).sort((a, b) => list[a].track - list[b].track || list[a].startMs - list[b].startMs || a - b)
+}
+
+/** 新叠加素材默认的宽度（占画面宽度的比例）：不超过 0.4，竖长的素材再收一点，高度不超过画面的一半。 */
+export function defaultOverlayScale(src: { w: number; h: number }, frame: { w: number; h: number }): number {
+  const sw = src.w > 0 ? src.w : 16
+  const sh = src.h > 0 ? src.h : 9
+  const byHeight = 0.5 * (frame.h / Math.max(1, frame.w)) * (sw / sh)
+  return Math.round(clamp(Math.min(0.4, byHeight), 0.05, 1) * 1000) / 1000
+}
+
+/**
+ * 素材放上叠加轨时的默认设置：视频取整段，图片显示 5 秒；GIF 动图默认循环（凑够约 3 秒）并静音。
+ * `index` 是此刻已经同时出现的叠加素材数，用来让新的错开一点，不正好盖在上一个上面。
+ */
+export function overlayFromSource(src: EditSource, id: number, startMs: number, track: number, frame: { w: number; h: number }, index = 0): EditOverlay {
+  const o = blankOverlay()
+  o.id = id
+  o.path = src.path
+  o.track = clamp(Math.round(track), 1, MAX_OVERLAY_TRACKS)
+  o.startMs = clamp(Math.round(startMs), 0, MAX_START_MS)
+  if (src.kind === 'image') {
+    o.kind = 'image'
+    o.outMs = DEFAULT_STILL_MS
+  } else {
+    const d = Math.max(MIN_MS, src.durationMs ?? DEFAULT_STILL_MS)
+    o.outMs = d
+    if (isGif(src.path)) {
+      o.looped = true
+      o.mute = true
+      o.outMs = d * Math.max(1, Math.ceil(3000 / d))
+    }
+  }
+  o.scale = defaultOverlayScale({ w: src.width, h: src.height }, frame)
+  const nudge = (index % 5) * 0.07
+  o.x = clamp(0.5 + nudge, 0, 1)
+  o.y = clamp(0.5 + nudge, 0, 1)
+  return o
+}
+
+/** 这条轨道上 [s, e) 这段时间里有没有别的叠加素材。 */
+export function trackBusy(list: EditOverlay[], track: number, s: number, e: number, skipId?: number): boolean {
+  return list.some((o) => o.id !== skipId && o.track === track && o.startMs < e && overlayEnd(o) > s)
+}
+
+/** 想放在 wanted 轨：被占了就找最近的空轨（先往上，再往下）；都满了仍然用 wanted（重叠的会按开始先后叠放）。 */
+export function pickTrack(list: EditOverlay[], wanted: number, s: number, e: number, skipId?: number): number {
+  const w = clamp(Math.round(wanted), 1, MAX_OVERLAY_TRACKS)
+  if (!trackBusy(list, w, s, e, skipId)) return w
+  for (let t = w + 1; t <= MAX_OVERLAY_TRACKS; t++) if (!trackBusy(list, t, s, e, skipId)) return t
+  for (let t = w - 1; t >= 1; t--) if (!trackBusy(list, t, s, e, skipId)) return t
+  return w
+}
+
+/** 同一条轨道上时间重叠的素材在时间线上错开显示：返回每个叠加素材在自己轨道里的行号（0 起）。 */
+export function overlayLanes(list: EditOverlay[]): number[] {
+  const lane: number[] = new Array(list.length).fill(0)
+  const byTrack = new Map<number, number[]>()
+  list.forEach((o, i) => byTrack.set(o.track, [...(byTrack.get(o.track) ?? []), i]))
+  for (const idx of byTrack.values()) {
+    const order = [...idx].sort((a, b) => list[a].startMs - list[b].startMs || a - b)
+    const ends: number[] = []
+    for (const i of order) {
+      let l = ends.findIndex((e) => e <= list[i].startMs)
+      if (l < 0) {
+        l = ends.length
+        ends.push(0)
+      }
+      ends[l] = overlayEnd(list[i])
+      lane[i] = l
+    }
+  }
+  return lane
+}
+
+/** 叠加素材的最大可用长度（素材本身的长度）：循环的、图片不受限制。 */
+export function overlaySourceLimit(o: EditOverlay, src: EditSource | undefined): number {
+  if (o.kind === 'image' || o.looped) return Infinity
+  return src?.durationMs ?? Infinity
+}
+
+/** 在时间线 t 处把叠加素材一分为二。离两端不足 MIN_MS 时返回 null。第二段接着播：循环的素材会算好循环到哪里了。淡入归第一段、淡出归第二段。 */
+export function splitOverlay(o: EditOverlay, t: number, newId: number, srcDurMs?: number | null): [EditOverlay, EditOverlay] | null {
+  const dur = overlayDuration(o)
+  const local = t - o.startMs
+  if (local < MIN_MS || dur - local < MIN_MS) return null
+  const first: EditOverlay = { ...o }
+  const second: EditOverlay = { ...o, id: newId, startMs: Math.round(t) }
+  if (o.kind === 'image') {
+    first.outMs = Math.round(local)
+    second.outMs = Math.round(dur - local)
+  } else {
+    const played = local * o.speed
+    const remain = o.outMs - o.inMs - played
+    const loop = o.looped && srcDurMs ? srcDurMs - o.inMs : 0
+    const phase = loop > 0 ? played % loop : played
+    first.outMs = Math.round(o.inMs + played)
+    second.inMs = Math.round(o.inMs + phase)
+    second.outMs = Math.round(second.inMs + remain)
+  }
+  first.fadeOutMs = 0
+  second.fadeInMs = 0
+  return [first, second]
+}
+
+/**
+ * 叠加素材在舞台里的摆法：以 (cx, cy) 为中心放一个“素材原方向”的盒子（ew × eh），再 `rotate · scale(翻转)`。
+ * 宽度按成片画面算：旋转 90 / 270 度后看上去的宽度 = 画面宽 × 缩放（和后端 `overlay_size` 一致）。
+ */
+export function overlayBox(o: { x: number; y: number; scale: number; rotate: number; flipH: boolean; flipV: boolean }, src: { w: number; h: number } | undefined, stage: { w: number; h: number }) {
+  const sw = src && src.w > 0 ? src.w : 16
+  const sh = src && src.h > 0 ? src.h : 9
+  const q = quarterTurn(o)
+  const turned = q === 90 || q === 270
+  const k = (o.scale * stage.w) / (turned ? sh : sw)
+  return {
+    cx: o.x * stage.w,
+    cy: o.y * stage.h,
+    ew: sw * k,
+    eh: sh * k,
+    transform: `rotate(${o.rotate}deg) scale(${o.flipH ? -1 : 1}, ${o.flipV ? -1 : 1})`,
+  }
+}
+
+/** 把叠加素材缩放到恰好放进画面（contain）或铺满画面（cover）时的 scale。 */
+export function overlayFitScale(o: { rotate: number }, src: { w: number; h: number } | undefined, frame: { w: number; h: number }, mode: 'contain' | 'cover'): number {
+  const sw = src && src.w > 0 ? src.w : 16
+  const sh = src && src.h > 0 ? src.h : 9
+  const q = quarterTurn(o)
+  const [vw, vh] = q === 90 || q === 270 ? [sh, sw] : [sw, sh]
+  const byHeight = (frame.h / Math.max(1, frame.w)) * (vw / vh)
+  return Math.round(clamp(mode === 'contain' ? Math.min(1, byHeight) : Math.max(1, byHeight), 0.02, 3) * 1000) / 1000
+}
+
+/** 主轨片段 → 叠加素材（放在原来的时间上，铺满画面）。区域、转场不能带过去。 */
+export function clipToOverlay(c: EditClip, pl: Placed, id: number, track: number, src: EditSource | undefined, frame: { w: number; h: number }): EditOverlay {
+  const o = blankOverlay()
+  o.id = id
+  o.path = c.path
+  o.kind = c.kind
+  o.track = clamp(Math.round(track), 1, MAX_OVERLAY_TRACKS)
+  o.startMs = clamp(Math.round(pl.startMs), 0, MAX_START_MS)
+  o.inMs = c.inMs
+  o.outMs = c.outMs
+  o.speed = c.speed
+  o.volume = c.volume
+  o.mute = c.mute
+  o.fadeInMs = c.fadeInMs
+  o.fadeOutMs = c.fadeOutMs
+  o.rotate = c.rotate
+  o.flipH = c.flipH
+  o.flipV = c.flipV
+  o.brightness = c.brightness
+  o.contrast = c.contrast
+  o.saturation = c.saturation
+  o.scale = overlayFitScale(o, src && { w: src.width, h: src.height }, frame, 'contain')
+  return o
+}
+
+/** 叠加素材 → 主轨片段（接到主轨末尾时用）。位置、大小、透明度、循环用不上；循环的素材取到素材结尾。 */
+export function overlayToClip(o: EditOverlay, id: number, srcDurMs?: number | null): EditClip {
+  const c = blankClip()
+  c.id = id
+  c.path = o.path
+  c.kind = o.kind
+  c.inMs = o.inMs
+  c.outMs = o.kind === 'video' && srcDurMs ? Math.min(o.outMs, srcDurMs) : o.outMs
+  c.speed = o.speed
+  c.volume = o.volume
+  c.mute = o.mute
+  c.fadeInMs = o.fadeInMs
+  c.fadeOutMs = o.fadeOutMs
+  const q = quarterTurn(o)
+  c.rotate = q ?? 0
+  c.flipH = o.flipH
+  c.flipV = o.flipV
+  c.brightness = o.brightness
+  c.contrast = o.contrast
+  c.saturation = o.saturation
+  return c
+}
+
+// ---------- 实时画面 ----------
+// 监视器不再先渲染成片再播放，而是直接把每个素材叠在一起显示：主轨的片段（含转场）、叠加轨、文字，声音也实时混合。
+// 下面是“某一时刻看到什么”的纯计算（`liveFrame`）和转场在 CSS 里的样子（`transitionLook`）；
+// 转场的几何形状是对着 ffmpeg 的 xfade 实际输出量出来的，导出时仍然由 ffmpeg 渲染，这里只是近似。
+
+/** 主轨上此刻看得见的一层 */
+export interface LiveMain {
+  /** 在 `clips` 里的下标 */
+  idx: number
+  clip: EditClip
+  /** 此刻对应素材里的时间（毫秒） */
+  srcMs: number
+  /** 淡入淡出的亮度系数 0–1 */
+  fade: number
+  /** solo：单独显示；out：转场里离开的那个；in：转场里进来的那个 */
+  role: 'solo' | 'out' | 'in'
+  /** 转场进度 0–1（solo 时为 0） */
+  p: number
+  /** 转场名称（role 为 out / in 时有意义） */
+  transition: string
+}
+
+/** 叠加轨上此刻看得见的一个素材 */
+export interface LiveOverlay {
+  overlay: EditOverlay
+  srcMs: number
+  /** 淡入淡出的不透明度系数 0–1 */
+  fade: number
+  /** 从下到上的叠放序号（0 最下） */
+  rank: number
+}
+
+export interface LiveFrame {
+  main: LiveMain[]
+  overlays: LiveOverlay[]
+}
+
+/** 叠加素材在 `local`（距它开始多久，毫秒）这一刻对应素材里的时间。循环的素材回绕到入点。 */
+export function overlaySourceMs(o: EditOverlay, local: number, srcDurMs?: number | null): number {
+  if (o.kind === 'image') return 0
+  const played = Math.max(0, local) * o.speed
+  const loop = o.looped && srcDurMs ? srcDurMs - o.inMs : 0
+  if (loop > 0) return o.inMs + (played % loop)
+  return Math.min(o.inMs + played, o.outMs)
+}
+
+/** 时间线 t 处看到的东西。`srcDur` 用来查素材的长度（循环叠加素材回绕时用）。 */
+export function liveFrame(p: EditProject, pl: Placed[], t: number, srcDur: (path: string) => number | null | undefined = () => null): LiveFrame {
+  const main: LiveMain[] = []
+  const clips = p.clips
+  let i = clipIndexAt(pl, t)
+  let tt = t
+  if (i < 0 && clips.length) {
+    i = clips.length - 1
+    tt = pl[i].endMs - 1
+  }
+  if (i >= 0) {
+    const mk = (idx: number, role: LiveMain['role'], prog: number): LiveMain => {
+      const c = clips[idx]
+      const q = pl[idx]
+      return { idx, clip: c, srcMs: sourceTimeAt(c, q, tt), fade: fadeFactor(c, q, clamp(tt, q.startMs, q.endMs)), role, p: prog, transition: clips[Math.max(idx, i)].transition?.kind ?? 'fade' }
+    }
+    const ov = pl[i].overlapMs
+    if (i > 0 && ov > 0 && tt < pl[i].startMs + ov) {
+      const prog = clamp((tt - pl[i].startMs) / ov, 0, 1)
+      main.push(mk(i - 1, 'out', prog), mk(i, 'in', prog))
+    } else main.push(mk(i, 'solo', 0))
+  }
+  const overlays: LiveOverlay[] = []
+  const order = overlayOrder(p.overlays)
+  order.forEach((idx, rank) => {
+    const o = p.overlays[idx]
+    const dur = overlayDuration(o)
+    const local = t - o.startMs
+    if (local < 0 || local >= dur) return
+    let f = 1
+    if (o.fadeInMs > 0) f = Math.min(f, local / o.fadeInMs)
+    if (o.fadeOutMs > 0) f = Math.min(f, (dur - local) / o.fadeOutMs)
+    overlays.push({ overlay: o, srcMs: overlaySourceMs(o, local, srcDur(o.path)), fade: clamp(f, 0, 1), rank })
+  })
+  return { main, overlays }
+}
+
+/** 主轨一层此刻的音量系数（0–1，已含片段音量、淡入淡出和转场里的声音交叉淡化；浏览器里音量最大 1）。 */
+export function mainGain(m: LiveMain): number {
+  if (m.clip.mute) return 0
+  const x = m.role === 'out' ? 1 - m.p : m.role === 'in' ? m.p : 1
+  return clamp(m.clip.volume * m.fade * x, 0, 1)
+}
+
+/** 叠加素材此刻的音量系数。 */
+export function overlayGain(l: LiveOverlay): number {
+  return l.overlay.mute ? 0 : clamp(l.overlay.volume * l.fade, 0, 1)
+}
+
+/** 转场里一层的样式（CSS 属性，驼峰写法）。 */
+export type LayerFx = Record<string, string>
+export interface TransitionLook {
+  /** 离开的那一层 */
+  a: LayerFx
+  /** 进来的那一层（盖在上面） */
+  b: LayerFx
+  /** 垫在两层下面的颜色（闪黑 / 闪白用），null 为默认的黑色舞台 */
+  backdrop: string | null
+}
+
+const smoothstep = (a: number, b: number, x: number) => {
+  const t = clamp((x - a) / (b - a), 0, 1)
+  return t * t * (3 - 2 * t)
+}
+const percent = (v: number) => `${(v * 100).toFixed(2)}%`
+const masked = (image: string): LayerFx => ({ maskImage: image, WebkitMaskImage: image })
+
+/**
+ * 转场进行到 `p`（0–1）时两层的样子。形状对着 xfade 量过：
+ * 擦除是进来的画面从一侧逐渐露出来（边缘直线移动，画面本身不动）；滑动是两个画面一起平移；
+ * 圆形的边缘是柔和的，半径随进度大约按 3p 增长；时钟擦除从 12 点钟方向顺时针转，大约在 p=0.13 开始、0.93 结束；
+ * 闪黑 / 闪白是前 20% 渐变成黑 / 白，之后再从黑 / 白里慢慢出现；
+ * 溶解（逐点随机替换）和像素化（马赛克块）用淡入淡出近似。
+ */
+export function transitionLook(kind: string, p: number): TransitionLook {
+  const q = clamp(p, 0, 1)
+  const plain = (b: LayerFx = {}, a: LayerFx = {}, backdrop: string | null = null): TransitionLook => ({ a, b, backdrop })
+  switch (kind) {
+    case 'wipeleft':
+      return plain({ clipPath: `inset(0 0 0 ${percent(1 - q)})` })
+    case 'wiperight':
+      return plain({ clipPath: `inset(0 ${percent(1 - q)} 0 0)` })
+    case 'wipeup':
+      return plain({ clipPath: `inset(${percent(1 - q)} 0 0 0)` })
+    case 'wipedown':
+      return plain({ clipPath: `inset(0 0 ${percent(1 - q)} 0)` })
+    case 'slideleft':
+      return plain({ transform: `translateX(${percent(1 - q)})` }, { transform: `translateX(${percent(-q)})` })
+    case 'slideright':
+      return plain({ transform: `translateX(${percent(q - 1)})` }, { transform: `translateX(${percent(q)})` })
+    case 'slideup':
+      return plain({ transform: `translateY(${percent(1 - q)})` }, { transform: `translateY(${percent(-q)})` })
+    case 'slidedown':
+      return plain({ transform: `translateY(${percent(q - 1)})` }, { transform: `translateY(${percent(q)})` })
+    case 'circleopen': {
+      const s = (v: number) => `${(v * 100).toFixed(1)}%`
+      return plain(masked(`radial-gradient(circle farthest-corner at 50% 50%, #000 ${s(3 * q - 1.5)}, rgba(0,0,0,0.5) ${s(3 * q - 1)}, transparent ${s(3 * q - 0.5)})`))
+    }
+    case 'circleclose': {
+      const s = (v: number) => `${(v * 100).toFixed(1)}%`
+      return plain(masked(`radial-gradient(circle farthest-corner at 50% 50%, transparent ${s(1.5 - 3 * q)}, rgba(0,0,0,0.5) ${s(2 - 3 * q)}, #000 ${s(2.5 - 3 * q)})`))
+    }
+    case 'radial': {
+      const deg = clamp(450 * q - 60, 0, 360).toFixed(1)
+      return plain(masked(`conic-gradient(from 0deg at 50% 50%, #000 0deg ${deg}deg, transparent ${deg}deg)`))
+    }
+    case 'fadeblack':
+    case 'fadewhite':
+      return plain({ opacity: String(smoothstep(0.2, 1, q)) }, { opacity: String(1 - smoothstep(0, 0.2, q)) }, kind === 'fadewhite' ? '#fff' : null)
+    case 'pixelize': {
+      const blur = (10 * Math.sin(Math.PI * q)).toFixed(1)
+      return plain({ opacity: String(smoothstep(0.35, 0.65, q)), filter: `blur(${blur}px)` }, { filter: `blur(${blur}px)` })
+    }
+    default:
+      // fade、dissolve，以及没见过的名字：线性淡入淡出
+      return plain({ opacity: String(q) })
+  }
+}
 
 // ---------- 跟着物体走的区域 ----------
 // 轨迹点的位置是相对整个画面的比例（左上角为原点），方向是素材的显示方向（旋转翻转之前），时间是素材里的时间。

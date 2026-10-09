@@ -2,10 +2,13 @@
 
 import { computed, reactive, ref, watch } from 'vue'
 import { api, errorText } from '../api'
-import type { EditAudio, EditClip, EditProject, EditSource, EditText } from '../types'
+import type { EditAudio, EditClip, EditOverlay, EditProject, EditSource, EditText } from '../types'
 import {
   MAX_AUDIO,
   MAX_CLIPS,
+  MAX_OVERLAYS,
+  MAX_OVERLAY_TRACKS,
+  MAX_START_MS,
   MAX_TEXTS,
   MIN_MS,
   audioFromSource,
@@ -13,6 +16,7 @@ import {
   clipDuration,
   clipFromSource,
   clipIndexAt,
+  clipToOverlay,
   copyRegion,
   emptyProject,
   layout,
@@ -20,13 +24,21 @@ import {
   moveItem,
   nextId,
   normalizeProject,
+  outputSize,
+  overlayDuration,
+  overlayEnd,
+  overlayFromSource,
+  overlayLanes,
+  overlayToClip,
+  pickTrack,
   splitClip,
+  splitOverlay,
   textAt,
   totalMs,
 } from '../utils/edit'
 
 export interface Sel {
-  kind: 'clip' | 'text' | 'audio'
+  kind: 'clip' | 'overlay' | 'text' | 'audio'
   id: number
 }
 
@@ -52,9 +64,12 @@ export function useEditProject() {
 
   const placed = computed(() => layout(project.value.clips))
   const total = computed(() => totalMs(project.value.clips))
-  /** 时间线上所有东西里最晚结束的时间（文字、音频可以超出主轨） */
+  /** 叠加素材在各自轨道里的行号（同一轨道上时间重叠的错开显示） */
+  const overlayLane = computed(() => overlayLanes(project.value.overlays))
+  /** 时间线上所有东西里最晚结束的时间（叠加素材、文字、音频可以超出主轨） */
   const extent = computed(() => {
     let m = total.value
+    for (const o of project.value.overlays) m = Math.max(m, overlayEnd(o))
     for (const t of project.value.texts) m = Math.max(m, t.endMs)
     for (const a of project.value.audio) m = Math.max(m, a.startMs + 1000)
     return m
@@ -107,20 +122,28 @@ export function useEditProject() {
 
   // ---------- 取项目 ----------
 
-  function find(s: Sel): EditClip | EditText | EditAudio | undefined {
+  function find(s: Sel): EditClip | EditOverlay | EditText | EditAudio | undefined {
     const p = project.value
-    return (s.kind === 'clip' ? p.clips : s.kind === 'text' ? p.texts : p.audio).find((x) => x.id === s.id)
+    return (s.kind === 'clip' ? p.clips : s.kind === 'overlay' ? p.overlays : s.kind === 'text' ? p.texts : p.audio).find((x) => x.id === s.id)
   }
   const clipOf = (id: number) => project.value.clips.find((c) => c.id === id)
+  const overlayOf = (id: number) => project.value.overlays.find((c) => c.id === id)
   const textOf = (id: number) => project.value.texts.find((c) => c.id === id)
   const audioOf = (id: number) => project.value.audio.find((c) => c.id === id)
   const selectedClip = computed(() => (sel.value?.kind === 'clip' ? clipOf(sel.value.id) : undefined))
+  const selectedOverlay = computed(() => (sel.value?.kind === 'overlay' ? overlayOf(sel.value.id) : undefined))
   const selectedText = computed(() => (sel.value?.kind === 'text' ? textOf(sel.value.id) : undefined))
   const selectedAudio = computed(() => (sel.value?.kind === 'audio' ? audioOf(sel.value.id) : undefined))
 
   function patchClip(id: number, patch: Partial<EditClip>, key = '') {
     mutate((p) => {
       const c = p.clips.find((x) => x.id === id)
+      if (c) Object.assign(c, patch)
+    }, key)
+  }
+  function patchOverlay(id: number, patch: Partial<EditOverlay>, key = '') {
+    mutate((p) => {
+      const c = p.overlays.find((x) => x.id === id)
       if (c) Object.assign(c, patch)
     }, key)
   }
@@ -173,13 +196,14 @@ export function useEditProject() {
 
   const baseName = (p: string) => p.split(/[\\/]/).pop() ?? p
 
-  /** 把视频、图片放到主轨末尾；音频文件自动放到音频轨。 */
-  async function addClips(paths: string[]): Promise<AddReport> {
+  /** 把视频、图片放到主轨（默认末尾，`at` 指定了就插在这个位置）；音频文件自动放到音频轨。 */
+  async function addClips(paths: string[], at?: number): Promise<AddReport> {
     const report: AddReport = { added: 0, errors: [] }
     busy.value = true
     try {
       const infos = await probeAll(paths)
       mutate((p) => {
+        let pos = at === undefined ? p.clips.length : clamp(at, 0, p.clips.length)
         infos.forEach((info, i) => {
           if (typeof info === 'string') {
             report.errors.push(`${baseName(paths[i])}：${info}`)
@@ -194,7 +218,7 @@ export function useEditProject() {
           }
           if (p.clips.length >= MAX_CLIPS) return report.errors.push(`片段最多 ${MAX_CLIPS} 个，${info.name} 没有加入。`)
           const c = clipFromSource(info, nextId(p))
-          p.clips.push(c)
+          p.clips.splice(pos++, 0, c)
           sel.value = { kind: 'clip', id: c.id }
           report.added++
         })
@@ -205,8 +229,42 @@ export function useEditProject() {
     return report
   }
 
-  /** 添加配乐（音频文件，或者想用它声音的视频）。从播放位置开始。 */
-  async function addMusic(paths: string[]): Promise<AddReport> {
+  /**
+   * 把视频、图片、GIF 放到叠加轨：从 `startMs`（默认播放位置）开始，多个文件首尾相接；
+   * 想放的轨道（默认 1 号）这段时间被占了，就放到最近的空轨道。
+   */
+  async function addOverlays(paths: string[], at: { track?: number; startMs?: number } = {}): Promise<AddReport> {
+    const report: AddReport = { added: 0, errors: [] }
+    busy.value = true
+    try {
+      const infos = await probeAll(paths)
+      mutate((p) => {
+        let start = clamp(Math.round(at.startMs ?? playhead.value), 0, MAX_START_MS)
+        infos.forEach((info, i) => {
+          if (typeof info === 'string') return report.errors.push(`${baseName(paths[i])}：${info}`)
+          if (info.kind === 'audio') return report.errors.push(`${info.name}：这是音频文件，请用“添加配乐”。`)
+          if (p.overlays.length >= MAX_OVERLAYS) return report.errors.push(`叠加素材最多 ${MAX_OVERLAYS} 个，${info.name} 没有加入。`)
+          const frame = outputSize(p, sources)
+          // 同一时间已经有几个叠加素材了：新的错开一点，不正好盖住它们
+          const trial = overlayFromSource(info, 0, start, 1, frame)
+          const end = start + overlayDuration(trial)
+          const together = p.overlays.filter((x) => x.startMs < end && overlayEnd(x) > start).length
+          const o = overlayFromSource(info, nextId(p), start, at.track ?? 1, frame, together)
+          o.track = pickTrack(p.overlays, o.track, o.startMs, end)
+          p.overlays.push(o)
+          sel.value = { kind: 'overlay', id: o.id }
+          report.added++
+          start = clamp(end, 0, MAX_START_MS)
+        })
+      })
+    } finally {
+      busy.value = false
+    }
+    return report
+  }
+
+  /** 添加配乐（音频文件，或者想用它声音的视频）。从 `startMs`（默认播放位置）开始。 */
+  async function addMusic(paths: string[], startMs?: number): Promise<AddReport> {
     const report: AddReport = { added: 0, errors: [] }
     busy.value = true
     try {
@@ -216,7 +274,7 @@ export function useEditProject() {
           if (typeof info === 'string') return report.errors.push(`${baseName(paths[i])}：${info}`)
           if (!info.hasAudio) return report.errors.push(`${info.name}：这个文件里没有声音。`)
           if (p.audio.length >= MAX_AUDIO) return report.errors.push(`音频轨最多 ${MAX_AUDIO} 条，${info.name} 没有加入。`)
-          const a = audioFromSource(info, nextId(p), Math.round(playhead.value))
+          const a = audioFromSource(info, nextId(p), Math.round(Math.max(0, startMs ?? playhead.value)))
           p.audio.push(a)
           sel.value = { kind: 'audio', id: a.id }
           report.added++
@@ -240,9 +298,20 @@ export function useEditProject() {
 
   // ---------- 编辑操作 ----------
 
-  /** 在播放位置分割。选中了片段就分割它，否则分割播放位置下的片段。成功返回 true。 */
+  /** 在播放位置分割。选中了叠加素材 / 片段就分割它，否则分割播放位置下的主轨片段。成功返回 true。 */
   function splitAtPlayhead(): boolean {
     const t = Math.round(playhead.value)
+    const ov = selectedOverlay.value
+    if (ov) {
+      const parts = splitOverlay(ov, t, nextId(project.value), sources[ov.path]?.durationMs)
+      if (!parts) return false
+      mutate((p) => {
+        const i = p.overlays.findIndex((x) => x.id === ov.id)
+        if (i >= 0) p.overlays.splice(i, 1, parts[0], parts[1])
+      })
+      sel.value = { kind: 'overlay', id: parts[1].id }
+      return true
+    }
     const pl = placed.value
     const idx = selectedClip.value ? project.value.clips.findIndex((c) => c.id === selectedClip.value?.id) : clipIndexAt(pl, t)
     if (idx < 0) return false
@@ -260,6 +329,7 @@ export function useEditProject() {
     if (!s) return
     mutate((p) => {
       if (s.kind === 'clip') p.clips = p.clips.filter((c) => c.id !== s.id)
+      else if (s.kind === 'overlay') p.overlays = p.overlays.filter((c) => c.id !== s.id)
       else if (s.kind === 'text') p.texts = p.texts.filter((c) => c.id !== s.id)
       else p.audio = p.audio.filter((c) => c.id !== s.id)
     })
@@ -277,6 +347,14 @@ export function useEditProject() {
         const i = p.clips.findIndex((c) => c.id === s.id)
         if (i < 0 || p.clips.length >= MAX_CLIPS) return
         p.clips.splice(i + 1, 0, { ...p.clips[i], id, transition: null, regions: p.clips[i].regions.map(copyRegion) })
+      } else if (s.kind === 'overlay') {
+        const o = p.overlays.find((c) => c.id === s.id)
+        if (!o || p.overlays.length >= MAX_OVERLAYS) return
+        // 接在原来的后面；那一段这条轨道被占了就换一条
+        const start = clamp(overlayEnd(o), 0, MAX_START_MS)
+        const copy = { ...o, id, startMs: start }
+        copy.track = pickTrack(p.overlays, o.track, start, start + overlayDuration(o))
+        p.overlays.push(copy)
       } else if (s.kind === 'text') {
         const t = p.texts.find((c) => c.id === s.id)
         if (!t || p.texts.length >= MAX_TEXTS) return
@@ -300,11 +378,44 @@ export function useEditProject() {
     })
   }
 
-  /** 把一个素材路径换成另一个（找不到文件时重新指定），所有用到它的片段、音频一起换。 */
+  /** 把主轨上的片段移到叠加轨（留在原来的时间上，缩放到刚好放进画面）。区域不能带过去。返回丢掉了几个区域，失败返回 null。 */
+  function clipToOverlayTrack(id: number): number | null {
+    const i = project.value.clips.findIndex((c) => c.id === id)
+    if (i < 0 || project.value.overlays.length >= MAX_OVERLAYS) return null
+    const c = project.value.clips[i]
+    const pl = placed.value[i]
+    const frame = outputSize(project.value, sources)
+    const o = clipToOverlay(c, pl, c.id, 1, sources[c.path], frame)
+    mutate((p) => {
+      o.track = pickTrack(p.overlays, 1, o.startMs, o.startMs + overlayDuration(o))
+      p.clips.splice(i, 1)
+      p.overlays.push(o)
+    })
+    sel.value = { kind: 'overlay', id: o.id }
+    return c.regions.length
+  }
+
+  /** 把叠加素材放到主轨：按它的开始时间插在合适的位置。返回是否成功。 */
+  function overlayToMain(id: number): boolean {
+    const o = overlayOf(id)
+    if (!o || project.value.clips.length >= MAX_CLIPS) return false
+    const c = overlayToClip(o, o.id, sources[o.path]?.durationMs)
+    const mid = placed.value.map((pl) => (pl.startMs + pl.endMs) / 2)
+    const at = mid.filter((m) => m < o.startMs).length
+    mutate((p) => {
+      p.overlays = p.overlays.filter((x) => x.id !== id)
+      p.clips.splice(at, 0, c)
+    })
+    sel.value = { kind: 'clip', id: c.id }
+    return true
+  }
+
+  /** 把一个素材路径换成另一个（找不到文件时重新指定），所有用到它的片段、叠加素材、音频一起换。 */
   async function relink(oldPath: string, newPath: string) {
     await probe(newPath)
     mutate((p) => {
       for (const c of p.clips) if (c.path === oldPath) c.path = newPath
+      for (const o of p.overlays) if (o.path === oldPath) o.path = newPath
       for (const a of p.audio) if (a.path === oldPath) a.path = newPath
     })
     delete broken[oldPath]
@@ -368,7 +479,7 @@ export function useEditProject() {
       draftTimer = setTimeout(() => {
         try {
           const p = project.value
-          if (!p.clips.length && !p.texts.length && !p.audio.length) localStorage.removeItem(DRAFT_KEY)
+          if (!p.clips.length && !p.overlays.length && !p.texts.length && !p.audio.length) localStorage.removeItem(DRAFT_KEY)
           else localStorage.setItem(DRAFT_KEY, JSON.stringify({ project: p, filePath: filePath.value }))
         } catch {
           /* 存不了草稿不影响使用 */
@@ -384,7 +495,7 @@ export function useEditProject() {
       if (!raw) return null
       const d = JSON.parse(raw) as { project?: EditProject; filePath?: string }
       const p = normalizeProject(d.project)
-      return p.clips.length || p.texts.length || p.audio.length ? { project: p, filePath: d.filePath ?? '' } : null
+      return p.clips.length || p.overlays.length || p.texts.length || p.audio.length ? { project: p, filePath: d.filePath ?? '' } : null
     } catch {
       return null
     }
@@ -417,28 +528,35 @@ export function useEditProject() {
     placed,
     total,
     extent,
+    overlayLane,
     canUndo,
     canRedo,
     selectedClip,
+    selectedOverlay,
     selectedText,
     selectedAudio,
     mutate,
     undo,
     redo,
     clipOf,
+    overlayOf,
     textOf,
     audioOf,
     patchClip,
+    patchOverlay,
     patchText,
     patchAudio,
     probe,
     addClips,
+    addOverlays,
     addMusic,
     addText,
     splitAtPlayhead,
     removeSelected,
     duplicateSelected,
     reorderClip,
+    clipToOverlayTrack,
+    overlayToMain,
     relink,
     sourceOf,
     newProject,
@@ -449,6 +567,7 @@ export function useEditProject() {
     restoreDraft,
     clipDuration,
     MIN_MS,
+    MAX_OVERLAY_TRACKS,
   }
 }
 

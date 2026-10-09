@@ -50,13 +50,23 @@ fn need_ffmpeg(state: &AppState) -> AppResult<PathBuf> {
     crate::postprocess::find_ffmpeg(state).ok_or_else(|| AppError::new(ErrorKind::NeedUpdate, "需要 ffmpeg。请在“设置 → 组件”里安装 ffmpeg 后重试。"))
 }
 
+/// 媒体库认识的格式之外，剪辑还接受的扩展名（要和界面 `src/utils/edit.ts` 的 `EDIT_*_EXTS` 保持一致）。
+/// 能不能真正解码最后以 ffmpeg 为准，读不出来时 `edit_probe` 会说明原因。
+const EXTRA_VIDEO: &[&str] = &["3g2", "m2ts", "mts", "ogv", "vob", "f4v", "asf", "divx", "mxf"];
+const EXTRA_IMAGE: &[&str] = &["jfif", "tif", "tiff", "avif", "heif"];
+const EXTRA_AUDIO: &[&str] = &["aif", "aiff", "ac3", "mka", "amr"];
+
 /// 只接受视频、音频、图片文件（本机服务不能被用来读取别的文件）。
 fn media_kind(p: &Path) -> AppResult<&'static str> {
     if !p.is_file() {
         return Err(AppError::not_found("找不到文件。"));
     }
-    match crate::library::kind_of_ext(&ext_of(p)) {
+    let ext = ext_of(p);
+    match crate::library::kind_of_ext(&ext) {
         Some(k @ ("video" | "audio" | "image")) => Ok(k),
+        _ if EXTRA_VIDEO.contains(&ext.as_str()) => Ok("video"),
+        _ if EXTRA_IMAGE.contains(&ext.as_str()) => Ok("image"),
+        _ if EXTRA_AUDIO.contains(&ext.as_str()) => Ok("audio"),
         _ => Err(AppError::unsupported("剪辑只能用视频、音频和图片文件。")),
     }
 }
@@ -94,7 +104,13 @@ pub async fn edit_probe(state: St<'_>, path: String) -> AppResult<EditSource> {
     let p = PathBuf::from(&path);
     let by_ext = media_kind(&p)?;
     let ff = need_ffmpeg(&state)?;
-    let f = facts::read(&ff, &p).await.ok_or_else(|| AppError::invalid("无法读取这个文件。"))?;
+    let f = facts::read(&ff, &p).await.ok_or_else(|| {
+        if by_ext == "image" && matches!(ext_of(&p).as_str(), "avif" | "heic" | "heif" | "tif" | "tiff") {
+            AppError::invalid("无法读取这张图片：当前的 ffmpeg 解不了这种格式。请先转成 PNG 或 JPG 再用。")
+        } else {
+            AppError::invalid("无法读取这个文件。")
+        }
+    })?;
     let (has_video, has_audio) = (f.video.is_some(), f.audio.is_some());
     // 按内容修正扩展名的判断：GIF 有时长就是动图（当视频），否则是图片；mp3 里的封面图不算画面
     let kind = match by_ext {
@@ -275,7 +291,7 @@ mod tests {
     #[test]
     fn only_media_files_are_accepted() {
         let d = dir("kinds");
-        for (n, k) in [("a.mp4", "video"), ("a.MP3", "audio"), ("a.png", "image")] {
+        for (n, k) in [("a.mp4", "video"), ("a.MP3", "audio"), ("a.png", "image"), ("a.gif", "image"), ("a.m2ts", "video"), ("a.Tiff", "image"), ("a.avif", "image"), ("a.aiff", "audio")] {
             std::fs::write(d.join(n), "x").unwrap();
             assert_eq!(media_kind(&d.join(n)).unwrap(), k);
         }

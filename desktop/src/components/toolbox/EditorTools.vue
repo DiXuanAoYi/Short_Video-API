@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 剪辑：把多个视频 / 图片在时间线上排好，裁剪、分割、加转场、文字和配乐，导出成一个视频。
+// 剪辑：把多个视频 / 图片在时间线上排好，裁剪、分割、加转场、文字和配乐，还能在主轨上面叠加多条素材（画中画、贴纸、GIF），导出成一个视频。
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { open, save } from '@tauri-apps/plugin-dialog'
@@ -8,7 +8,8 @@ import { api, errorText, events } from '../../api'
 import type { EditProject, JobSnap } from '../../types'
 import { useEditProject, type AddReport } from '../../composables/useEditProject'
 import { useRegions } from '../../composables/useRegions'
-import { MAX_AUDIO, MAX_CLIPS, MAX_TEXTS, clamp, msText, outputSize } from '../../utils/edit'
+import { registerDrop } from '../../utils/dropHub'
+import { EDIT_AUDIO_EXTS, EDIT_IMAGE_EXTS, EDIT_VIDEO_EXTS, MAX_AUDIO, MAX_CLIPS, MAX_OVERLAYS, MAX_TEXTS, clamp, editMediaKind, msText, outputSize } from '../../utils/edit'
 import FileInput from './FileInput.vue'
 import EditInspector from './edit/EditInspector.vue'
 import EditMonitor from './edit/EditMonitor.vue'
@@ -23,9 +24,9 @@ const root = ref<HTMLElement | null>(null)
 const tlBox = ref<HTMLElement | null>(null)
 const timeline = ref<InstanceType<typeof EditTimeline> | null>(null)
 
-const VIDEO_EXTS = ['mp4', 'mkv', 'webm', 'mov', 'avi', 'flv', 'ts', 'm4v', 'wmv', 'mpg', 'mpeg', '3gp']
-const IMAGE_EXTS = ['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp']
-const AUDIO_EXTS = ['mp3', 'm4a', 'flac', 'wav', 'ogg', 'opus', 'aac', 'wma']
+const VIDEO_EXTS = EDIT_VIDEO_EXTS
+const IMAGE_EXTS = EDIT_IMAGE_EXTS
+const AUDIO_EXTS = EDIT_AUDIO_EXTS
 
 const pps = ref(50)
 const outDir = ref('')
@@ -34,25 +35,40 @@ const monitorMode = ref<'live' | 'preview'>('live')
 // ---------- 添加素材 ----------
 
 const pickedClips = ref<string[]>([])
+const pickedOverlays = ref<string[]>([])
 const pickedMusic = ref<string[]>([])
 
 function report(r: AddReport) {
   if (r.errors.length) ElMessage({ type: r.added ? 'warning' : 'error', message: r.errors.slice(0, 3).join('\n') + (r.errors.length > 3 ? `\n……还有 ${r.errors.length - 3} 个` : ''), duration: 6000, showClose: true })
 }
-async function addClips(paths: string[]) {
+async function addClips(paths: string[], at?: number) {
   if (!paths.length) return
   const before = ed.total.value
-  report(await ed.addClips(paths))
+  report(await ed.addClips(paths, at))
   if (!before) fit()
 }
-async function addMusic(paths: string[]) {
+/** 添加到叠加轨。主轨还是空的时候叠加素材没有地方出现，就先放到主轨上。 */
+async function addOverlays(paths: string[], at?: { track?: number; startMs?: number }) {
   if (!paths.length) return
-  report(await ed.addMusic(paths))
+  if (!hasClips.value) {
+    ElMessage.info('主轨上还没有视频，先把它放到主轨上；之后再添加的素材可以叠加在它上面。')
+    return addClips(paths.slice(0, 1))
+  }
+  report(await ed.addOverlays(paths, at))
+}
+async function addMusic(paths: string[], startMs?: number) {
+  if (!paths.length) return
+  report(await ed.addMusic(paths, startMs))
 }
 watch(pickedClips, (v) => {
   if (!v.length) return
   pickedClips.value = []
   addClips(v)
+})
+watch(pickedOverlays, (v) => {
+  if (!v.length) return
+  pickedOverlays.value = []
+  addOverlays(v)
 })
 watch(pickedMusic, (v) => {
   if (!v.length) return
@@ -116,12 +132,12 @@ function split() {
 function duplicate() {
   if (!ed.duplicateSelected()) ElMessage.warning('没有选中的内容，或已经到了数量上限。')
 }
-const selectedLabel = computed(() => (ed.sel.value?.kind === 'clip' ? '片段' : ed.sel.value?.kind === 'text' ? '文字' : ed.sel.value?.kind === 'audio' ? '配乐' : ''))
+const selectedLabel = computed(() => (ed.sel.value?.kind === 'clip' ? '片段' : ed.sel.value?.kind === 'overlay' ? '叠加素材' : ed.sel.value?.kind === 'text' ? '文字' : ed.sel.value?.kind === 'audio' ? '配乐' : ''))
 
 // ---------- 工程文件 ----------
 
 const FILTERS = [{ name: '清影剪辑工程', extensions: ['ccedit'] }]
-const hasContent = computed(() => hasClips.value || ed.project.value.texts.length > 0 || ed.project.value.audio.length > 0)
+const hasContent = computed(() => hasClips.value || ed.project.value.overlays.length > 0 || ed.project.value.texts.length > 0 || ed.project.value.audio.length > 0)
 
 async function discardOk(): Promise<boolean> {
   if (!ed.dirty.value || !hasContent.value) return true
@@ -201,7 +217,7 @@ watch(hasContent, (v) => {
   if (v) draft.value = null
 })
 
-// ---------- 预览成片 ----------
+// ---------- 精确预览（可选：和导出同一套流程渲染，实时画面是近似效果） ----------
 
 const projectKey = computed(() => JSON.stringify(ed.project.value))
 const preview = ref<{ url: string; key: string } | null>(null)
@@ -269,7 +285,7 @@ const exporting = ref(false)
 
 /** 有素材找不到时不能导出 / 预览，提示是哪几个。 */
 function checkMedia(): boolean {
-  const used = new Set([...ed.project.value.clips.map((c) => c.path), ...ed.project.value.audio.map((a) => a.path)])
+  const used = new Set([...ed.project.value.clips.map((c) => c.path), ...ed.project.value.overlays.map((o) => o.path), ...ed.project.value.audio.map((a) => a.path)])
   const bad = [...used].filter((p) => p in ed.broken)
   if (!bad.length) return true
   ElMessage({ type: 'error', message: `有 ${bad.length} 个素材找不到或读不出来（在时间线上标红）：${bad.slice(0, 2).map((p) => p.split(/[\\/]/).pop()).join('、')}${bad.length > 2 ? '…' : ''}。请重新指定或删除这些片段。`, duration: 7000, showClose: true })
@@ -354,14 +370,89 @@ const outInfo = computed(() => {
   return `${s.w}×${s.h}${ed.project.value.out.fps ? ` · ${ed.project.value.out.fps} 帧/秒` : ''}`
 })
 const clipCount = computed(() => ed.project.value.clips.length)
-const sizeWarn = computed(() => (ed.project.value.clips.length >= MAX_CLIPS ? `片段已达上限 ${MAX_CLIPS} 个` : ed.project.value.audio.length >= MAX_AUDIO ? `配乐已达上限 ${MAX_AUDIO} 条` : ''))
+const overlayCount = computed(() => ed.project.value.overlays.length)
+const sizeWarn = computed(() =>
+  ed.project.value.clips.length >= MAX_CLIPS
+    ? `片段已达上限 ${MAX_CLIPS} 个`
+    : ed.project.value.overlays.length >= MAX_OVERLAYS
+      ? `叠加素材已达上限 ${MAX_OVERLAYS} 个`
+      : ed.project.value.audio.length >= MAX_AUDIO
+        ? `配乐已达上限 ${MAX_AUDIO} 条`
+        : '',
+)
+
+// ---------- 把文件拖进来 ----------
+// 拖到时间线的哪一行就放进哪一行：主轨按位置插入，叠加轨从落点的时间开始，音频行当配乐；拖到别处放到主轨末尾。
+
+const dropHint = ref('')
+
+function dropText(t: { lane: string; track?: number; ms: number } | null): string {
+  if (!t) return '松开，添加到主轨末尾'
+  const at = msText(t.ms).replace(/\.\d+$/, (m) => m.slice(0, 2))
+  if (t.lane === 'main') return '松开，插入到主轨这里'
+  if (t.lane === 'audio') return `松开，作为配乐，从 ${at} 开始`
+  return `松开，放到叠加 ${t.lane === 'overlay' ? t.track : 1}，从 ${at} 开始`
+}
+
+async function dropPaths(paths: string[], x: number, y: number) {
+  const project = paths.filter((p) => /\.ccedit$/i.test(p))
+  if (project.length) {
+    if (!(await discardOk())) return
+    try {
+      const missing = await ed.openProject(project[0])
+      fit()
+      if (missing.length) ElMessage({ type: 'warning', message: `有 ${missing.length} 个素材文件找不到，已在时间线上标红。选中后可以重新指定。`, duration: 6000, showClose: true })
+    } catch (e) {
+      ElMessage.error(errorText(e))
+    }
+    return
+  }
+  const media = paths.filter((p) => editMediaKind(p) !== null)
+  const skipped = paths.length - media.length
+  if (skipped > 0) ElMessage({ type: 'warning', message: `有 ${skipped} 个文件不是剪辑能用的视频、图片或音频（文件夹不能直接拖入，请把里面的文件选中后拖进来）。`, duration: 5000, showClose: true })
+  if (!media.length) return
+  const t = timeline.value?.targetAt(x, y) ?? null
+  if (!t || t.lane === 'main') return addClips(media, t?.index)
+  if (t.lane === 'audio') {
+    const audio = media.filter((p) => editMediaKind(p) !== 'image')
+    if (audio.length < media.length) ElMessage.warning('图片不能当配乐，已忽略。')
+    return addMusic(audio, t.ms)
+  }
+  return addOverlays(media, { track: t.lane === 'overlay' ? t.track : 1, startMs: t.ms })
+}
+
+let releaseDrop: (() => void) | undefined
+onMounted(() => {
+  releaseDrop = registerDrop({
+    accepts(x, y) {
+      const r = root.value
+      if (!r || r.offsetParent === null) return false
+      const b = r.getBoundingClientRect()
+      return x >= b.left && x <= b.right && y >= b.top && y <= b.bottom
+    },
+    over(x, y) {
+      timeline.value?.hover(x, y)
+      dropHint.value = dropText(timeline.value?.targetAt(x, y) ?? null)
+    },
+    leave() {
+      timeline.value?.hover(null)
+      dropHint.value = ''
+    },
+    drop(paths, x, y) {
+      dropHint.value = ''
+      timeline.value?.hover(null)
+      dropPaths(paths, x, y)
+    },
+  })
+})
+onBeforeUnmount(() => releaseDrop?.())
 </script>
 
 <template>
   <div ref="root" class="ed">
     <el-alert v-if="draft" type="info" :closable="false" show-icon class="draft">
       <template #title>
-        <span>找到上次没保存的剪辑（{{ draft.project.clips.length }} 个片段）。</span>
+        <span>找到上次没保存的剪辑（{{ draft.project.clips.length }} 个片段{{ draft.project.overlays.length ? `，${draft.project.overlays.length} 个叠加素材` : '' }}）。</span>
         <el-button size="small" type="primary" class="gap" @click="resumeDraft">继续编辑</el-button>
         <el-button size="small" @click="dropDraft">不要了</el-button>
       </template>
@@ -383,9 +474,22 @@ const sizeWarn = computed(() => (ed.project.value.clips.length >= MAX_CLIPS ? `�
           plain
           :extensions="[...VIDEO_EXTS, ...IMAGE_EXTS, ...AUDIO_EXTS]"
           :kinds="['video', 'image']"
-          browse-text="添加片段…"
+          browse-text="添加到主轨…"
           library-text="从媒体库添加…"
           label="视频或图片"
+        />
+      </div>
+      <div class="grp">
+        <FileInput
+          v-model="pickedOverlays"
+          multiple
+          compact
+          plain
+          :extensions="[...VIDEO_EXTS, ...IMAGE_EXTS]"
+          :kinds="['video', 'image']"
+          browse-text="添加叠加素材…"
+          library-text="从媒体库叠加…"
+          label="叠加的视频、图片或 GIF"
         />
       </div>
       <div class="grp">
@@ -398,6 +502,8 @@ const sizeWarn = computed(() => (ed.project.value.clips.length >= MAX_CLIPS ? `�
       </div>
     </div>
 
+    <div v-if="dropHint" class="drophint">{{ dropHint }}</div>
+
     <div class="main">
       <!-- 监视器 -->
       <div class="left">
@@ -409,18 +515,18 @@ const sizeWarn = computed(() => (ed.project.value.clips.length >= MAX_CLIPS ? `�
           <span class="sp" />
           <el-radio-group v-model="monitorMode" size="small">
             <el-radio-button value="live">实时画面</el-radio-button>
-            <el-radio-button value="preview" :disabled="!preview || stale">预览成片</el-radio-button>
+            <el-radio-button value="preview" :disabled="!preview || stale">精确预览</el-radio-button>
           </el-radio-group>
         </div>
         <div class="pvbar">
-          <el-button v-if="!building" size="small" :disabled="!hasClips" @click="buildPreview">生成预览（含转场、文字、配乐）</el-button>
+          <el-button v-if="!building" size="small" :disabled="!hasClips" @click="buildPreview">生成精确预览</el-button>
           <template v-else>
             <el-progress :percentage="Math.round(previewJob?.percent ?? 0)" :stroke-width="6" class="pg" />
             <el-button size="small" link @click="cancelPreview">取消</el-button>
           </template>
-          <span v-if="stale && !building" class="mute small">预览已过期（工程改过了），需要重新生成</span>
-          <span v-else-if="preview && !building" class="ok small">预览是最新的</span>
-          <span v-else-if="!building" class="mute small">实时画面不显示转场；要看完整效果请生成预览</span>
+          <span v-if="stale && !building" class="mute small">精确预览已过期（工程改过了），需要重新生成</span>
+          <span v-else-if="preview && !building" class="ok small">精确预览是最新的</span>
+          <span v-else-if="!building" class="mute small">实时画面随改随看，是近似效果（转场的形状、变速、降噪等细节以导出为准）；要逐帧核对再生成精确预览</span>
         </div>
         <div v-if="previewError" class="err selectable">{{ previewError }}</div>
       </div>
@@ -443,13 +549,14 @@ const sizeWarn = computed(() => (ed.project.value.clips.length >= MAX_CLIPS ? `�
         <el-button size="small" link @click="fit">适合窗口</el-button>
       </div>
       <EditTimeline ref="timeline" :ed="ed" :pps="pps" />
-      <div class="keys mute small">空格 播放 / 暂停 · S 分割 · Delete 删除 · Ctrl+Z 撤销 · ← → 前后 1 秒（加 Shift 为 0.1 秒）</div>
+      <div class="keys mute small">空格 播放 / 暂停 · S 分割 · Delete 删除 · Ctrl+Z 撤销 · ← → 前后 1 秒（加 Shift 为 0.1 秒） · 可以把文件直接拖到时间线的某一行</div>
     </div>
 
     <!-- 导出 -->
     <div class="export card">
       <div class="info">
         <span>共 {{ clipCount }} 个片段</span>
+        <span v-if="overlayCount">{{ overlayCount }} 个叠加素材</span>
         <span class="mono">{{ msText(ed.total.value) }}</span>
         <span class="mono">{{ outInfo }}</span>
         <span v-if="ed.filePath.value" class="mute ellipsis" :title="ed.filePath.value">{{ ed.filePath.value.split(/[\\/]/).pop() }}{{ ed.dirty.value ? '（有未保存的修改）' : '' }}</span>
@@ -470,6 +577,17 @@ const sizeWarn = computed(() => (ed.project.value.clips.length >= MAX_CLIPS ? `�
 }
 .draft .gap {
   margin-left: 12px;
+}
+.drophint {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  padding: 6px 12px;
+  border-radius: 6px;
+  background: var(--cc-acc);
+  color: #fff;
+  font-size: 12.5px;
+  text-align: center;
 }
 .bar {
   display: flex;

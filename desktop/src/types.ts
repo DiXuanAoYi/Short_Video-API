@@ -1362,6 +1362,39 @@ export interface EditAudio {
   duck: boolean
 }
 
+/** 叠加轨上的素材（画中画、贴纸、GIF、水印）：盖在主轨画面上面，位置、大小和时间都自由。轨号越大越在上面 */
+export interface EditOverlay {
+  id: number
+  path: string
+  kind: 'video' | 'image'
+  /** 叠加轨编号 1–8 */
+  track: number
+  /** 在时间线上从哪里开始（毫秒） */
+  startMs: number
+  inMs: number
+  outMs: number
+  speed: number
+  /** 素材不够长时重复播放（GIF、短视频） */
+  looped: boolean
+  volume: number
+  mute: boolean
+  fadeInMs: number
+  fadeOutMs: number
+  /** 中心点在画面里的位置（占画面宽、高的比例，0.5 = 正中） */
+  x: number
+  y: number
+  /** 素材宽度占画面宽度的比例 */
+  scale: number
+  /** 顺时针旋转的角度（度） */
+  rotate: number
+  opacity: number
+  flipH: boolean
+  flipV: boolean
+  brightness: number
+  contrast: number
+  saturation: number
+}
+
 export interface EditOutput {
   width: number
   height: number
@@ -1375,6 +1408,7 @@ export interface EditOutput {
 export interface EditProject {
   title: string
   clips: EditClip[]
+  overlays: EditOverlay[]
   texts: EditText[]
   audio: EditAudio[]
   out: EditOutput

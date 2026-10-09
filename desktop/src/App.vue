@@ -20,6 +20,7 @@ import PlayerDialog from './components/PlayerDialog.vue'
 import elEn from 'element-plus/es/locale/lang/en'
 import elZh from 'element-plus/es/locale/lang/zh-cn'
 import { useLanguage } from './i18n/useLanguage'
+import { dropFiles, dropLeave, dropOver } from './utils/dropHub'
 import type { PairRequest } from './types'
 
 const app = useAppStore()
@@ -192,10 +193,18 @@ onMounted(async () => {
   })
   // 拖入包含链接的文本文件
   await getCurrentWebview().onDragDropEvent(async (e) => {
-    if (e.payload.type === 'over' || e.payload.type === 'enter') dragging.value = true
-    else if (e.payload.type === 'leave') dragging.value = false
-    else if (e.payload.type === 'drop') {
+    // 位置是物理像素，换成页面里的 CSS 像素；剪辑页等会自己接收拖进来的素材文件
+    const at = (p: { x: number; y: number }) => ({ x: p.x / (window.devicePixelRatio || 1), y: p.y / (window.devicePixelRatio || 1) })
+    if (e.payload.type === 'over' || e.payload.type === 'enter') {
+      const { x, y } = at(e.payload.position)
+      dragging.value = !dropOver(x, y)
+    } else if (e.payload.type === 'leave') {
       dragging.value = false
+      dropLeave()
+    } else if (e.payload.type === 'drop') {
+      dragging.value = false
+      const { x, y } = at(e.payload.position)
+      if (dropFiles(e.payload.paths, x, y)) return
       const texts: string[] = []
       for (const path of e.payload.paths.slice(0, 20)) {
         try {

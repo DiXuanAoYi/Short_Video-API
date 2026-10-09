@@ -1,13 +1,13 @@
 <script setup lang="ts">
-// 检查器：选中的片段 / 文字 / 音频的属性，以及输出设置。
+// 检查器：选中的片段 / 叠加素材 / 文字 / 音频的属性，以及输出设置。
 import { computed, ref, watch } from 'vue'
 import { open } from '@tauri-apps/plugin-dialog'
 import { ElMessage } from 'element-plus'
 import { errorText } from '../../../api'
 import type { EditApi } from '../../../composables/useEditProject'
 import type { RegionApi } from '../../../composables/useRegions'
-import type { EditClip, EditOutput } from '../../../types'
-import { MIN_MS, MIN_TRANSITION_MS, TRANSITIONS, clipDuration, msText, outputSize } from '../../../utils/edit'
+import type { EditClip, EditOutput, EditOverlay } from '../../../types'
+import { MAX_OVERLAY_TRACKS, MAX_START_MS, MIN_MS, MIN_TRANSITION_MS, TRANSITIONS, clipDuration, defaultOverlayScale, isGif, msText, outputSize, overlayDuration, overlayFitScale, overlaySourceLimit } from '../../../utils/edit'
 import EditField from './EditField.vue'
 import EditRegions from './EditRegions.vue'
 import EditSlider from './EditSlider.vue'
@@ -28,9 +28,10 @@ watch(
 )
 
 const clip = ed.selectedClip
+const overlay = ed.selectedOverlay
 const text = ed.selectedText
 const audio = ed.selectedAudio
-const src = computed(() => (clip.value ? ed.sources[clip.value.path] : audio.value ? ed.sources[audio.value.path] : undefined))
+const src = computed(() => (clip.value ? ed.sources[clip.value.path] : overlay.value ? ed.sources[overlay.value.path] : audio.value ? ed.sources[audio.value.path] : undefined))
 const index = computed(() => (clip.value ? ed.project.value.clips.findIndex((c) => c.id === clip.value?.id) : -1))
 const placed = computed(() => (index.value >= 0 ? ed.placed.value[index.value] : undefined))
 const baseName = (p: string) => p.split(/[\\/]/).pop() ?? p
@@ -40,6 +41,7 @@ const baseName = (p: string) => p.split(/[\\/]/).pop() ?? p
 function pc(patch: Partial<EditClip>, key: string) {
   if (clip.value) ed.patchClip(clip.value.id, patch, `${key}:${clip.value.id}`)
 }
+const po = (patch: Partial<EditOverlay>, key: string) => overlay.value && ed.patchOverlay(overlay.value.id, patch, `${key}:${overlay.value.id}`)
 const pt = (patch: Parameters<typeof ed.patchText>[1], key: string) => text.value && ed.patchText(text.value.id, patch, `${key}:${text.value.id}`)
 const pa = (patch: Parameters<typeof ed.patchAudio>[1], key: string) => audio.value && ed.patchAudio(audio.value.id, patch, `${key}:${audio.value.id}`)
 
@@ -60,10 +62,57 @@ function resetTone() {
 }
 const toned = computed(() => !!clip.value && (clip.value.brightness !== 0 || clip.value.contrast !== 1 || clip.value.saturation !== 1))
 
+// ---------- 叠加素材 ----------
+
+const ovLimit = computed(() => (overlay.value ? overlaySourceLimit(overlay.value, src.value) : Infinity))
+const ovMax = computed(() => (Number.isFinite(ovLimit.value) ? ovLimit.value : Number.MAX_SAFE_INTEGER))
+const ovSrcSize = computed(() => (src.value ? { w: src.value.width, h: src.value.height } : undefined))
+const frame = computed(() => outputSize(ed.project.value, ed.sources))
+const ovToned = computed(() => !!overlay.value && (overlay.value.brightness !== 0 || overlay.value.contrast !== 1 || overlay.value.saturation !== 1))
+
+function fitOverlay(mode: 'contain' | 'cover') {
+  if (!overlay.value) return
+  po({ scale: overlayFitScale(overlay.value, ovSrcSize.value, frame.value, mode), x: 0.5, y: 0.5 }, 'fit')
+}
+function resetOverlayBox() {
+  if (!overlay.value) return
+  po({ scale: defaultOverlayScale({ w: src.value?.width ?? 0, h: src.value?.height ?? 0 }, frame.value), x: 0.5, y: 0.5, rotate: 0 }, 'fit')
+}
+function turnOverlay(deg: number) {
+  const o = overlay.value
+  if (!o) return
+  let r = o.rotate + deg
+  if (r > 360) r -= 360
+  if (r < -360) r += 360
+  po({ rotate: r }, 'orot')
+}
+function resetOverlayTone() {
+  po({ brightness: 0, contrast: 1, saturation: 1 }, 'otone')
+}
+function moveToMain() {
+  if (overlay.value && !ed.overlayToMain(overlay.value.id)) ElMessage.warning('主轨的片段已经到上限了，放不下。')
+}
+function moveToOverlay() {
+  const c = clip.value
+  if (!c) return
+  const lost = ed.clipToOverlayTrack(c.id)
+  if (lost === null) ElMessage.warning('叠加素材已经到上限了，放不下。')
+  else if (lost > 0) ElMessage.info(`这个片段上的 ${lost} 个区域不会带到叠加轨（叠加素材没有区域功能）。`)
+}
+const ovHint = computed(() => {
+  const o = overlay.value
+  if (!o) return ''
+  const total = ed.total.value
+  if (!total) return '主轨上还没有视频，叠加素材要有主轨才能出现在成片里。'
+  if (o.startMs >= total) return '它从主轨结尾之后才开始，成片里不会出现。'
+  if (o.startMs + overlayDuration(o) > total) return '它的结尾超出了主轨，成片里超出的部分会被截掉（叠加素材不会撑长成片）。'
+  return ''
+})
+
 async function relink() {
   const c = clip.value
   const a = audio.value
-  const old = c?.path ?? a?.path
+  const old = c?.path ?? overlay.value?.path ?? a?.path
   if (!old) return
   try {
     const r = await open({ multiple: false })
@@ -221,6 +270,10 @@ async function pickDir() {
         <span class="mute small">监视器里的颜色是近似效果，以导出为准。</span>
       </EditField>
 
+      <EditField label="位置" hint="叠加轨上的素材可以放在画面的任意位置、任意大小，和主轨同时出现">
+        <el-button size="small" @click="moveToOverlay">移到叠加轨（画中画）</el-button>
+      </EditField>
+
       <template v-if="index > 0">
         <EditField label="转场" hint="和上一个片段之间的过渡">
           <el-select :model-value="clip.transition?.kind ?? 'none'" size="small" style="width: 150px" @update:model-value="setTransition">
@@ -232,8 +285,91 @@ async function pickDir() {
         <div v-if="clip.transition && appliedOverlap < clip.transition.durationMs" class="mute small pad">
           {{ appliedOverlap ? `片段太短，实际转场 ${(appliedOverlap / 1000).toFixed(2)} 秒。` : '片段太短放不下这个转场，会直接切换。' }}
         </div>
-        <div v-if="clip.transition" class="mute small pad">转场在监视器里不显示，点“生成预览”查看。</div>
+        <div v-if="clip.transition" class="mute small pad">实时画面里的转场是近似效果，导出时按所选转场渲染；想逐帧核对请生成“精确预览”。</div>
       </template>
+    </div>
+
+    <!-- 叠加素材 -->
+    <div v-else-if="tab === 'item' && overlay" class="sec">
+      <div class="title">
+        <span class="chip">叠加</span>
+        <span class="ellipsis" :title="overlay.path">{{ baseName(overlay.path) }}</span>
+      </div>
+      <div v-if="overlay.path in ed.broken" class="alert">
+        <span>{{ ed.broken[overlay.path] }}</span>
+        <el-button size="small" type="primary" @click="relink">重新指定文件…</el-button>
+      </div>
+      <div v-else-if="ovHint" class="alert soft">{{ ovHint }}</div>
+
+      <EditField label="叠加轨" hint="轨号越大，越在上面（盖住小的）">
+        <el-select :model-value="overlay.track" size="small" style="width: 150px" @update:model-value="(v: number) => po({ track: v }, 'otr')">
+          <el-option v-for="n in MAX_OVERLAY_TRACKS" :key="n" :value="n" :label="`叠加 ${n}`" />
+        </el-select>
+        <el-button size="small" link type="primary" @click="moveToMain">移到主轨</el-button>
+      </EditField>
+      <EditField label="开始于">
+        <TimeInput :model-value="overlay.startMs" :max="MAX_START_MS" @update:model-value="(v) => po({ startMs: v }, 'os')" />
+        <el-button size="small" link @click="po({ startMs: Math.round(ed.playhead.value) }, 'os')">取播放位置</el-button>
+      </EditField>
+      <template v-if="overlay.kind === 'video'">
+        <EditField label="入点">
+          <TimeInput :model-value="overlay.inMs" :max="overlay.outMs - MIN_MS" @update:model-value="(v) => po({ inMs: v }, 'oin')" />
+        </EditField>
+        <EditField label="出点">
+          <TimeInput :model-value="overlay.outMs" :min="overlay.inMs + MIN_MS" :max="ovMax" @update:model-value="(v) => po({ outMs: v }, 'oout')" />
+          <span class="mute small">素材共 {{ src?.durationMs ? msText(src.durationMs) : '—' }}</span>
+        </EditField>
+        <EditField label="成片里长">
+          <span class="mono">{{ msText(overlayDuration(overlay)) }}</span>
+          <span v-if="overlay.speed !== 1" class="mute small">（{{ overlay.speed }}× 速度）</span>
+        </EditField>
+        <EditSlider label="速度" :model-value="overlay.speed" :min="0.25" :max="4" :step="0.05" unit="×" :digits="2" @update:model-value="(v) => po({ speed: v }, 'ospd')" />
+        <EditField label="">
+          <el-checkbox :model-value="overlay.looped" @update:model-value="(v: unknown) => po({ looped: !!v }, 'oloop')">{{ isGif(overlay.path) ? 'GIF 循环播放（拉长出点就一直重复）' : '素材不够长时重复播放' }}</el-checkbox>
+        </EditField>
+      </template>
+      <EditField v-else label="显示时长">
+        <TimeInput :model-value="overlay.outMs" :min="MIN_MS" @update:model-value="(v) => po({ outMs: v }, 'oout')" />
+      </EditField>
+
+      <EditSlider label="左右位置" :model-value="overlay.x" :min="-0.5" :max="1.5" :step="0.005" unit="%" :scale="100" hint="素材中心离画面左边的距离。也可以在监视器里直接拖动素材" @update:model-value="(v) => po({ x: v }, 'ox')" />
+      <EditSlider label="上下位置" :model-value="overlay.y" :min="-0.5" :max="1.5" :step="0.005" unit="%" :scale="100" @update:model-value="(v) => po({ y: v }, 'oy')" />
+      <EditSlider label="大小" :model-value="overlay.scale" :min="0.02" :max="3" :step="0.01" unit="%" :scale="100" hint="素材宽度占画面宽度的比例（100% = 和画面一样宽）" @update:model-value="(v) => po({ scale: v }, 'osc')" />
+      <EditSlider label="旋转" :model-value="overlay.rotate" :min="-360" :max="360" :step="1" unit="°" @update:model-value="(v) => po({ rotate: v }, 'orot')" />
+      <EditField label="">
+        <el-button size="small" @click="turnOverlay(-90)">左转 90°</el-button>
+        <el-button size="small" @click="turnOverlay(90)">右转 90°</el-button>
+        <el-button size="small" link type="primary" :disabled="overlay.rotate === 0" @click="po({ rotate: 0 }, 'orot')">归零</el-button>
+      </EditField>
+      <EditField label="">
+        <el-button size="small" @click="fitOverlay('contain')">放进画面</el-button>
+        <el-button size="small" @click="fitOverlay('cover')">铺满画面</el-button>
+        <el-button size="small" @click="resetOverlayBox">还原</el-button>
+      </EditField>
+      <EditSlider label="不透明度" :model-value="overlay.opacity" :min="0" :max="1" :step="0.01" unit="%" :scale="100" @update:model-value="(v) => po({ opacity: v }, 'oop')" />
+      <EditField label="">
+        <el-checkbox :model-value="overlay.flipH" @update:model-value="(v: unknown) => po({ flipH: !!v }, 'ofh')">左右翻转</el-checkbox>
+        <el-checkbox :model-value="overlay.flipV" @update:model-value="(v: unknown) => po({ flipV: !!v }, 'ofv')">上下翻转</el-checkbox>
+      </EditField>
+      <EditField label="淡入（秒）" hint="变透明再出现，声音同步">
+        <el-input-number :model-value="overlay.fadeInMs / 1000" :min="0" :max="overlayDuration(overlay) / 1000" :step="0.1" :precision="1" size="small" controls-position="right" @update:model-value="(v: number | undefined) => po({ fadeInMs: Math.round((v ?? 0) * 1000) }, 'ofi')" />
+      </EditField>
+      <EditField label="淡出（秒）" hint="逐渐变透明，声音同步">
+        <el-input-number :model-value="overlay.fadeOutMs / 1000" :min="0" :max="overlayDuration(overlay) / 1000" :step="0.1" :precision="1" size="small" controls-position="right" @update:model-value="(v: number | undefined) => po({ fadeOutMs: Math.round((v ?? 0) * 1000) }, 'ofo')" />
+      </EditField>
+      <template v-if="overlay.kind === 'video' && src && src.hasAudio">
+        <EditSlider label="音量" :model-value="overlay.volume" :min="0" :max="4" :step="0.05" unit="%" :scale="100" :disabled="overlay.mute" @update:model-value="(v) => po({ volume: v }, 'ovol')" />
+        <EditField label="">
+          <el-checkbox :model-value="overlay.mute" @update:model-value="(v: unknown) => po({ mute: !!v }, 'omute')">静音这个素材</el-checkbox>
+        </EditField>
+      </template>
+      <EditSlider label="亮度" :model-value="overlay.brightness" :min="-1" :max="1" :step="0.01" :scale="100" :digits="0" @update:model-value="(v) => po({ brightness: v }, 'otone')" />
+      <EditSlider label="对比度" :model-value="overlay.contrast" :min="0" :max="3" :step="0.01" :scale="100" unit="%" @update:model-value="(v) => po({ contrast: v }, 'otone')" />
+      <EditSlider label="饱和度" :model-value="overlay.saturation" :min="0" :max="3" :step="0.01" :scale="100" unit="%" @update:model-value="(v) => po({ saturation: v }, 'otone')" />
+      <EditField label="">
+        <el-button size="small" link type="primary" :disabled="!ovToned" @click="resetOverlayTone">调色归零</el-button>
+      </EditField>
+      <div class="mute small pad">叠加素材不会撑长成片，超出主轨结尾的部分会被截掉。</div>
     </div>
 
     <!-- 文字 -->
@@ -310,8 +446,8 @@ async function pickDir() {
     </div>
 
     <div v-else-if="tab === 'item'" class="sec mute small">
-      在时间线上点一个片段、文字或配乐，在这里修改它的属性。<br />
-      点时间线空白处可以移动播放位置；拖动片段可以换顺序，拖动两端可以裁剪。
+      在时间线上点一个片段、叠加素材、文字或配乐，在这里修改它的属性。<br />
+      点时间线空白处可以移动播放位置；拖动片段可以换顺序，拖动两端可以裁剪；叠加素材可以拖到任意时间和轨道。
     </div>
 
     <!-- 区域 -->
