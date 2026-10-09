@@ -1,5 +1,5 @@
 //! 自动规则：下载完成后，按条件（平台、作者、标题关键词、类型、来源、大小）自动打标签、收藏、
-//! 移动到子目录、提取音频、上传、推送通知。
+//! 移动到子目录、提取音频、视频规整、上传、推送通知。
 
 use std::path::Path;
 use std::sync::Arc;
@@ -90,6 +90,18 @@ pub fn run_for(app: &tauri::AppHandle, st: &Arc<AppState>, item: &LibraryItem) {
             };
             if crate::media_tools::start(app, job).is_ok() {
                 notes.push(format!("提取 {} 音频", rule.then.extract_audio.to_uppercase()));
+            }
+        }
+        if let Some(spec) = crate::vidnorm::spec::preset(&rule.then.normalize) {
+            if matches!(item.kind.as_str(), "video") && Path::new(&path).is_file() {
+                let job = crate::media_tools::ToolJob {
+                    inputs: vec![path.clone()],
+                    op: crate::media_tools::ToolOp::Normalize { spec, preset: Some(rule.then.normalize.clone()) },
+                    output_dir: None,
+                };
+                if crate::media_tools::start(app, job).is_ok() {
+                    notes.push("视频规整".into());
+                }
             }
         }
         if rule.then.upload && settings.upload.url.is_empty() {

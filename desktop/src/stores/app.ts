@@ -28,14 +28,14 @@ export const useAppStore = defineStore('app', () => {
   /** 命令面板请求解析页解析这段文字；处理后清空 */
   const pendingParse = ref<string | null>(null)
   /** 请求工具箱打开并预选文件（媒体库里的“用工具箱处理”）；处理后清空 */
-  const toolboxRequest = ref<{ paths: string[]; tool?: string; tab?: 'video' | 'subtitle' | 'tags' | 'ai'; aiMode?: 'transcribe' | 'translate' | 'summarize' } | null>(null)
+  const toolboxRequest = ref<{ paths: string[]; tool?: string; tab?: 'video' | 'normalize' | 'subtitle' | 'tags' | 'ai'; aiMode?: 'transcribe' | 'translate' | 'summarize'; hint?: string } | null>(null)
 
   function goSettings(tab: SettingsTab) {
     settingsTab.value = tab
     view.value = 'settings'
   }
 
-  function goToolbox(paths: string[], tool?: string, extra?: { tab?: 'video' | 'subtitle' | 'tags' | 'ai'; aiMode?: 'transcribe' | 'translate' | 'summarize' }) {
+  function goToolbox(paths: string[], tool?: string, extra?: { tab?: 'video' | 'normalize' | 'subtitle' | 'tags' | 'ai'; aiMode?: 'transcribe' | 'translate' | 'summarize'; hint?: string }) {
     toolboxRequest.value = { paths, tool, ...extra }
     view.value = 'tools'
   }

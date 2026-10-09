@@ -107,6 +107,17 @@ async function bulkDelete() {
   }
 }
 
+/** 把所选的视频交给工具箱的“视频规整”（来源提示取第一个：直播录制 / 平台下载）。 */
+function bulkNormalize() {
+  const videos = files.value.filter((i) => selected.value.has(i.id) && i.kind === 'video' && i.exists)
+  if (!videos.length) {
+    ElMessage.info('所选的项目里没有可以规整的视频文件。')
+    return
+  }
+  const first = videos[0]
+  app.goToolbox(videos.map((v) => v.path), undefined, { tab: 'normalize', hint: first.source === 'live' ? 'live' : first.platform !== 'local' ? 'download' : undefined })
+}
+
 async function bulkSafebox() {
   const st = await api.safeboxStatus().catch(() => null)
   if (!st?.unlocked) {
@@ -372,6 +383,7 @@ async function clearHistory() {
       <el-button size="small" :disabled="!selected.size" @click="bulkTag(true)">去标签</el-button>
       <el-button size="small" :disabled="!selected.size" @click="bulkFavorite(true)">收藏</el-button>
       <el-button size="small" :disabled="!selected.size" @click="bulkFavorite(false)">取消收藏</el-button>
+      <el-button size="small" :disabled="!selected.size" @click="bulkNormalize">视频规整</el-button>
       <el-button size="small" :disabled="!selected.size" @click="bulkSafebox">移入保险箱</el-button>
       <el-button size="small" type="danger" plain :disabled="!selected.size" @click="bulkDelete">删除</el-button>
     </div>

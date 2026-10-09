@@ -282,9 +282,118 @@ export type ToolOp =
   | { op: 'trim'; startMs: number; endMs: number | null; precise: boolean }
   | { op: 'mute' }
   | { op: 'chapters'; chapters: Chapter[] }
+  | { op: 'normalize'; spec: NormSpec; preset?: string | null }
+  | { op: 'stabilize'; strength: 'light' | 'normal' | 'strong' }
   | { op: 'tags'; title?: string | null; artist?: string | null; album?: string | null; year?: string | null; genre?: string | null; comment?: string | null; cover?: string | null }
 
 export type ToolJob = ToolOp & { inputs: string[]; outputDir?: string | null }
+
+// ---------- 视频规整 ----------
+
+export interface NormSpec {
+  size: 'keep' | 'limit' | 'fit' | 'blur' | 'fill'
+  width: number
+  height: number
+  shortSide: number
+  followOrientation: boolean
+  fps: 'keep' | 'auto' | 'fixed'
+  fpsValue: number
+  hdr: boolean
+  fixColor: boolean
+  levels: number
+  lut: string | null
+  lutStrength: number
+  autocrop: boolean
+  audioRate: number
+  audioChannels: number
+  loudness: number | null
+  fixSync: boolean
+  codec: 'keep' | 'h264' | 'hevc'
+  quality: 'small' | 'balanced' | 'high'
+}
+
+export interface NormPreset {
+  id: string
+  name: string
+  desc: string
+  spec: NormSpec
+}
+
+export interface VideoStreamFacts {
+  codec: string
+  width: number
+  height: number
+  pixFmt: string
+  bitDepth: number
+  range: string | null
+  matrix: string | null
+  primaries: string | null
+  transfer: string | null
+  fps: number | null
+  tbr: number | null
+  rotation: number
+  sar: [number, number] | null
+  bitrateKbps: number | null
+  hdr: 'none' | 'pq' | 'hlg'
+  dolbyVision: boolean
+  dolbyProfile: number | null
+}
+
+export interface AudioStreamFacts {
+  codec: string
+  sampleRate: number
+  channels: number
+  bitrateKbps: number | null
+}
+
+export interface VideoFactsInfo {
+  durationMs: number | null
+  container: string
+  video: VideoStreamFacts | null
+  audio: AudioStreamFacts | null
+}
+
+export interface VideoAnalysis {
+  vfr: { variable: boolean; medianFps: number; minFps: number; maxFps: number; frames: number } | null
+  crop: { w: number; h: number; x: number; y: number; srcW: number; srcH: number } | null
+  loudness: { inputI: number; inputTp: number; inputLra: number; inputThresh: number; targetOffset: number } | null
+}
+
+export interface VideoIssue {
+  id: string
+  label: string
+  detail: string
+  level: 'info' | 'warn'
+}
+
+export interface VideoReport {
+  facts: VideoFactsInfo
+  analysis: VideoAnalysis
+  issues: VideoIssue[]
+  recommended: string
+}
+
+export interface VideoPreview {
+  before: string
+  after: string
+  notes: string[]
+  warnings: string[]
+  changed: boolean
+}
+
+export interface CapsSummary {
+  version: string
+  edition: 'full' | 'lite'
+  h264: string | null
+  hevc: string | null
+  hardware: string[]
+  tonemap: boolean
+  lut: boolean
+  levels: boolean
+  cropDetect: boolean
+  stabilize: 'vidstab' | 'deshake' | 'none'
+  notes: string[]
+}
 
 export interface JobSnap {
   id: number
@@ -372,6 +481,7 @@ export interface RuleThen {
   extractAudio: string
   upload: boolean
   notify: boolean
+  normalize: string
 }
 
 export interface AutoRule {
@@ -555,6 +665,7 @@ export interface Settings {
   useYtdlp: boolean
   genericSniffer: boolean
   componentMirrors: string[]
+  ffmpegEdition: 'lite' | 'full'
   clipboardAllSites: boolean
   clipboardDomains: string[]
   phone: PhoneSettings
@@ -661,6 +772,7 @@ export interface LiveSettings {
   segmentMb: number
   convertMp4: boolean
   mergeSegments: boolean
+  normalize: string
   dir: string
   notify: boolean
   schedule: TimeWindow[]
@@ -813,6 +925,7 @@ export interface ToolStatus {
   autoInstall: boolean
   note: string | null
   busy: boolean
+  edition: 'full' | 'lite' | null
 }
 
 export interface ToolProgress {

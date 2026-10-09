@@ -46,6 +46,8 @@ pub mod tools;
 mod tray;
 pub mod upload;
 pub mod vault;
+pub mod vidcaps;
+pub mod vidnorm;
 mod winframe;
 
 use std::path::PathBuf;
@@ -98,6 +100,8 @@ pub struct AppState {
     pub safebox: safebox::Safebox,
     /// 内置播放器用的本机媒体服务
     pub media: media_server::MediaServer,
+    /// ffmpeg 的能力（滤镜、编码器）检测结果缓存
+    pub vcaps: vidcaps::CapsCache,
 }
 
 impl AppState {
@@ -292,6 +296,7 @@ pub fn run() {
                 lock: security::LockState::new(locked),
                 safebox: safebox::Safebox::new(data_dir.join("safebox")),
                 media,
+                vcaps: vidcaps::CapsCache::default(),
             }));
             // 媒体库封面缓存通过 asset 协议显示
             let covers = data_dir.join("covers");
@@ -499,6 +504,10 @@ pub fn run() {
             media_cmds::media_job_cancel,
             media_cmds::media_jobs_clear,
             media_cmds::media_info,
+            media_cmds::video_caps,
+            media_cmds::video_presets,
+            media_cmds::video_analyze,
+            media_cmds::video_preview,
             media_cmds::subtitle_tool,
             commands::list_orphan_parts,
             commands::delete_orphan_parts,

@@ -491,7 +491,7 @@ function insertVar(v: string) {
       </el-tab-pane>
 
       <el-tab-pane label="组件" name="components">
-        <ComponentsPanel v-model="form.componentMirrors" />
+        <ComponentsPanel v-model="form.componentMirrors" v-model:edition="form.ffmpegEdition" />
       </el-tab-pane>
 
       <el-tab-pane label="诊断" name="diagnostics">

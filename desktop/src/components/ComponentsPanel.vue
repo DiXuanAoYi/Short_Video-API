@@ -4,14 +4,18 @@ import { ElMessage } from 'element-plus'
 import { open } from '@tauri-apps/plugin-dialog'
 import type { UnlistenFn } from '@tauri-apps/api/event'
 import { api, errorText, events } from '../api'
-import type { ToolProgress, ToolStatus } from '../types'
+import { useAppStore } from '../stores/app'
+import type { CapsSummary, ToolProgress, ToolStatus } from '../types'
 import { formatBytes } from '../utils/format'
 
 const mirrors = defineModel<string[]>({ required: true })
+const edition = defineModel<'lite' | 'full'>('edition', { default: 'lite' })
+const app = useAppStore()
+const caps = ref<CapsSummary | null>(null)
 
 const INFO: Record<string, { name: string; desc: string }> = {
   'yt-dlp': { name: 'yt-dlp', desc: '解析和下载上千个视频网站（YouTube、Pornhub、Twitter/X、TikTok 等）。网站改版频繁，建议经常更新。' },
-  ffmpeg: { name: 'ffmpeg', desc: '合并音视频分轨、m3u8 转 MP4、提取音频、Pixiv 动图合成。自动下载的是 LGPL 版本。' },
+  ffmpeg: { name: 'ffmpeg', desc: '合并音视频分轨、m3u8 转 MP4、提取音频、Pixiv 动图合成，以及工具箱里的压缩、视频规整、防抖等。' },
 }
 
 const list = ref<ToolStatus[]>([])
@@ -33,6 +37,7 @@ async function refresh() {
   loading.value = true
   try {
     list.value = await api.toolsStatus()
+    caps.value = await api.videoCaps().catch(() => null)
   } catch (e) {
     ElMessage.error(errorText(e))
   } finally {
@@ -48,6 +53,8 @@ function replace(s: ToolStatus) {
 async function install(t: ToolStatus) {
   t.busy = true
   try {
+    // 要下载哪个版本以保存的设置为准，先保存再安装
+    if (t.id === 'ffmpeg' && app.settings && app.settings.ffmpegEdition !== edition.value) await app.patch({ ffmpegEdition: edition.value })
     const s = await api.installTool(t.id)
     replace(s)
     ElMessage.success(`${INFO[t.id].name} 已就绪：${s.version ?? ''}`)
@@ -145,8 +152,31 @@ onUnmounted(() => unlisten?.())
         <el-progress :percentage="percent(progress[t.id])" :show-text="false" :stroke-width="4" :indeterminate="!progress[t.id].total || progress[t.id].stage !== 'download'" />
         <small class="mute">{{ stageText(progress[t.id]) }}</small>
       </div>
+      <template v-if="t.id === 'ffmpeg'">
+        <div v-if="t.installed" class="row edition">
+          <span class="chip" :class="t.edition === 'full' ? 'ok' : ''">{{ t.edition === 'full' ? '当前是完整版' : '当前是精简版' }}</span>
+          <small v-if="caps" class="mute">
+            H.264 编码器：{{ caps.h264 ?? '无' }}
+            <template v-if="caps.hardware.length">；硬件编码：{{ caps.hardware.join('、') }}</template>
+            ；防抖：{{ { vidstab: 'vidstab', deshake: 'deshake（较弱）', none: '不可用' }[caps.stabilize] }}
+            ；HDR 转 SDR：{{ caps.tonemap ? 'zscale' : '程序内置' }}
+          </small>
+        </div>
+        <div v-if="t.autoInstall" class="row edition">
+          <span class="mute small">下载哪个版本</span>
+          <el-radio-group v-model="edition" size="small" :disabled="t.busy">
+            <el-radio-button value="lite">精简版（约 40 MB）</el-radio-button>
+            <el-radio-button value="full">完整版（约 130 MB）</el-radio-button>
+          </el-radio-group>
+        </div>
+        <small v-if="t.autoInstall" class="mute">
+          精简版（LGPL）没有 x264 / x265 编码器和 vidstab 防抖，只能用硬件编码、openh264 或 VP9 输出视频。
+          完整版（GPL）带 x264、x265、vidstab 防抖、zscale 色调映射等，画质和效果更好；它按 GPL 授权，由你自己下载使用，不随清影分发。选好后点下面的按钮即可切换。
+        </small>
+        <small v-for="n in caps?.notes ?? []" :key="n" class="mute warn-note">· {{ n }}</small>
+      </template>
       <div class="row">
-        <el-button v-if="t.autoInstall" size="small" type="primary" :loading="t.busy" @click="install(t)">{{ t.installed && t.managed ? '检查更新' : '下载安装' }}</el-button>
+        <el-button v-if="t.autoInstall" size="small" type="primary" :loading="t.busy" @click="install(t)">{{ t.id === 'ffmpeg' && t.installed && (t.edition ?? 'lite') !== edition ? `切换到${edition === 'full' ? '完整版' : '精简版'}` : t.installed && t.managed ? '检查更新' : '下载安装' }}</el-button>
         <el-button v-if="t.hasPrevious" size="small" :disabled="t.busy" @click="rollback(t)">回退到上一版本</el-button>
         <el-button size="small" :disabled="t.busy" @click="importFile(t)">导入本地文件…</el-button>
         <el-button v-if="t.id === 'yt-dlp' && t.installed" size="small" link @click="showSites">支持的网站</el-button>

@@ -51,6 +51,107 @@ pub async fn media_info(state: St<'_>, path: String) -> AppResult<MediaInfoLite>
     Ok(p.into())
 }
 
+// ---------- 视频规整 ----------
+
+/// 当前 ffmpeg 能做什么、做不到什么。没有安装 ffmpeg 时返回 None。
+#[tauri::command]
+pub async fn video_caps(state: St<'_>) -> AppResult<Option<crate::vidcaps::CapsSummary>> {
+    Ok(crate::vidcaps::current(&state).await.map(|(_, c)| c.summary()))
+}
+
+#[tauri::command]
+pub fn video_presets() -> Vec<crate::vidnorm::spec::Preset> {
+    crate::vidnorm::spec::presets()
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoReport {
+    pub facts: crate::vidnorm::Facts,
+    pub analysis: crate::vidnorm::Analysis,
+    pub issues: Vec<crate::vidnorm::spec::Issue>,
+    pub recommended: &'static str,
+}
+
+/// 检查一个视频：编码、尺寸、帧率、色彩、HDR，以及需要解码才能知道的可变帧率和黑边；给出问题清单和推荐预设。
+/// `hint`：来源提示（`live` 直播录制 / `download` 平台下载）。
+#[tauri::command]
+pub async fn video_analyze(state: St<'_>, path: String, hint: Option<String>) -> AppResult<VideoReport> {
+    use crate::vidnorm::{analyze, facts, spec};
+    let ff = postprocess::find_ffmpeg(&state).ok_or_else(|| AppError::new(ErrorKind::NeedUpdate, "需要 ffmpeg。请在“设置 → 组件”里安装 ffmpeg 后重试。"))?;
+    let file = Path::new(&path);
+    if !file.is_file() {
+        return Err(AppError::not_found("找不到文件。"));
+    }
+    let f = facts::read(&ff, file).await.ok_or_else(|| AppError::invalid("无法读取这个文件。"))?;
+    if f.video.is_none() {
+        return Err(AppError::invalid("这个文件里没有视频画面。"));
+    }
+    let an = analyze::analyze_quick(&ff, file, &f).await;
+    let recommended = spec::recommend(&f, &an, hint.as_deref());
+    let issues = spec::issues(&f, &an);
+    Ok(VideoReport { facts: f, analysis: an, issues, recommended })
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoPreview {
+    pub before: String,
+    pub after: String,
+    pub notes: Vec<String>,
+    pub warnings: Vec<String>,
+    /// 视频画面是否会被改动（没有改动时“处理后”和“处理前”相同）
+    pub changed: bool,
+}
+
+fn short_hash(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(&Sha256::digest(text.as_bytes())[..8])
+}
+
+/// 截取某一时刻“处理前 / 处理后”的两张图，用来对比规整的效果（只含画面处理，不含帧率和声音）。
+#[tauri::command]
+pub async fn video_preview(state: St<'_>, path: String, spec: crate::vidnorm::NormSpec, at_ms: u64) -> AppResult<VideoPreview> {
+    use crate::vidnorm::{analyze, build, facts};
+    let (ff, caps) =
+        crate::vidcaps::current(&state).await.ok_or_else(|| AppError::new(ErrorKind::NeedUpdate, "需要 ffmpeg。请在“设置 → 组件”里安装 ffmpeg 后重试。"))?;
+    let file = Path::new(&path);
+    if !file.is_file() {
+        return Err(AppError::not_found("找不到文件。"));
+    }
+    let spec = spec.checked().map_err(AppError::invalid)?;
+    let f = facts::read(&ff, file).await.ok_or_else(|| AppError::invalid("无法读取这个文件。"))?;
+    let mut an = crate::vidnorm::Analysis::default();
+    if spec.autocrop {
+        an.crop = analyze::detect_crop(&ff, file, &f).await;
+    }
+    let pix = if caps.encoders.h264 == Some("h264_qsv") { "nv12" } else { "yuv420p" };
+    let tmp = state.data_dir.join("tmp").join("preview");
+    let vg = build::video_graph(&spec, &f, &an, &caps, &tmp, pix, true)?;
+    let dir = state.data_dir.join("previews");
+    // 清理两小时前的预览图
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > std::time::Duration::from_secs(7200));
+            if old && e.file_name().to_string_lossy().starts_with("norm-") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    let key = format!("norm-{}", short_hash(&format!("{path}|{at_ms}|{}", serde_json::to_string(&spec).unwrap_or_default())));
+    let (before, after) = analyze::preview(&ff, file, at_ms, vg.graph.as_deref(), &dir, &key).await?;
+    for t in vg.temp_files {
+        let _ = std::fs::remove_file(t);
+    }
+    Ok(VideoPreview {
+        before: before.to_string_lossy().into_owned(),
+        after: after.to_string_lossy().into_owned(),
+        changed: vg.graph.is_some(),
+        notes: vg.notes,
+        warnings: vg.warnings,
+    })
+}
+
 // ---------- 字幕工具 ----------
 
 #[derive(Debug, Deserialize)]

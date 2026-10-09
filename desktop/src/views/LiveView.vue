@@ -5,7 +5,7 @@ import type { UnlistenFn } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
 import { api, errorKind, errorText, events } from '../api'
 import { useAppStore } from '../stores/app'
-import type { ErrorKind, LiveRoom, LiveSettings, LiveStatus, Recording } from '../types'
+import type { ErrorKind, LiveRoom, LiveSettings, LiveStatus, NormPreset, Recording } from '../types'
 import { formatBytes, formatDateTime } from '../utils/format'
 import ErrorAlert from '../components/ErrorAlert.vue'
 
@@ -15,7 +15,7 @@ const tick = ref(Date.now())
 let unlisten: UnlistenFn | undefined
 let timer: number | undefined
 
-const DEFAULTS: LiveSettings = { autoRecord: true, quality: '', checkIntervalS: 60, segmentMinutes: 60, segmentMb: 0, convertMp4: false, mergeSegments: false, dir: '', notify: true, schedule: [] }
+const DEFAULTS: LiveSettings = { autoRecord: true, quality: '', checkIntervalS: 60, segmentMinutes: 60, segmentMb: 0, convertMp4: false, mergeSegments: false, normalize: '', dir: '', notify: true, schedule: [] }
 
 async function load() {
   try {
@@ -25,7 +25,10 @@ async function load() {
   }
 }
 
+const presets = ref<NormPreset[]>([])
+
 onMounted(async () => {
+  presets.value = await api.videoPresets().catch(() => [])
   await load()
   unlisten = await events.onLive(load)
   // 录制中刷新已录时长和大小
@@ -245,6 +248,13 @@ const REC_STATUS: Record<string, string> = { recording: '录制中', done: '已�
           <div class="col">
             <el-checkbox v-model="editing.settings.convertMp4">无损转为 MP4（修正时间戳）</el-checkbox>
             <el-checkbox v-model="editing.settings.mergeSegments" :disabled="!editing.settings.convertMp4">合并同一场的分段</el-checkbox>
+            <span class="row">
+              <span class="mute small">视频规整</span>
+              <el-select v-model="editing.settings.normalize" size="small" clearable placeholder="不规整" class="grow">
+                <el-option v-for="p in presets" :key="p.id" :value="p.id" :label="p.name" />
+              </el-select>
+            </span>
+            <span class="mute small">规整会在录制文件旁边生成新文件（修正时间戳和音画不同步、统一响度等），原文件保留。推荐选“直播录制”。</span>
           </div>
           <label>保存位置</label>
           <div class="row">
