@@ -62,6 +62,7 @@ import type {
   ToolProgress,
   ToolStatus,
   ClipboardLink,
+  ColorReport,
   DetectedLink,
   HistoryItem,
   InboxCounts,
@@ -202,6 +203,7 @@ export const api = {
   videoCaps: () => invoke<CapsSummary | null>('video_caps'),
   videoPresets: () => invoke<NormPreset[]>('video_presets'),
   videoAnalyze: (path: string, hint?: string | null) => invoke<VideoReport>('video_analyze', { path, hint: hint ?? null }),
+  videoColor: (path: string) => invoke<ColorReport>('video_color', { path }),
   videoPreview: (path: string, spec: NormSpec, atMs: number) => invoke<VideoPreview>('video_preview', { path, spec, atMs }),
   subtitleTool: (job: SubJob) => invoke<{ output: string; count: number }>('subtitle_tool', { job }),
 

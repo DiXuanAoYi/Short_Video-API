@@ -491,6 +491,7 @@ pub fn run() {
             media_cmds::video_caps,
             media_cmds::video_presets,
             media_cmds::video_analyze,
+            media_cmds::video_color,
             media_cmds::video_preview,
             media_cmds::subtitle_tool,
             commands::list_orphan_parts,

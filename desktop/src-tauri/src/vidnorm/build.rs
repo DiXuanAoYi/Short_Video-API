@@ -281,6 +281,26 @@ pub fn video_graph(spec: &NormSpec, facts: &Facts, an: &Analysis, caps: &Caps, t
     let mut out = VideoGraph::default();
     let mut g = Graph::new();
 
+    // 分段色彩匹配：放在最前面，滤镜看到的时间戳和分析时一致（后面的帧率转换会改写时间戳）。
+    // 校正用 lutyuv，只认 8 位的 YUV 平面格式，其他格式先转成 yuv420p。
+    if spec.match_color > 0.0 {
+        if let Some(plan) = an.color.as_ref().filter(|p| !p.fixes.is_empty()) {
+            if v.hdr != Hdr::None {
+                out.warnings.push("HDR 素材要先转成 SDR，分段色彩匹配没有应用。".into());
+            } else {
+                let planar8 = matches!(v.pix_fmt.as_str(), "yuv420p" | "yuvj420p" | "yuv422p" | "yuvj422p" | "yuv444p" | "yuvj444p" | "yuv440p");
+                if !planar8 {
+                    g.push("format=yuv420p");
+                }
+                for fix in &plan.fixes {
+                    g.push(&fix.filter());
+                }
+                out.reasons.push("color_match");
+                out.notes.push(format!("分段色彩匹配：{} 个镜头单独校正到和整体一致", plan.fixes.len()));
+            }
+        }
+    }
+
     // 帧率
     let fps_target: Option<(u32, u32)> = match spec.fps.as_str() {
         "fixed" => Some(fps_fraction(spec.fps_value)),
@@ -679,6 +699,7 @@ fn reasons_text(reasons: &[&str]) -> String {
             "matrix" => "色彩空间",
             "levels" => "色阶",
             "lut" => "LUT",
+            "color_match" => "分段色彩匹配",
             "pix" => "像素格式",
             "codec" => "编码",
             "container" => "封装",
@@ -816,6 +837,7 @@ mod tests {
             vfr: Some(VfrInfo { variable: true, median_fps: 30.0, min_fps: 5.0, max_fps: 60.0, frames: 240 }),
             crop: Some(Crop { w: 1080, h: 2208, x: 0, y: 96, src_w: 1080, src_h: 2400 }),
             loudness: Some(Loudness { input_i: -24.0, input_tp: -3.0, input_lra: 6.0, input_thresh: -34.0, target_offset: 0.3 }),
+            ..Default::default()
         };
         let p = build(Path::new("/m/r.mp4"), &preset("edit").unwrap(), &f, &an, &caps(true, true), &tmp()).unwrap();
         let g = arg_after(&p.args, "-filter_complex").unwrap();

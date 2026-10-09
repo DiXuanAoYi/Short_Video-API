@@ -5,8 +5,8 @@ import { open } from '@tauri-apps/plugin-dialog'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { api, errorText } from '../../api'
 import { useAppStore } from '../../stores/app'
-import type { CapsSummary, NormPreset, NormSpec, VideoFactsInfo, VideoPreview, VideoReport } from '../../types'
-import { parseClock } from '../../utils/time'
+import type { CapsSummary, ColorFlaggedShot, ColorReport, NormPreset, NormSpec, VideoFactsInfo, VideoPreview, VideoReport } from '../../types'
+import { formatClock, parseClock } from '../../utils/time'
 import FileInput from './FileInput.vue'
 
 const props = defineProps<{ preset?: string[]; hint?: string }>()
@@ -18,7 +18,7 @@ const caps = ref<CapsSummary | null>(null)
 const presets = ref<NormPreset[]>([])
 const presetId = ref('compat')
 const spec = reactive<NormSpec>({
-  size: 'limit', width: 1920, height: 1080, shortSide: 1080, followOrientation: true, fps: 'auto', fpsValue: 30, hdr: true, fixColor: true, levels: 0, lut: null,
+  size: 'limit', width: 1920, height: 1080, shortSide: 1080, followOrientation: true, fps: 'auto', fpsValue: 30, hdr: true, fixColor: true, levels: 0, matchColor: 0, matchExclude: [], lut: null,
   lutStrength: 1, autocrop: false, audioRate: 0, audioChannels: 0, loudness: null, fixSync: true, codec: 'h264', quality: 'balanced',
 })
 const reports = ref<Record<string, VideoReport | { error: string }>>({})
@@ -31,7 +31,46 @@ const stabBusy = ref(false)
 const previewAt = ref('0:02')
 const preview = ref<VideoPreview | null>(null)
 const previewing = ref(false)
+const colorReport = ref<ColorReport | null>(null)
+const colorBusy = ref(false)
 let token = 0
+
+// 换了第一个文件：旧的色彩检测结果和取消的镜头都作废
+watch(
+  () => files.value[0],
+  () => {
+    colorReport.value = null
+    spec.matchExclude = []
+  },
+)
+
+async function checkColor() {
+  const f = files.value[0]
+  if (!f) return
+  colorBusy.value = true
+  try {
+    colorReport.value = await api.videoColor(f)
+    spec.matchExclude = []
+  } catch (e) {
+    colorReport.value = null
+    ElMessage.error(errorText(e))
+  } finally {
+    colorBusy.value = false
+  }
+}
+
+function toggleShot(id: number, on: boolean) {
+  const rest = spec.matchExclude.filter((x) => x !== id)
+  spec.matchExclude = on ? rest : [...rest, id]
+}
+
+/** 看某个镜头校正前后的对比：取镜头中间的一帧。 */
+function previewShot(s: ColorFlaggedShot) {
+  previewAt.value = formatClock(Math.round((s.startMs + s.endMs) / 2))
+  void makePreview()
+}
+
+const segPercent = (a: number, b: number) => `${Math.max(0.4, ((b - a) / Math.max(1, colorReport.value?.durationMs ?? 1)) * 100)}%`
 
 watch(
   () => props.preset,
@@ -41,7 +80,7 @@ watch(
 function applyPreset(p: NormPreset) {
   presetId.value = p.id
   // 色阶和 LUT 是个人风格，不跟着预设走
-  Object.assign(spec, p.spec, { lut: spec.lut, lutStrength: spec.lutStrength, levels: spec.levels })
+  Object.assign(spec, p.spec, { lut: spec.lut, lutStrength: spec.lutStrength, levels: spec.levels, matchExclude: spec.matchExclude })
 }
 
 onMounted(async () => {
@@ -159,7 +198,9 @@ async function start() {
   busy.value = true
   try {
     for (const f of files.value) {
-      await api.mediaJobStart({ op: 'normalize', spec: { ...spec }, preset: presetId.value, inputs: [f], outputDir: outDir.value || null })
+      // 取消的镜头是按第一个文件的检测结果记的，别的文件用不上
+      const own = { ...spec, matchExclude: f === files.value[0] ? [...spec.matchExclude] : [] }
+      await api.mediaJobStart({ op: 'normalize', spec: own, preset: presetId.value, inputs: [f], outputDir: outDir.value || null })
     }
     ElMessage.success(files.value.length > 1 ? `已加入 ${files.value.length} 个任务，可以在下方查看进度。` : '已开始处理，可以在下方查看进度。')
     emit('started')
@@ -312,6 +353,41 @@ const imgSrc = (p: string) => convertFileSrc(p)
           <small class="mute">0 为关闭。把画面最暗和最亮的位置拉到黑和白，适合发灰、偏暗的素材。</small>
         </label>
         <label>
+          <span>分段色彩匹配</span>
+          <el-slider v-model="spec.matchColor" :min="0" :max="1" :step="0.05" :format-tooltip="(v: number) => `${Math.round(v * 100)}%`" size="small" class="sl" />
+          <small class="mute">
+            0 为关闭。视频里有几段来源不同、偏色（偏黄、偏蓝……）、亮度或饱和度和整体不一致时，只把不一致的镜头单独校正到和整体一致，一致的镜头不动。
+          </small>
+        </label>
+        <div v-if="spec.matchColor > 0" class="cm">
+          <div class="cmhead">
+            <el-button size="small" :loading="colorBusy" :disabled="!files.length" @click="checkColor">检测第一个文件的色彩差异</el-button>
+            <small class="mute">解码一遍关键帧，几秒到几十秒。处理时会自动检测，这里先看一眼，还可以取消不想校正的镜头。</small>
+          </div>
+          <template v-if="colorReport">
+            <div class="strip" :title="`共 ${colorReport.shotsTotal} 个镜头`">
+              <span
+                v-for="(seg, i) in colorReport.timeline"
+                :key="i"
+                :class="{ off: seg.off }"
+                :style="{ width: segPercent(seg.startMs, seg.endMs) }"
+                :title="`${formatClock(seg.startMs)} – ${formatClock(seg.endMs)}${seg.off ? '（和整体不一致）' : ''}`"
+              />
+            </div>
+            <div v-if="colorReport.note" class="mute small">{{ colorReport.note }}</div>
+            <div v-else class="mute small">共 {{ colorReport.shotsTotal }} 个镜头，{{ colorReport.flagged.length }} 个和整体不一致（橙色）。勾选的会被校正。</div>
+            <div v-for="f in colorReport.flagged" :key="f.id" class="shot">
+              <el-checkbox :model-value="!spec.matchExclude.includes(f.id)" @change="(v: string | number | boolean) => toggleShot(f.id, !!v)">
+                {{ formatClock(f.startMs) }} – {{ formatClock(f.endMs) }}
+              </el-checkbox>
+              <span class="chips">
+                <span v-for="d in f.defects" :key="d" class="chip warn">{{ d }}</span>
+              </span>
+              <el-button size="small" link type="primary" :loading="previewing" @click="previewShot(f)">看对比</el-button>
+            </div>
+          </template>
+        </div>
+        <label>
           <span>LUT</span>
           <span class="dirbox">
             <el-input :model-value="spec.lut ?? ''" size="small" readonly placeholder="未选择（.cube 文件）" class="w" />
@@ -384,7 +460,7 @@ const imgSrc = (p: string) => convertFileSrc(p)
       <div class="pv">
         <el-input v-model="previewAt" size="small" class="t mono" placeholder="0:02" />
         <el-button size="small" :loading="previewing" :disabled="!files.length" @click="makePreview">生成第一个文件的对比图</el-button>
-        <small class="mute">只含画面处理（尺寸、HDR、色阶、LUT、去黑边），不含帧率和声音。</small>
+        <small class="mute">只含画面处理（尺寸、HDR、色阶、分段色彩匹配、LUT、去黑边），不含帧率和声音。</small>
       </div>
       <div v-if="preview" class="cmp">
         <figure>
@@ -444,6 +520,42 @@ const imgSrc = (p: string) => convertFileSrc(p)
 h3 {
   margin: 0;
   font-size: 15px;
+}
+.cm {
+  margin: -4px 0 4px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--cc-line);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.cmhead {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.strip {
+  display: flex;
+  height: 10px;
+  border-radius: 5px;
+  overflow: hidden;
+  background: var(--cc-line);
+}
+.strip span {
+  display: block;
+  height: 100%;
+  background: color-mix(in srgb, var(--cc-mute) 30%, transparent);
+}
+.strip span.off {
+  background: var(--cc-acc);
+}
+.shot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 h4 {
   margin: 6px 0 0;

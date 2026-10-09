@@ -301,6 +301,10 @@ export interface NormSpec {
   hdr: boolean
   fixColor: boolean
   levels: number
+  /** 分段色彩匹配的强度（0 关闭）：把和整体色调不一致的镜头单独校正到和整体一致 */
+  matchColor: number
+  /** 不校正的镜头（镜头开头的毫秒数） */
+  matchExclude: number[]
   lut: string | null
   lutStrength: number
   autocrop: boolean
@@ -310,6 +314,28 @@ export interface NormSpec {
   fixSync: boolean
   codec: 'keep' | 'h264' | 'hevc'
   quality: 'small' | 'balanced' | 'high'
+}
+
+export interface ColorTimelineSeg {
+  startMs: number
+  endMs: number
+  off: boolean
+}
+
+export interface ColorFlaggedShot {
+  id: number
+  startMs: number
+  endMs: number
+  defects: string[]
+}
+
+/** 各个镜头的色彩是否一致的检测结果。 */
+export interface ColorReport {
+  durationMs: number
+  shotsTotal: number
+  timeline: ColorTimelineSeg[]
+  flagged: ColorFlaggedShot[]
+  note: string | null
 }
 
 export interface NormPreset {

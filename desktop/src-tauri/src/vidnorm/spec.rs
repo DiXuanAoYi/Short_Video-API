@@ -26,6 +26,10 @@ pub struct NormSpec {
     pub fix_color: bool,
     /// 自动色阶强度（0 关闭，1 完全）
     pub levels: f64,
+    /// 分段色彩匹配的强度（0 关闭，1 完全校正）：镜头之间偏色、亮度、对比度、饱和度不一致时，把和整体不一致的镜头单独校正到和整体一致
+    pub match_color: f64,
+    /// 不校正的镜头：用检测结果里镜头开头的毫秒数标识
+    pub match_exclude: Vec<i64>,
     /// `.cube` LUT 文件和强度
     pub lut: Option<String>,
     pub lut_strength: f64,
@@ -57,6 +61,8 @@ impl Default for NormSpec {
             hdr: true,
             fix_color: true,
             levels: 0.0,
+            match_color: 0.0,
+            match_exclude: vec![],
             lut: None,
             lut_strength: 1.0,
             autocrop: false,
@@ -89,6 +95,8 @@ impl NormSpec {
         self.short_side = self.short_side.clamp(240, 4320) & !1;
         self.fps_value = self.fps_value.clamp(1.0, 240.0);
         self.levels = self.levels.clamp(0.0, 1.0);
+        self.match_color = self.match_color.clamp(0.0, 1.0);
+        self.match_exclude.truncate(500);
         self.lut_strength = self.lut_strength.clamp(0.0, 1.0);
         self.lut = self.lut.take().filter(|p| !p.trim().is_empty());
         self.loudness = self.loudness.map(|l| l.clamp(-30.0, -5.0));
@@ -198,6 +206,12 @@ pub fn presets() -> Vec<Preset> {
             },
         },
         Preset {
+            id: "mashup",
+            name: "混剪 / 多来源拼接",
+            desc: "几段来源不同的画面拼在一起、各段偏色、亮度或饱和度不一致时：把和整体不一致的镜头单独校正到和整体一致，一致的镜头不动；同时去黑边、补全色彩信息。",
+            spec: NormSpec { size: "keep".into(), fps: "keep".into(), autocrop: true, codec: "keep".into(), quality: "high".into(), match_color: 0.8, ..base() },
+        },
+        Preset {
             id: "archive",
             name: "省空间（HEVC）",
             desc: "重新编码成 HEVC，同样画质体积通常小三成以上，适合长期存放。需要 ffmpeg 有 HEVC 编码器（完整版或硬件编码）。",
@@ -258,6 +272,8 @@ pub struct Analysis {
     pub vfr: Option<VfrInfo>,
     pub crop: Option<Crop>,
     pub loudness: Option<Loudness>,
+    /// 分段色彩匹配要校正的镜头（只在选了分段色彩匹配时才分析）
+    pub color: Option<super::colormatch::ColorPlan>,
 }
 
 // ---------- 问题与推荐 ----------
@@ -410,7 +426,7 @@ mod tests {
         let an = Analysis {
             vfr: Some(VfrInfo { variable: true, median_fps: 30.0, min_fps: 12.0, max_fps: 60.0, frames: 200 }),
             crop: Some(Crop { w: 2160, h: 3400, x: 0, y: 220, src_w: 2160, src_h: 3840 }),
-            loudness: None,
+            ..Default::default()
         };
         let ids: Vec<_> = issues(&f, &an).iter().map(|i| i.id).collect();
         for want in ["hdr", "vfr", "rotation", "black_bars", "codec", "audio_channels"] {

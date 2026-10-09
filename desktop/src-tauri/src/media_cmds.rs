@@ -93,6 +93,21 @@ pub async fn video_analyze(state: St<'_>, path: String, hint: Option<String>) ->
     Ok(VideoReport { facts: f, analysis: an, issues, recommended })
 }
 
+/// 检查一个视频里各个镜头的色彩是否一致：哪些镜头和整体的偏色、亮度、对比度、饱和度不一样。要解码一遍关键帧，几秒到几十秒。
+#[tauri::command]
+pub async fn video_color(state: St<'_>, path: String) -> AppResult<crate::vidnorm::colormatch::ColorReport> {
+    use crate::vidnorm::{colormatch, facts};
+    let (ff, caps) =
+        crate::vidcaps::current(&state).await.ok_or_else(|| AppError::new(ErrorKind::NeedUpdate, "需要 ffmpeg。请在“设置 → 组件”里安装 ffmpeg 后重试。"))?;
+    let file = Path::new(&path);
+    if !file.is_file() {
+        return Err(AppError::not_found("找不到文件。"));
+    }
+    let f = facts::read(&ff, file).await.ok_or_else(|| AppError::invalid("无法读取这个文件。"))?;
+    let a = colormatch::analyze_cached(&ff, file, &f, &caps).await.map_err(AppError::invalid)?;
+    Ok(a.report())
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VideoPreview {
@@ -125,6 +140,14 @@ pub async fn video_preview(state: St<'_>, path: String, spec: crate::vidnorm::No
     if spec.autocrop {
         an.crop = analyze::detect_crop(&ff, file, &f).await;
     }
+    let mut color_warning = None;
+    if spec.match_color > 0.0 {
+        // 预览从 at_ms 处开始读，滤镜看到的时间要减去它
+        match crate::vidnorm::colormatch::analyze_cached(&ff, file, &f, &caps).await {
+            Ok(a) => an.color = Some(a.plan(spec.match_color, &spec.match_exclude).shifted(at_ms as i64)),
+            Err(e) => color_warning = Some(format!("分段色彩匹配没有做：{e}")),
+        }
+    }
     let pix = if caps.encoders.h264 == Some("h264_qsv") { "nv12" } else { "yuv420p" };
     let tmp = state.data_dir.join("tmp").join("preview");
     let vg = build::video_graph(&spec, &f, &an, &caps, &tmp, pix, true)?;
@@ -148,7 +171,7 @@ pub async fn video_preview(state: St<'_>, path: String, spec: crate::vidnorm::No
         after: after.to_string_lossy().into_owned(),
         changed: vg.graph.is_some(),
         notes: vg.notes,
-        warnings: vg.warnings,
+        warnings: vg.warnings.into_iter().chain(color_warning).collect(),
     })
 }
 

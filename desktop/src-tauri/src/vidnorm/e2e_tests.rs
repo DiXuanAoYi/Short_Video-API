@@ -59,6 +59,11 @@ async fn normalize(ff: &Path, input: &Path, spec: &NormSpec, caps: &Caps, d: &Pa
     if let (Some(t), Some(_)) = (spec.loudness, &facts.audio) {
         an.loudness = analyze::measure_loudness(ff, input, t).await;
     }
+    if spec.match_color > 0.0 {
+        if let Ok(a) = super::colormatch::analyze_cached(ff, input, &facts, caps).await {
+            an.color = Some(a.plan(spec.match_color, &spec.match_exclude));
+        }
+    }
     let plan = build(input, spec, &facts, &an, caps, &d.join("tmp")).expect("build");
     let out = d.join(format!("out.{}", plan.ext));
     let _ = std::fs::remove_file(&out);
@@ -450,4 +455,232 @@ async fn already_compliant_files_are_reported_unchanged() {
     );
     let (_, plan, _) = normalize(&ff, &src, &preset("compat").unwrap(), &caps, &d).await;
     assert!(plan.unchanged, "{:?}", plan.notes);
+}
+
+// ---------- 分段色彩匹配 ----------
+
+use super::colormatch::{self, FrameStats};
+
+/// 五个镜头（每个 3 秒、内容不同）拼成一个视频：第 2 个偏黄，第 4 个又亮又发灰，其余三个是正常的中性色调。
+/// `sparse_keys` 为真时只在开头有一个关键帧（模拟录屏、直播录制）。
+async fn mashup(ff: &Path, d: &Path, name: &str, sparse_keys: bool) -> Option<PathBuf> {
+    // (亮度基准, 亮度花纹频率, U 偏移, V 偏移, 色度花纹幅度)
+    mashup_of(ff, d, name, sparse_keys, [(110, 18, 0, 0, 10), (110, 26, -16, 7, 10), (108, 14, 0, 0, 10), (155, 22, 0, 0, 3), (112, 30, 0, 0, 10)]).await
+}
+
+async fn mashup_of(ff: &Path, d: &Path, name: &str, sparse_keys: bool, shots: [(i32, i32, i32, i32, i32); 5]) -> Option<PathBuf> {
+    let srcs: Vec<String> = shots
+        .iter()
+        .enumerate()
+        .map(|(i, (y, f, du, dv, amp))| {
+            format!(
+                // 色度花纹取整数个周期（零均值），这样“偏色”才只来自 du / dv
+                "nullsrc=s=320x180:r=25:d=3,format=yuv420p,geq=lum='{y}+45*sin(X/{f}+T+{i})*cos(Y/{}-T/2)':cb='{}+{amp}*sin(2*PI*2*X/160+{i})':cr='{}+{amp}*cos(2*PI*2*Y/90+{i})'",
+                f + 7,
+                128 + du,
+                128 + dv
+            )
+        })
+        .collect();
+    let mut a = strs(&["-hide_banner", "-loglevel", "error", "-y"]);
+    for s in &srcs {
+        a.extend(strs(&["-f", "lavfi", "-i", s]));
+    }
+    a.extend(strs(&[
+        "-filter_complex",
+        "[0:v][1:v][2:v][3:v][4:v]concat=n=5:v=1:a=0[v]",
+        "-map",
+        "[v]",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "14",
+        "-pix_fmt",
+        "yuv420p",
+    ]));
+    if sparse_keys {
+        a.extend(strs(&["-g", "9999", "-sc_threshold", "0"]));
+    } else {
+        a.extend(strs(&["-g", "25", "-force_key_frames", "expr:gte(t,n_forced*3)"]));
+    }
+    let out = d.join(name);
+    a.push(out.to_string_lossy().into_owned());
+    run_ffmpeg_capture(ff, &a, Duration::from_secs(120)).await.ok().map(|_| out)
+}
+
+fn ms_close(a: u64, b: u64, tol: u64) -> bool {
+    a.abs_diff(b) <= tol
+}
+
+/// 取视频某一时刻的一帧，统计色彩。
+async fn stats_at(ff: &Path, file: &Path, t: f64) -> FrameStats {
+    let a = strs(&[
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        &format!("{t:.3}"),
+        "-i",
+        &file.to_string_lossy(),
+        "-vf",
+        "scale=64:36:flags=area,format=yuv444p",
+        "-frames:v",
+        "1",
+        "-f",
+        "rawvideo",
+        "-",
+    ]);
+    let raw = run_ffmpeg_capture(ff, &a, Duration::from_secs(30)).await.unwrap().0;
+    let n = 64 * 36;
+    colormatch::frame_stats(&raw[..n], &raw[n..2 * n], &raw[2 * n..3 * n])
+}
+
+fn dist_to_ref(s: &FrameStats, r: &FrameStats) -> f64 {
+    ((s.nu - r.nu).hypot(s.nv - r.nv)).max((s.y - r.y).abs() / 4.0)
+}
+
+#[tokio::test]
+async fn color_outliers_between_shots_are_found_and_corrected() {
+    let (ff, d, caps) = need!(setup("colormatch").await);
+    let src = need!(mashup(&ff, &d, "m.mp4", false).await);
+    let facts = facts::read(&ff, &src).await.unwrap();
+    let a = colormatch::analyze(&ff, &src, &facts, &caps).await.expect("analyze");
+    let rep = a.report();
+    assert_eq!(rep.shots_total, 5, "{rep:?}");
+    let ids: Vec<(u64, u64)> = rep.flagged.iter().map(|f| (f.start_ms, f.end_ms)).collect();
+    assert_eq!(ids.len(), 2, "只有第 2、4 个镜头不一致：{rep:?}");
+    // 分界精确到帧（25 帧 = 40 毫秒）
+    assert!(ms_close(ids[0].0, 3000, 45) && ms_close(ids[0].1, 6000, 45), "{ids:?}");
+    assert!(ms_close(ids[1].0, 9000, 45) && ms_close(ids[1].1, 12000, 45), "{ids:?}");
+    assert!(rep.flagged[0].defects.contains(&"偏黄".to_string()), "{:?}", rep.flagged[0]);
+    let second = &rep.flagged[1].defects;
+    assert!(second.contains(&"偏亮".to_string()) && second.contains(&"饱和度偏低".to_string()), "{second:?}");
+
+    // 处理：校正后再分析，应该没有不一致的镜头；一致的镜头不动
+    let mut spec = preset("mashup").unwrap();
+    spec.match_color = 1.0;
+    let (out, plan, _) = normalize(&ff, &src, &spec, &caps, &d).await;
+    assert!(plan.notes.iter().any(|n| n.contains("分段色彩匹配：2 个镜头")), "{:?}", plan.notes);
+    let f2 = facts::read(&ff, &out).await.unwrap();
+    let after = colormatch::analyze(&ff, &out, &f2, &caps).await.expect("analyze after");
+    assert!(after.report().flagged.is_empty(), "校正后不应再有不一致的镜头：{:?}", after.report());
+
+    // 逐个镜头的中间时刻各取一帧比较：一致的镜头（1、3、5）不该被改动，不一致的（2、4）要向整体靠拢
+    let mid = [1.5, 4.5, 7.5, 10.5, 13.5];
+    let mut before = vec![];
+    let mut now = vec![];
+    for t in mid {
+        before.push(stats_at(&ff, &src, t).await);
+        now.push(stats_at(&ff, &out, t).await);
+    }
+    for i in [0, 2, 4] {
+        let (b, n) = (&before[i], &now[i]);
+        assert!(
+            (b.y - n.y).abs() < 3.0 && (b.nu - n.nu).abs() < 2.5 && (b.nv - n.nv).abs() < 2.5 && (b.sat - n.sat).abs() < 1.5,
+            "镜头 {i} 本来一致，不该被改动：{b:?} → {n:?}"
+        );
+    }
+    // 整体的色调：三个一致镜头的平均
+    let r = FrameStats {
+        y: (before[0].y + before[2].y + before[4].y) / 3.0,
+        nu: (before[0].nu + before[2].nu + before[4].nu) / 3.0,
+        nv: (before[0].nv + before[2].nv + before[4].nv) / 3.0,
+        sat: (before[0].sat + before[2].sat + before[4].sat) / 3.0,
+        ..Default::default()
+    };
+    for i in [1, 3] {
+        let (b, n) = (dist_to_ref(&before[i], &r), dist_to_ref(&now[i], &r));
+        assert!(n < b * 0.35, "镜头 {i} 和整体的差距应该大幅缩小：{b:.1} → {n:.1}（{:?} → {:?}）", before[i], now[i]);
+    }
+    // 饱和度偏低的那个镜头：饱和度向整体靠拢
+    assert!((now[3].sat - r.sat).abs() < (before[3].sat - r.sat).abs() * 0.6, "{:?} → {:?}，整体 {r:?}", before[3], now[3]);
+}
+
+#[tokio::test]
+async fn sparse_keyframes_fall_back_to_timed_sampling() {
+    let (ff, d, caps) = need!(setup("colormatch-sparse").await);
+    let src = need!(mashup(&ff, &d, "s.mp4", true).await);
+    let facts = facts::read(&ff, &src).await.unwrap();
+    let a = colormatch::analyze(&ff, &src, &facts, &caps).await.expect("analyze");
+    let rep = a.report();
+    let ids: Vec<(u64, u64)> = rep.flagged.iter().map(|f| (f.start_ms, f.end_ms)).collect();
+    assert_eq!(ids.len(), 2, "{rep:?}");
+    // 没有关键帧也能靠场景检测定位到帧
+    assert!(ms_close(ids[0].0, 3000, 45) && ms_close(ids[0].1, 6000, 45), "{ids:?}");
+    assert!(ms_close(ids[1].0, 9000, 45) && ms_close(ids[1].1, 12000, 45), "{ids:?}");
+}
+
+#[tokio::test]
+async fn consistent_footage_is_left_alone() {
+    let (ff, d, caps) = need!(setup("colormatch-same").await);
+    // 内容各不相同、但色调一致的五个镜头（自然的亮度、饱和度差别）：一个都不该被改
+    let natural = need!(
+        mashup_of(&ff, &d, "n.mp4", false, [(100, 18, 0, 0, 10), (118, 26, 1, -1, 12), (108, 14, 0, 1, 9), (96, 22, -1, 0, 11), (122, 30, 0, 0, 10)]).await
+    );
+    let nf = facts::read(&ff, &natural).await.unwrap();
+    let na = colormatch::analyze(&ff, &natural, &nf, &caps).await.expect("analyze");
+    assert!(na.report().flagged.is_empty(), "{:?}", na.report());
+    // 色彩很浓、画面一直在变的测试图：同样不该被当成不一致
+    let src =
+        need!(gen(&ff, &d, "same.mp4", &["-f", "lavfi", "-i", "testsrc2=s=320x180:r=25:d=12"], &["-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "25"]).await);
+    let facts = facts::read(&ff, &src).await.unwrap();
+    let a = colormatch::analyze(&ff, &src, &facts, &caps).await.expect("analyze");
+    assert!(a.report().flagged.is_empty(), "{:?}", a.report());
+    let mut spec = preset("mashup").unwrap();
+    spec.size = "keep".into();
+    let (_, plan, _) = normalize(&ff, &src, &spec, &caps, &d).await;
+    assert!(!plan.notes.iter().any(|n| n.contains("个镜头单独校正")), "{:?}", plan.notes);
+}
+
+#[tokio::test]
+async fn excluded_shots_and_preview_use_the_same_plan() {
+    let (ff, d, caps) = need!(setup("colormatch-preview").await);
+    let src = need!(mashup(&ff, &d, "p.mp4", false).await);
+    let facts = facts::read(&ff, &src).await.unwrap();
+    let a = colormatch::analyze(&ff, &src, &facts, &caps).await.expect("analyze");
+    let full = a.plan(1.0, &[]);
+    assert_eq!(full.fixes.len(), 2);
+    // 取消第 2 个镜头（开头约 3000 毫秒）：只剩第 4 个
+    let skip = a.report().flagged[0].id;
+    assert_eq!(a.plan(1.0, &[skip]).fixes.len(), 1);
+
+    // 预览：在第 2 个镜头里（4 秒处）截一帧，处理后的偏色应该比处理前小得多
+    let spec = NormSpec { match_color: 1.0, ..Default::default() };
+    let an = Analysis { color: Some(full.shifted(4000)), ..Default::default() };
+    let vg = video_graph(&spec, &facts, &an, &caps, &d.join("tmp"), "yuv420p", true).unwrap();
+    let (before, after) = analyze::preview(&ff, &src, 4000, vg.graph.as_deref(), &d, "pv").await.unwrap();
+    let stat = |f: &Path| {
+        let ff = ff.clone();
+        let f = f.to_path_buf();
+        async move {
+            let a = strs(&[
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                &f.to_string_lossy(),
+                "-vf",
+                "scale=64:36:flags=area,format=yuv444p",
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-",
+            ]);
+            let raw = run_ffmpeg_capture(&ff, &a, Duration::from_secs(30)).await.unwrap().0;
+            let n = 64 * 36;
+            colormatch::frame_stats(&raw[..n], &raw[n..2 * n], &raw[2 * n..3 * n])
+        }
+    };
+    let (b, n) = (stat(&before).await, stat(&after).await);
+    let (_, r) = a.looks();
+    assert!(dist_to_ref(&n, &r.st) < dist_to_ref(&b, &r.st) * 0.5, "预览应该已经校正：{b:?} → {n:?}");
+    // 同一时刻之外（第 3 个镜头，7 秒处）预览不应有任何改动
+    let an2 = Analysis { color: Some(full.shifted(7000)), ..Default::default() };
+    let vg2 = video_graph(&spec, &facts, &an2, &caps, &d.join("tmp"), "yuv420p", true).unwrap();
+    let (b2, a2) = analyze::preview(&ff, &src, 7000, vg2.graph.as_deref(), &d, "pv2").await.unwrap();
+    let (sb, sa) = (stat(&b2).await, stat(&a2).await);
+    assert!((sb.y - sa.y).abs() < 2.0 && (sb.nu - sa.nu).abs() < 2.0, "{sb:?} → {sa:?}");
 }

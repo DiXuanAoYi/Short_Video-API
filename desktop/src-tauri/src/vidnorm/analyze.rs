@@ -144,7 +144,7 @@ pub async fn measure_loudness(ffmpeg: &Path, file: &Path, target: f64) -> Option
 /// 界面里“检测”按钮用的分析：帧率和黑边（响度要读完整段音频，放到真正处理时再测）。
 pub async fn analyze_quick(ffmpeg: &Path, file: &Path, facts: &Facts) -> Analysis {
     let (vfr, crop) = tokio::join!(detect_vfr(ffmpeg, file), detect_crop(ffmpeg, file, facts));
-    Analysis { vfr, crop, loudness: None }
+    Analysis { vfr, crop, ..Default::default() }
 }
 
 // ---------- 预览 ----------

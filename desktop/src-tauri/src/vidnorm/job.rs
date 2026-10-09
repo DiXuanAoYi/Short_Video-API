@@ -93,8 +93,29 @@ pub async fn run_normalize(ctx: &JobCtx, job: &ToolJob, spec: &NormSpec) -> AppR
         ctx.check()?;
     }
 
+    // 分段色彩匹配：分析镜头之间的色彩，找出和整体不一致的镜头
+    let mut color_notes: Vec<String> = vec![];
+    let mut color_warnings: Vec<String> = vec![];
+    if spec.match_color > 0.0 {
+        ctx.note("正在分析镜头之间的色彩…");
+        match super::colormatch::analyze_cached(&ffmpeg, &input, &facts, &caps).await {
+            Ok(a) => {
+                let color = a.plan(spec.match_color, &spec.match_exclude);
+                if color.fixes.is_empty() {
+                    color_notes.push(a.note.clone().unwrap_or_else(|| "没有需要校正的镜头".into()));
+                } else {
+                    an.color = Some(color);
+                }
+            }
+            Err(e) => color_warnings.push(format!("分段色彩匹配没有做：{e}")),
+        }
+        ctx.check()?;
+    }
+
     let tmp = tmp_dir(ctx);
-    let plan = build(&input, &spec, &facts, &an, &caps, &tmp)?;
+    let mut plan = build(&input, &spec, &facts, &an, &caps, &tmp)?;
+    plan.notes.extend(color_notes);
+    plan.warnings.extend(color_warnings);
     let note = join_notes(&plan.notes, &plan.warnings);
     if plan.unchanged {
         ctx.note(format!("已经符合所选规格，没有生成新文件。{note}"));
