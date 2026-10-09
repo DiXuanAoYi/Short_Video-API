@@ -124,6 +124,8 @@ jobs:
             - macOS：安装包未经 Apple 公证。首次打开如果被拦截，到“系统设置 → 隐私与安全性”，在页面下方点“仍要打开”；如果提示“已损坏，无法打开”，在终端执行 `xattr -cr /Applications/ClearClip.app` 后再打开。
             - YouTube 等网站需要的 yt-dlp、ffmpeg 组件在“设置 → 组件”中一键安装，国内网络可填写 GitHub 镜像。
 
+            本版本的新增内容见 [更新记录](https://github.com/DiXuanAoYi/Short_Video-API/blob/main/desktop/CHANGELOG.md)。
+
             仅用于下载你有权保存的内容。
           releaseDraft: false
           prerelease: false
