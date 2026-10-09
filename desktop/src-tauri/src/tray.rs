@@ -1,11 +1,11 @@
 //! 系统托盘、主窗口 / 迷你窗的显示控制。
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, LogicalSize, Manager, PhysicalPosition, Wry};
+use tauri::{AppHandle, LogicalSize, Manager, PhysicalPosition, WebviewWindow, Wry};
 
 use crate::{clipboard, AppState};
 
@@ -140,6 +140,7 @@ pub fn spawn_speed_ticker(app: &AppHandle) {
         let mut last = String::new();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            hide_stray_small_windows(&app);
             let st = app.state::<Arc<AppState>>();
             let snaps = st.downloads.snapshots();
             let running: Vec<_> = snaps.iter().filter(|s| s.status == crate::download::TaskStatus::Running).collect();
@@ -163,6 +164,47 @@ pub fn main_is_focused(app: &AppHandle) -> bool {
     app.get_webview_window("main").map(|w| w.is_visible().unwrap_or(false) && w.is_focused().unwrap_or(false)).unwrap_or(false)
 }
 
+/// 迷你窗这次运行里是否被程序主动显示过。没显示过却出现在屏幕上的，一律收起来。
+static MINI_SHOWN: AtomicBool = AtomicBool::new(false);
+
+/// 工作区右下角的位置：窗口右边缘、下边缘离工作区边缘 `right`、`bottom`（物理像素）。
+/// `area` 是工作区的 (x, y, 宽, 高)，`size` 是窗口的物理尺寸。
+fn corner_position(area: (i32, i32, u32, u32), size: (u32, u32), right: i32, bottom: i32) -> (i32, i32) {
+    let (x, y, w, h) = area;
+    (x + w as i32 - size.0 as i32 - right, y + h as i32 - size.1 as i32 - bottom)
+}
+
+/// 窗口所在屏幕右下角的位置（边距按逻辑像素给）。
+fn corner_of(w: &WebviewWindow, size: LogicalSize<f64>, right: f64, bottom: f64) -> Option<(i32, i32)> {
+    let monitor = w.current_monitor().ok().flatten().or_else(|| w.primary_monitor().ok().flatten())?;
+    let scale = monitor.scale_factor();
+    let phys = size.to_physical::<u32>(scale);
+    let area = monitor.work_area();
+    Some(corner_position(
+        (area.position.x, area.position.y, area.size.width, area.size.height),
+        (phys.width, phys.height),
+        (right * scale) as i32,
+        (bottom * scale) as i32,
+    ))
+}
+
+/// 在指定位置显示小窗（不抢焦点）。
+///
+/// Windows 上窗口第一次显示时，可能把位置改回系统默认的左上角、忽略显示前设置的尺寸，
+/// 还会把原生标题栏的样式带回来，所以显示前后各放一次位置和尺寸，显示后再去掉标题栏样式。
+fn show_at(w: &WebviewWindow, pos: Option<(i32, i32)>, size: LogicalSize<f64>) {
+    let place = || {
+        if let Some((x, y)) = pos {
+            let _ = w.set_position(PhysicalPosition::new(x, y));
+        }
+        let _ = w.set_size(size);
+    };
+    place();
+    let _ = w.show();
+    crate::winframe::strip_caption(w);
+    place();
+}
+
 /// 显示或隐藏悬浮拖拽窗；首次显示时放在屏幕右侧、迷你窗上方。
 pub fn apply_float(app: &AppHandle, on: bool) {
     let Some(w) = app.get_webview_window("float") else { return };
@@ -173,20 +215,9 @@ pub fn apply_float(app: &AppHandle, on: bool) {
     if app.try_state::<Arc<AppState>>().is_some_and(|st| crate::security::status(&st).locked) {
         return;
     }
-    if !w.is_visible().unwrap_or(false) {
-        if let Ok(Some(monitor)) = w.current_monitor().or_else(|_| w.primary_monitor()) {
-            let scale = monitor.scale_factor();
-            let size = LogicalSize::new(FLOAT_W, FLOAT_H).to_physical::<u32>(scale);
-            let area = monitor.work_area();
-            let x = area.position.x + area.size.width as i32 - size.width as i32 - (24.0 * scale) as i32;
-            let y = area.position.y + area.size.height as i32 - size.height as i32 - (MINI_H * scale) as i32 - (40.0 * scale) as i32;
-            let _ = w.set_position(PhysicalPosition::new(x, y));
-        }
-        let _ = w.set_size(LogicalSize::new(FLOAT_W, FLOAT_H));
-    }
-    let _ = w.show();
-    // 有的系统在窗口第一次显示时会忽略显示前设置的尺寸，显示后再设置一次
-    let _ = w.set_size(LogicalSize::new(FLOAT_W, FLOAT_H));
+    let size = LogicalSize::new(FLOAT_W, FLOAT_H);
+    let pos = if w.is_visible().unwrap_or(false) { None } else { corner_of(&w, size, 24.0, MINI_H + 40.0) };
+    show_at(&w, pos, size);
 }
 
 /// 在屏幕右下角显示迷你窗（不抢焦点）。
@@ -196,19 +227,52 @@ pub fn show_mini(app: &AppHandle) {
         return;
     }
     let Some(w) = app.get_webview_window("mini") else { return };
-    if let Ok(Some(monitor)) = w.current_monitor().or_else(|_| w.primary_monitor()) {
-        let scale = monitor.scale_factor();
-        // 首次显示前窗口尺寸可能还是 1×1，此时按配置的逻辑尺寸计算
-        let size: tauri::PhysicalSize<u32> =
-            w.outer_size().ok().filter(|s| s.width > 100).unwrap_or_else(|| LogicalSize::new(MINI_W, MINI_H).to_physical(scale));
-        let area = monitor.work_area();
-        let margin = (16.0 * scale) as i32;
-        let x = area.position.x + area.size.width as i32 - size.width as i32 - margin;
-        let y = area.position.y + area.size.height as i32 - size.height as i32 - margin;
-        let _ = w.set_position(PhysicalPosition::new(x, y));
+    let size = LogicalSize::new(MINI_W, MINI_H);
+    MINI_SHOWN.store(true, Ordering::SeqCst);
+    show_at(&w, corner_of(&w, size, 16.0, 16.0), size);
+}
+
+/// 迷你窗、悬浮拖拽窗是配置里预先建好的隐藏窗口：页面第一次加载完成时，没有理由显示的就收起来，
+/// 不让它们出现在启动时的屏幕上。
+pub fn on_small_window_loaded(app: &AppHandle, label: &str) {
+    match label {
+        "mini" if !MINI_SHOWN.load(Ordering::SeqCst) => {
+            if let Some(w) = app.get_webview_window("mini") {
+                let _ = w.hide();
+            }
+        }
+        "float" => {
+            if let Some(st) = app.try_state::<Arc<AppState>>() {
+                let want = st.settings_raw().float_ball && !crate::security::status(&st).locked;
+                if !want {
+                    apply_float(app, false);
+                }
+            }
+        }
+        _ => {}
     }
-    let _ = w.set_size(LogicalSize::new(MINI_W, MINI_H));
-    let _ = w.show();
+}
+
+/// 兜底：小窗不该出现却出现了（没被程序显示过的迷你窗、设置里关掉了或已锁定时的悬浮窗），就收起来。
+fn hide_stray_small_windows(app: &AppHandle) {
+    if !MINI_SHOWN.load(Ordering::SeqCst) {
+        if let Some(w) = app.get_webview_window("mini") {
+            if w.is_visible().unwrap_or(false) {
+                log::warn!("迷你窗没有被显示却出现在屏幕上，已收起");
+                let _ = w.hide();
+            }
+        }
+    }
+    let Some(st) = app.try_state::<Arc<AppState>>() else { return };
+    let want = st.settings_raw().float_ball && !crate::security::status(&st).locked;
+    if !want {
+        if let Some(w) = app.get_webview_window("float") {
+            if w.is_visible().unwrap_or(false) {
+                log::warn!("悬浮窗不该显示却出现在屏幕上，已收起");
+                let _ = w.hide();
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -222,6 +286,17 @@ mod tests {
         assert_eq!(speed_text(2048), "2 KB/s");
         assert_eq!(speed_text(3_355_443), "3.2 MB/s");
         assert_eq!(speed_text(5 * 1024 * 1024 * 1024), "5.0 GB/s");
+    }
+
+    #[test]
+    fn corner_is_inside_the_work_area() {
+        // 1920×1040 的工作区（任务栏在下面），窗口 400×245（125% 缩放下的迷你窗），边距 20
+        assert_eq!(corner_position((0, 0, 1920, 1040), (400, 245), 20, 20), (1500, 775));
+        // 工作区不从原点开始（副屏在左边）
+        assert_eq!(corner_position((-1920, 0, 1920, 1080), (195, 80), 30, 300), (-1920 + 1920 - 195 - 30, 1080 - 80 - 300));
+        // 窗口比工作区还大时不会算出溢出的数
+        let (x, y) = corner_position((0, 0, 100, 100), (400, 400), 0, 0);
+        assert!(x <= 0 && y <= 0);
     }
 
     #[test]
