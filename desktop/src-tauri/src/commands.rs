@@ -81,6 +81,12 @@ pub async fn save_settings(app: AppHandle, state: St<'_>, settings: Settings) ->
     if old.shortcut != s.shortcut || old.security.panic_shortcut != s.security.panic_shortcut {
         apply_shortcut(&app, &s.shortcut);
     }
+    if old.language != s.language {
+        tray::apply_language(&app, crate::i18n::is_en(&s.language));
+    }
+    if old.float_ball != s.float_ball {
+        tray::apply_float(&app, s.float_ball);
+    }
     if old.security.content_protection != s.security.content_protection {
         crate::security::apply_window_protection(&app, s.security.content_protection);
     }
@@ -504,6 +510,11 @@ pub async fn open_tools_dir(app: AppHandle, state: St<'_>) -> AppResult<()> {
 #[tauri::command]
 pub fn list_tasks(state: St<'_>) -> Vec<TaskSnapshot> {
     state.downloads.snapshots()
+}
+
+#[tauri::command]
+pub fn task_detail(app: AppHandle, id: i64) -> AppResult<download::TaskDetail> {
+    download::task_detail(&app, id).ok_or_else(|| AppError::not_found("任务不存在或已被移除"))
 }
 
 #[tauri::command]

@@ -271,6 +271,11 @@ impl Db {
         Ok(())
     }
 
+    /// 这个路径是不是媒体库里的文件。
+    pub fn path_known(&self, path: &str) -> bool {
+        self.conn().query_row("SELECT 1 FROM downloads WHERE path = ?1 LIMIT 1", params![path], |_| Ok(())).optional().ok().flatten().is_some()
+    }
+
     /// 一键清除：按选项删除各类记录，并把数据库文件压缩（旧内容不再留在文件里）。
     /// 返回被跳过的项目说明。回收站记录不动，免得里面的文件变成找不回来的孤儿。
     pub fn wipe(&self, w: &DbWipe) -> AppResult<Vec<String>> {

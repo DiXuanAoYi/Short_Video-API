@@ -588,6 +588,9 @@ export interface Settings {
   speedSchedule: SpeedWindow[]
   meteredMode: boolean
   security: SecuritySettings
+  onboarded: boolean
+  language: 'zh' | 'en' | 'ja'
+  floatBall: boolean
 }
 
 export interface SecuritySettings {
@@ -937,4 +940,49 @@ export interface InboxSettings {
   recordClipboard: boolean
   keepDays: number
   maxItems: number
+}
+
+export interface LogLine {
+  /** Unix 毫秒 */
+  at: number
+  text: string
+}
+
+export interface RequestInfo {
+  label: string
+  protocol: string
+  url: string
+  headers: [string, string][]
+  route: string
+}
+
+export interface TaskDetail {
+  task: TaskSnapshot
+  sourceUrl: string
+  log: LogLine[]
+  requests: RequestInfo[]
+  partFiles: string[]
+  post: string[]
+}
+
+export interface PlayerCue {
+  startMs: number
+  endMs: number
+  text: string
+}
+
+export interface PlayerTrack {
+  label: string
+  path: string
+  cues: PlayerCue[]
+}
+
+export interface PlayerSource {
+  path: string
+  /** 播放地址（本机媒体服务） */
+  url: string
+  title: string
+  kind: 'video' | 'audio'
+  ext: string
+  tracks: PlayerTrack[]
 }

@@ -21,6 +21,12 @@ export const useAppStore = defineStore('app', () => {
   const loginRequest = ref<string | null>(null)
   /** 应用锁状态；locked 时界面被锁屏遮住 */
   const lock = ref<LockStatus>({ enabled: false, locked: false, lockedOutSecs: 0 })
+  /** 内置播放器：要播放的文件和起始位置；为 null 时关闭 */
+  const player = ref<{ path: string; startMs?: number } | null>(null)
+  /** 命令面板请求媒体库按关键词搜索；处理后清空 */
+  const libraryQuery = ref<string | null>(null)
+  /** 命令面板请求解析页解析这段文字；处理后清空 */
+  const pendingParse = ref<string | null>(null)
   /** 请求工具箱打开并预选文件（媒体库里的“用工具箱处理”）；处理后清空 */
   const toolboxRequest = ref<{ paths: string[]; tool?: string; tab?: 'video' | 'subtitle' | 'tags' | 'ai'; aiMode?: 'transcribe' | 'translate' | 'summarize' } | null>(null)
 
@@ -32,6 +38,16 @@ export const useAppStore = defineStore('app', () => {
   function goToolbox(paths: string[], tool?: string, extra?: { tab?: 'video' | 'subtitle' | 'tags' | 'ai'; aiMode?: 'transcribe' | 'translate' | 'summarize' }) {
     toolboxRequest.value = { paths, tool, ...extra }
     view.value = 'tools'
+  }
+
+  function openPlayer(path: string, startMs?: number) {
+    player.value = { path, startMs }
+  }
+
+  function goLibraryQuery(q: string) {
+    libraryQuery.value = q
+    libraryTab.value = 'files'
+    view.value = 'library'
   }
 
   function goLibrary(tab: LibraryTab) {
@@ -77,7 +93,7 @@ export const useAppStore = defineStore('app', () => {
   }
   media.addEventListener('change', applyTheme)
 
-  return { settings, info, view, settingsTab, shortcutError, libraryTab, inboxUnhandled, loginRequest, lock, toolboxRequest, refreshLock, goSettings, goLibrary, goToolbox, goLogin, load, save, patch, applyTheme }
+  return { settings, info, view, settingsTab, shortcutError, libraryTab, inboxUnhandled, loginRequest, lock, libraryQuery, pendingParse, player, openPlayer, goLibraryQuery, toolboxRequest, refreshLock, goSettings, goLibrary, goToolbox, goLogin, load, save, patch, applyTheme }
 })
 
 /** 下载队列，监听后端事件保持同步。 */

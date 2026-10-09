@@ -135,9 +135,12 @@ pub fn lock_now(app: &AppHandle) -> bool {
         return false;
     }
     st.lock.set(true);
+    st.media.clear();
     seal_safebox(&st);
-    if let Some(m) = app.get_webview_window("mini") {
-        let _ = m.hide();
+    for label in ["mini", "float"] {
+        if let Some(w) = app.get_webview_window(label) {
+            let _ = w.hide();
+        }
     }
     let _ = app.emit(EVT_LOCK, serde_json::json!({ "locked": true }));
     true
@@ -158,6 +161,7 @@ pub fn unlock(app: &AppHandle, st: &AppState, password: &str) -> AppResult<()> {
     }
     st.lock.throttle.ok();
     st.lock.set(false);
+    crate::tray::apply_float(app, st.settings_raw().float_ball);
     let _ = app.emit(EVT_LOCK, serde_json::json!({ "locked": false }));
     Ok(())
 }
@@ -219,13 +223,16 @@ pub fn apply_window_protection(app: &AppHandle, on: bool) {
 
 /// 弹系统通知。隐私模式或已锁定时不显示内容：`title_safe` 为真（标题本身不含作品名、主播名）时标题照常显示。
 pub fn system_notification(app: &AppHandle, title: &str, body: &str, title_safe: bool) {
+    use crate::i18n::tr;
     use tauri_plugin_notification::NotificationExt;
     let st = app.state::<Arc<AppState>>();
-    let hide = st.settings_raw().security.privacy_mode || (lock_enabled(&st) && st.lock.is_locked());
+    let settings = st.settings_raw();
+    let en = crate::i18n::is_en(&settings.language);
+    let hide = settings.security.privacy_mode || (lock_enabled(&st) && st.lock.is_locked());
     let (t, b) = match (hide, title_safe) {
-        (false, _) => (title, body),
-        (true, true) => (title, "详情请打开清影查看"),
-        (true, false) => ("清影", "有新消息"),
+        (false, _) => (tr(en, title), body.to_string()),
+        (true, true) => (tr(en, title), tr(en, "详情请打开清影查看")),
+        (true, false) => (tr(en, "清影"), tr(en, "有新消息")),
     };
     let _ = app.notification().builder().title(t).body(b).show();
 }

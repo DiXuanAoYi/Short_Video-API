@@ -12,12 +12,14 @@ pub mod diagnostics;
 pub mod download;
 pub mod engine;
 pub mod error;
+pub mod i18n;
 pub mod inbox;
 pub mod library;
 pub mod library_cmds;
 pub mod library_media;
 pub mod live;
 pub mod media_cmds;
+pub mod media_server;
 pub mod media_tools;
 pub mod model;
 pub mod naming;
@@ -25,6 +27,7 @@ pub mod net;
 pub mod notify;
 pub mod organize;
 pub mod phone;
+pub mod player;
 pub mod postprocess;
 pub mod power;
 pub mod providers;
@@ -92,6 +95,8 @@ pub struct AppState {
     pub lock: security::LockState,
     /// 加密保险箱
     pub safebox: safebox::Safebox,
+    /// 内置播放器用的本机媒体服务
+    pub media: media_server::MediaServer,
 }
 
 impl AppState {
@@ -258,6 +263,8 @@ pub fn run() {
             }
             // 保险箱解密出来临时查看的文件，上次没清掉的也一并清理
             safebox::shred_dir(&data_dir.join(security::VIEW_DIR));
+            let (media, media_listener) = media_server::MediaServer::bind().map_err(|e| format!("无法启动播放器的本机服务：{e}"))?;
+            tauri::async_runtime::spawn(media.clone().serve(media_listener));
             app.manage(Arc::new(AppState {
                 settings: RwLock::new(settings.clone()),
                 settings_path,
@@ -283,6 +290,7 @@ pub fn run() {
                 vault,
                 lock: security::LockState::new(locked),
                 safebox: safebox::Safebox::new(data_dir.join("safebox")),
+                media,
             }));
             // 媒体库封面缓存通过 asset 协议显示
             let covers = data_dir.join("covers");
@@ -311,9 +319,11 @@ pub fn run() {
             library_cmds::spawn_maintenance(&handle);
             security::spawn_idle_watch(&handle);
             security::apply_window_protection(&handle, settings.security.content_protection);
+            tray::apply_float(&handle, settings.float_ball && !locked);
             spawn_account_reminders(handle.clone());
 
             tray::create(&handle)?;
+            tray::spawn_speed_ticker(&handle);
             commands::apply_shortcut(&handle, &settings.shortcut);
             clipboard::start_watcher(handle.clone());
             phone::restore(&handle);
@@ -349,7 +359,7 @@ pub fn run() {
                             app.exit(0);
                         }
                     }
-                    "mini" => {
+                    "mini" | "float" => {
                         api.prevent_close();
                         let _ = window.hide();
                     }
@@ -414,6 +424,7 @@ pub fn run() {
             commands::phone_revoke,
             commands::phone_pair_respond,
             commands::list_tasks,
+            commands::task_detail,
             commands::pause_task,
             commands::resume_task,
             commands::cancel_task,
@@ -502,6 +513,7 @@ pub fn run() {
             commands::save_login_cookies,
             commands::check_update,
             commands::install_update,
+            player::player_source,
             security_cmds::lock_status,
             security_cmds::lock_set_password,
             security_cmds::lock_remove_password,

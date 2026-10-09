@@ -34,6 +34,23 @@
         "skipTaskbar": true,
         "visible": false,
         "focus": false
+      },
+      {
+        "label": "float",
+        "title": "清影拖拽区",
+        "url": "index.html#float",
+        "width": 156,
+        "height": 64,
+        "resizable": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "focus": false,
+        "dragDropEnabled": false,
+        "shadow": true,
+        "minWidth": 120,
+        "minHeight": 48
       }
     ],
     "security": {

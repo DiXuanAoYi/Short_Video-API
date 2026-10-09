@@ -151,7 +151,8 @@ function cover(i: LibraryItem) {
         <div v-if="!item.exists" class="miss">文件已不在原位置</div>
       </div>
       <div class="acts">
-        <el-button size="small" type="primary" :disabled="!item.exists" @click="api.openFile(item.path)">打开</el-button>
+        <el-button v-if="item.kind === 'video' || item.kind === 'audio'" size="small" type="primary" :disabled="!item.exists" @click="app.openPlayer(item.path)">播放</el-button>
+        <el-button size="small" :type="item.kind === 'video' || item.kind === 'audio' ? undefined : 'primary'" :disabled="!item.exists" @click="api.openFile(item.path)">{{ item.kind === 'video' || item.kind === 'audio' ? '用系统程序打开' : '打开' }}</el-button>
         <el-button size="small" :disabled="!item.exists" @click="api.revealFile(item.path)">所在文件夹</el-button>
         <el-button v-if="item.sourceUrl" size="small" @click="copyUrl">复制原链接</el-button>
         <el-button v-if="item.exists && (item.kind === 'video' || item.kind === 'audio')" size="small" @click="toTools">用工具箱处理…</el-button>

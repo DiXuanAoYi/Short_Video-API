@@ -162,6 +162,28 @@ struct Entry {
     media: Arc<MediaInfo>,
     ctrl: watch::Sender<u8>,
     meta: JobMeta,
+    /// 任务详情里显示的过程记录（只在内存里，最多保留最近 300 条）
+    log: Vec<LogLine>,
+}
+
+/// 任务过程记录里的一行。`at` 是 Unix 毫秒。
+#[derive(Debug, Clone, Serialize)]
+pub struct LogLine {
+    pub at: i64,
+    pub text: String,
+}
+
+const LOG_CAP: usize = 300;
+
+/// 给任务追加一条过程记录。
+pub(crate) fn task_log(st: &AppState, id: i64, text: impl Into<String>) {
+    let line = LogLine { at: chrono::Utc::now().timestamp_millis(), text: text.into() };
+    with_entry(st, id, |e| {
+        if e.log.len() >= LOG_CAP {
+            e.log.remove(0);
+        }
+        e.log.push(line);
+    });
 }
 
 #[derive(Default)]
@@ -315,7 +337,7 @@ pub fn restore(app: &AppHandle) {
             if status == TaskStatus::Paused && received > 0 {
                 snap.note = Some(format!("上次下载到 {}，继续时从这里开始", human_bytes(received)));
             }
-            let e = Entry { snap, spec, media: Arc::new(media), ctrl, meta };
+            let e = Entry { snap, spec, media: Arc::new(media), ctrl, meta, log: Vec::new() };
             persist(&st, &e);
             list.push(e);
             restored += 1;
@@ -531,7 +553,14 @@ pub fn enqueue_ext(app: &AppHandle, media: MediaInfo, asset_ids: &[String], post
             let snap = snapshot_for(id, &media, &spec, &path_str, TaskStatus::Queued, now);
             result.tasks.push(snap.clone());
             let meta = JobMeta { inputs: vec![ResumeMeta::default(); spec.inputs.len()] };
-            list.push(Entry { snap, spec, media: media.clone(), ctrl, meta });
+            list.push(Entry {
+                snap,
+                spec,
+                media: media.clone(),
+                ctrl,
+                meta,
+                log: vec![LogLine { at: chrono::Utc::now().timestamp_millis(), text: "已加入队列".into() }],
+            });
         }
     }
     // 收到的链接里等待处理的同一作品，关联到这些任务
@@ -698,6 +727,15 @@ async fn run_task_body(app: AppHandle, id: i64, retry_ok: bool) {
     else {
         return;
     };
+    task_log(
+        &st,
+        id,
+        format!(
+            "开始下载：{} 个输入（{}）",
+            spec.inputs.len(),
+            spec.inputs.iter().map(|a| format!("{} · {}", a.label, protocol_name(a.protocol))).collect::<Vec<_>>().join("；")
+        ),
+    );
     let settings = st.settings();
     let count = spec.inputs.len();
     meta.inputs.resize(count, ResumeMeta::default());
@@ -1114,6 +1152,7 @@ async fn download_input(
                 if matches!(code, 403 | 404 | 410) && !re_resolved && !media.source_url.is_empty() && asset.protocol != Protocol::Ytdlp =>
             {
                 re_resolved = true;
+                task_log(st, id, format!("服务器返回 HTTP {code}，下载地址可能已过期"));
                 set_note(app, id, Some("下载地址已过期，正在重新解析…"));
                 let ctx = st.parse_ctx(settings);
                 let fresh = providers::resolve_url(&ctx, &media.source_url).await.map_err(|e| DlError::Other(format!("下载地址已过期，重新解析失败：{e}")))?;
@@ -1143,8 +1182,9 @@ async fn download_input(
             Err(DlError::Net(msg)) if net_attempts < settings.max_retries => {
                 net_attempts += 1;
                 log::info!("job {id} network error, retry {net_attempts}: {msg}");
-                set_note(app, id, Some(&format!("网络中断，第 {net_attempts} 次重试…")));
                 let delay = Duration::from_secs(settings.retry_delay_secs.saturating_mul(1 << (net_attempts - 1).min(5)));
+                task_log(st, id, format!("网络错误：{msg}；{} 秒后进行第 {net_attempts}/{} 次重试", delay.as_secs(), settings.max_retries));
+                set_note(app, id, Some(&format!("网络中断，第 {net_attempts} 次重试…")));
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
                     c = wait_ctrl(rx) => return Err(DlError::from_ctrl(c)),
@@ -1152,6 +1192,21 @@ async fn download_input(
             }
             other => return other,
         }
+    }
+}
+
+fn push_log(e: &mut Entry, text: String) {
+    if e.log.len() >= LOG_CAP {
+        e.log.remove(0);
+    }
+    e.log.push(LogLine { at: chrono::Utc::now().timestamp_millis(), text });
+}
+
+fn protocol_name(p: Protocol) -> &'static str {
+    match p {
+        Protocol::Http => "HTTP 直链",
+        Protocol::Hls => "m3u8 分片",
+        Protocol::Ytdlp => "yt-dlp",
     }
 }
 
@@ -1239,6 +1294,7 @@ fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>
                 }
                 match move_file(part, &dest) {
                     Ok(()) => {
+                        push_log(e, format!("下载完成（{}），已保存到 {}", human_bytes(size), dest.display()));
                         e.snap.file_path = dest.to_string_lossy().into_owned();
                         e.snap.status = TaskStatus::Done;
                         e.snap.received = size;
@@ -1271,14 +1327,19 @@ fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>
                         }
                     }
                     Err(err) => {
+                        push_log(e, format!("保存文件失败：{err}"));
                         e.snap.status = TaskStatus::Failed;
                         e.snap.error = Some(format!("保存文件失败：{err}"));
                         e.snap.error_kind = Some(ErrorKind::Disk);
                     }
                 }
             }
-            Err(DlError::Paused) => e.snap.status = TaskStatus::Paused,
+            Err(DlError::Paused) => {
+                push_log(e, format!("已暂停（已下载 {}）", human_bytes(e.snap.received)));
+                e.snap.status = TaskStatus::Paused;
+            }
             Err(DlError::Canceled) => {
+                push_log(e, "已取消".into());
                 e.snap.status = TaskStatus::Canceled;
                 if !settings.keep_part_on_cancel {
                     e.snap.received = 0;
@@ -1290,6 +1351,7 @@ fn finish(app: &AppHandle, st: &AppState, id: i64, outcome: Result<u64, DlError>
             }
             Err(err) => {
                 log::warn!("job {} failed: {err}", e.snap.id);
+                push_log(e, format!("失败（{:?}）：{err}", err.kind()));
                 if settings.auto_downgrade {
                     downgrade = Some((e.media.clone(), e.spec.clone(), err.kind()));
                 }
@@ -1516,6 +1578,9 @@ async fn keep_part_after_refresh(st: &AppState, settings: &Settings, media: &Med
 fn set_note(app: &AppHandle, id: i64, note: Option<&str>) {
     let st = state(app);
     with_entry(&st, id, |e| e.snap.note = note.map(String::from));
+    if let Some(n) = note {
+        task_log(&st, id, n);
+    }
     emit_all(app);
 }
 
@@ -1543,6 +1608,7 @@ pub fn resume(app: &AppHandle, id: i64) {
     let st = state(app);
     with_entry(&st, id, |e| {
         if matches!(e.snap.status, TaskStatus::Paused | TaskStatus::Failed | TaskStatus::Canceled) {
+            push_log(e, "继续 / 重试，重新排队".into());
             e.snap.status = TaskStatus::Queued;
             e.snap.error = None;
             e.snap.error_kind = None;
@@ -1611,6 +1677,120 @@ pub fn remove(app: &AppHandle, id: i64) {
         }
     }
     schedule(app);
+}
+
+/// 任务详情：过程记录、每个输入的原始请求（敏感信息已打码）、所在路径。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskDetail {
+    pub task: TaskSnapshot,
+    pub source_url: String,
+    pub log: Vec<LogLine>,
+    pub requests: Vec<RequestInfo>,
+    /// 下载中的临时文件
+    pub part_files: Vec<String>,
+    /// 后处理选项的文字说明
+    pub post: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestInfo {
+    pub label: String,
+    pub protocol: String,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    /// 使用的网络出口：直连 / 系统代理 / 自定义代理
+    pub route: String,
+}
+
+/// 链接里常见的令牌类参数只留前几个字符，复制给别人看时不会泄露登录态。
+pub fn mask_url(url: &str) -> String {
+    let Ok(mut u) = url::Url::parse(url) else { return url.to_string() };
+    let _ = u.set_username("");
+    let _ = u.set_password(None);
+    let pairs: Vec<(String, String)> = u.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+    if pairs.is_empty() {
+        return u.to_string();
+    }
+    u.set_query(None);
+    {
+        let mut q = u.query_pairs_mut();
+        for (k, v) in pairs {
+            let sensitive = matches!(
+                k.to_ascii_lowercase().as_str(),
+                "token" | "sign" | "signature" | "key" | "auth" | "sig" | "session" | "sessionid" | "password" | "passwd" | "secret"
+            );
+            if sensitive && v.chars().count() > 6 {
+                q.append_pair(&k, &format!("{}…", v.chars().take(4).collect::<String>()));
+            } else {
+                q.append_pair(&k, &v);
+            }
+        }
+    }
+    u.to_string()
+}
+
+/// 请求头的值：Cookie / 令牌只显示长度。
+pub fn mask_header(name: &str, value: &str) -> String {
+    match name.to_ascii_lowercase().as_str() {
+        "cookie" | "authorization" | "proxy-authorization" | "x-csrf-token" => format!("（已隐藏，{} 个字符）", value.chars().count()),
+        _ => value.to_string(),
+    }
+}
+
+pub fn task_detail(app: &AppHandle, id: i64) -> Option<TaskDetail> {
+    let st = state(app);
+    let settings = st.settings();
+    let (snap, spec, media, log) = with_entry(&st, id, |e| (e.snap.clone(), e.spec.clone(), e.media.clone(), e.log.clone()))?;
+    let requests = spec
+        .inputs
+        .iter()
+        .map(|a| {
+            let (url, headers) = if a.protocol == Protocol::Ytdlp {
+                (media.source_url.clone(), vec![])
+            } else {
+                let req = build_request(&st, &media, a);
+                (a.url.clone(), req.headers)
+            };
+            let route = match st.net.route_for(&settings.network, &url) {
+                crate::settings::Route::Direct => "直连".to_string(),
+                crate::settings::Route::System => "系统代理".to_string(),
+                crate::settings::Route::Proxy(pid) => format!("代理 {pid}"),
+            };
+            RequestInfo {
+                label: a.label.clone(),
+                protocol: protocol_name(a.protocol).to_string(),
+                url: mask_url(&url),
+                headers: headers.into_iter().map(|(k, v)| (k.clone(), mask_header(&k, &v))).collect(),
+                route,
+            }
+        })
+        .collect();
+    let part_files: Vec<String> = (0..spec.inputs.len())
+        .map(|i| input_part_path(&settings, id, Path::new(&snap.file_path), i, spec.inputs.len()))
+        .filter(|p| p.exists())
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let p = &spec.post;
+    let mut post = vec![];
+    if spec.inputs.len() > 1 {
+        post.push("下载后合并音视频".to_string());
+    }
+    if let Some(c) = &p.clip {
+        let end = c.end_ms.map(|e| format!("{:.1}", e as f64 / 1000.0)).unwrap_or_else(|| "结尾".into());
+        post.push(format!("只保留 {:.1} 秒到 {end}{}", c.start_ms as f64 / 1000.0, if c.precise { "（精确裁剪）" } else { "" }));
+    }
+    if let Some(m) = &p.sub_mode {
+        post.push(format!("字幕：{}", if m == "burn" { "烧录进画面" } else { "内嵌为字幕轨" }));
+    }
+    if let Some(f) = &p.extract_audio {
+        post.push(format!("提取音频（{}）", f.to_uppercase()));
+    }
+    if !p.split_chapters.is_empty() {
+        post.push(format!("按 {} 个章节另外拆分", p.split_chapters.len()));
+    }
+    Some(TaskDetail { source_url: mask_url(&media.source_url), task: snap, log, requests, part_files, post })
 }
 
 pub fn clear_finished(app: &AppHandle) {
@@ -1845,5 +2025,15 @@ mod tests {
         for s in [TaskStatus::Queued, TaskStatus::Running, TaskStatus::Paused, TaskStatus::Done, TaskStatus::Failed, TaskStatus::Canceled] {
             assert_eq!(TaskStatus::parse(s.as_str()), s);
         }
+    }
+
+    #[test]
+    fn urls_and_headers_are_masked() {
+        assert_eq!(mask_url("https://user:pw@cdn.example.com/v.mp4?token=abcdef123456&x=1"), "https://cdn.example.com/v.mp4?token=abcd%E2%80%A6&x=1");
+        assert_eq!(mask_url("https://a.com/v.m3u8"), "https://a.com/v.m3u8");
+        assert_eq!(mask_url("not a url"), "not a url");
+        assert_eq!(mask_header("Cookie", "SESSDATA=abc"), "（已隐藏，12 个字符）");
+        assert_eq!(mask_header("authorization", "Bearer x"), "（已隐藏，8 个字符）");
+        assert_eq!(mask_header("Referer", "https://b.com/"), "https://b.com/");
     }
 }

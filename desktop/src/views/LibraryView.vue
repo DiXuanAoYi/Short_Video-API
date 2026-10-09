@@ -235,7 +235,16 @@ watch(
   () => queue.counts.done,
   () => tab.value === 'files' && load(),
 )
+function consumeQuery() {
+  if (app.libraryQuery !== null) {
+    query.value = app.libraryQuery
+    app.libraryQuery = null
+  }
+}
+watch(() => app.libraryQuery, consumeQuery)
+
 onMounted(async () => {
+  consumeQuery()
   await load()
   await events.onLibraryChanged(() => tab.value === 'files' && load())
 })
@@ -381,7 +390,7 @@ async function clearHistory() {
                 :class="{ missing: !f.exists, picked: selected.has(f.id) }"
                 :title="f.title"
                 @click="selecting ? toggleSelect(f.id) : openDetail(f)"
-                @dblclick="!selecting && f.exists && run(api.openFile, f.path)"
+                @dblclick="!selecting && f.exists && ((f.kind === 'video' || f.kind === 'audio') ? app.openPlayer(f.path) : run(api.openFile, f.path))"
               >
                 <div class="imgbox">
                   <img v-if="coverOf(f)" :src="coverOf(f)!" referrerpolicy="no-referrer" loading="lazy" alt="" />
@@ -419,7 +428,8 @@ async function clearHistory() {
           </div>
           <div class="actions">
             <el-button link size="small" @click="openDetail(f)">详情</el-button>
-            <el-button link size="small" type="primary" :disabled="!f.exists" @click="run(api.openFile, f.path)">打开</el-button>
+            <el-button v-if="f.kind === 'video' || f.kind === 'audio'" link size="small" type="primary" :disabled="!f.exists" @click="app.openPlayer(f.path)">播放</el-button>
+            <el-button link size="small" :type="f.kind === 'video' || f.kind === 'audio' ? undefined : 'primary'" :disabled="!f.exists" @click="run(api.openFile, f.path)">打开</el-button>
             <el-button link size="small" :disabled="!f.exists" @click="run(api.revealFile, f.path)">文件夹</el-button>
             <el-button v-if="!f.exists && f.sourceUrl" link size="small" type="primary" @click="redownload(f)">重新下载</el-button>
             <el-button link size="small" @click="removeFile(f)">删除</el-button>

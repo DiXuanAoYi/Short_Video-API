@@ -18,6 +18,7 @@ import RulesPanel from '../components/RulesPanel.vue'
 import SecurityPanel from '../components/SecurityPanel.vue'
 import type { HealthResult } from '../types'
 import { copyDiagnostics } from '../composables/diagnostics'
+import { LANGUAGES } from '../i18n'
 
 const app = useAppStore()
 const form = ref<Settings>(JSON.parse(JSON.stringify(app.settings!)))
@@ -540,7 +541,14 @@ function insertVar(v: string) {
                 <el-radio-button value="light">浅色</el-radio-button>
               </el-radio-group>
             </div>
+            <div class="kv">
+              <span>界面语言<small class="mute block">English 界面由机器翻译整理，较长的提示和软件返回的错误消息仍可能是中文</small></span>
+              <el-radio-group v-model="form.language" size="small">
+                <el-radio-button v-for="l in LANGUAGES" :key="l.value" :value="l.value">{{ l.label }}</el-radio-button>
+              </el-radio-group>
+            </div>
             <div class="kv"><span>关闭窗口时最小化到托盘</span><el-switch v-model="form.closeToTray" /></div>
+            <div class="kv"><span>悬浮拖拽窗<small class="mute block">桌面上的小窗口：把浏览器里的链接拖进去就开始下载，也可以点一下后按 Ctrl+V 粘贴；双击回到主窗口</small></span><el-switch v-model="form.floatBall" /></div>
             <div class="kv"><span>开机自动启动<small class="mute block">在托盘运行，用于订阅的定期检查</small></span><el-switch v-model="form.launchAtLogin" /></div>
             <div class="kv"><span>订阅与追更<small class="mute block">在“订阅”页面管理</small></span><el-switch v-model="form.subscriptionsEnabled" /></div>
             <div class="kv"><span>启动时检查更新</span><el-switch v-model="form.checkUpdate" /></div>
@@ -639,6 +647,10 @@ h3 {
 }
 .kv > span {
   min-width: 0;
+}
+.kv :deep(.el-radio-group) {
+  flex-shrink: 0;
+  flex-wrap: nowrap;
 }
 .block {
   display: block;

@@ -4,6 +4,9 @@ import { ElMessage } from 'element-plus'
 import { api, errorText } from '../../api'
 import type { CueHit } from '../../types'
 import { formatClock } from '../../utils/time'
+import { useAppStore } from '../../stores/app'
+
+const app = useAppStore()
 
 const query = ref('')
 const hits = ref<CueHit[]>([])
@@ -68,11 +71,16 @@ function parts(text: string) {
   return out
 }
 
-async function openAt(h: CueHit) {
+/** 用内置播放器直接跳到这句话出现的位置。 */
+function openAt(h: CueHit) {
+  app.openPlayer(h.path, h.startMs)
+}
+
+async function openExternal(h: CueHit) {
   try {
     await api.copyText(formatClock(h.startMs))
     await api.openFile(h.path)
-    ElMessage.info(`已打开视频，位置 ${formatClock(h.startMs)} 已复制到剪贴板`)
+    ElMessage.info(`已用系统播放器打开，位置 ${formatClock(h.startMs)} 已复制到剪贴板`)
   } catch (e) {
     ElMessage.error(errorText(e))
   }
@@ -94,7 +102,8 @@ async function openAt(h: CueHit) {
           <span class="ellipsis" :title="h.title || h.path">{{ h.title || '（视频已不在媒体库里）' }}</span>
           <span class="mono mute">{{ formatClock(h.startMs) }}</span>
           <span v-if="h.lang && h.lang !== 'und'" class="chip">{{ h.lang }}</span>
-          <el-button link type="primary" size="small" :disabled="!h.path" @click="openAt(h)">打开</el-button>
+          <el-button link type="primary" size="small" :disabled="!h.path" @click="openAt(h)">播放</el-button>
+          <el-button link size="small" :disabled="!h.path" @click="openExternal(h)">系统播放器</el-button>
         </div>
         <div class="text selectable"><template v-for="(p, j) in parts(h.text)" :key="j"><mark v-if="p.hit">{{ p.t }}</mark><template v-else>{{ p.t }}</template></template></div>
       </div>

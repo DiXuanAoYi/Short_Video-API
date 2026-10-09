@@ -310,6 +310,12 @@ pub struct Settings {
     pub metered_mode: bool,
     /// 安全与隐私
     pub security: SecuritySettings,
+    /// 已完成首次使用引导（升级前就在使用的用户不再弹出）
+    pub onboarded: bool,
+    /// 界面语言：zh / en / ja
+    pub language: String,
+    /// 悬浮拖拽窗：把链接拖到桌面上的小圆标就能下载
+    pub float_ball: bool,
 }
 
 /// 限速计划里的一个时段。
@@ -775,13 +781,22 @@ impl Default for Settings {
             speed_schedule: vec![],
             metered_mode: false,
             security: SecuritySettings::default(),
+            onboarded: false,
+            language: "zh".into(),
+            float_ball: false,
         }
     }
 }
 
 impl Settings {
     pub fn load(path: &Path, default_download_dir: &Path) -> Settings {
-        let mut s: Settings = std::fs::read_to_string(path).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default();
+        let raw = std::fs::read_to_string(path).ok();
+        let mut s: Settings = raw.as_deref().and_then(|text| serde_json::from_str(text).ok()).unwrap_or_default();
+        // 升级前就已经在用的（同意过使用说明、设置里还没有这个字段）：不再弹出首次引导
+        let has_key = raw.as_deref().and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok()).is_some_and(|v| v.get("onboarded").is_some());
+        if !has_key && s.disclaimer_accepted {
+            s.onboarded = true;
+        }
         if s.download_dir.trim().is_empty() {
             s.download_dir = default_download_dir.to_string_lossy().into_owned();
         }
@@ -884,6 +899,9 @@ impl Settings {
                 *f = f.trim().to_string();
             }
         }
+        if !matches!(self.language.as_str(), "zh" | "en" | "ja") {
+            self.language = "zh".into();
+        }
         self.security.auto_lock_minutes = self.security.auto_lock_minutes.min(24 * 60);
         self.security.safebox_auto_lock_minutes = self.security.safebox_auto_lock_minutes.min(24 * 60);
         self.security.panic_shortcut = self.security.panic_shortcut.trim().to_string();
@@ -973,5 +991,25 @@ mod tests {
         let mut s = Settings { concurrency: 99, ..Settings::default() };
         s.normalize();
         assert_eq!(s.concurrency, 8);
+    }
+
+    #[test]
+    fn upgraders_skip_onboarding_but_new_installs_get_it() {
+        let dir = std::env::temp_dir().join(format!("clearclip-onb-{}-{}", std::process::id(), crate::db::now()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("settings.json");
+        let dl = dir.join("dl");
+        // 没有设置文件：新安装
+        assert!(!Settings::load(&p, &dl).onboarded);
+        // 旧版本的设置：同意过说明但没有 onboarded 字段
+        std::fs::write(&p, r#"{"disclaimerAccepted": true, "concurrency": 2}"#).unwrap();
+        assert!(Settings::load(&p, &dl).onboarded);
+        // 同意了说明但还没做完引导（字段明确为 false）：仍然显示
+        std::fs::write(&p, r#"{"disclaimerAccepted": true, "onboarded": false}"#).unwrap();
+        assert!(!Settings::load(&p, &dl).onboarded);
+        // 语言只接受已知值
+        std::fs::write(&p, r#"{"language": "xx"}"#).unwrap();
+        assert_eq!(Settings::load(&p, &dl).language, "zh");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { api, errorText, events } from './api'
@@ -14,10 +14,18 @@ import SafeboxView from './views/SafeboxView.vue'
 import SettingsView from './views/SettingsView.vue'
 import LockScreen from './components/LockScreen.vue'
 import DisclaimerDialog from './components/DisclaimerDialog.vue'
+import OnboardingDialog from './components/OnboardingDialog.vue'
+import CommandPalette from './components/CommandPalette.vue'
+import PlayerDialog from './components/PlayerDialog.vue'
+import elEn from 'element-plus/es/locale/lang/en'
+import elZh from 'element-plus/es/locale/lang/zh-cn'
+import { useLanguage } from './i18n/useLanguage'
 import type { PairRequest } from './types'
 
 const app = useAppStore()
 const queue = useQueueStore()
+useLanguage()
+const elLocale = computed(() => (app.settings?.language === 'en' ? elEn : elZh))
 const parse = useParseStore()
 const ready = ref(false)
 const dragging = ref(false)
@@ -33,6 +41,24 @@ async function importText(text: string) {
   if (urls.length === 1) parse.parse(text)
   else ElMessage.success(`已导入 ${urls.length} 条链接`)
 }
+
+// 锁定时关闭播放器，免得声音继续、画面露出来
+watch(
+  () => app.lock.locked,
+  (v) => {
+    if (v) app.player = null
+  },
+)
+
+watch(
+  () => app.pendingParse,
+  (t) => {
+    if (t) {
+      app.pendingParse = null
+      importText(t)
+    }
+  },
+)
 
 function onHtmlDrop(e: DragEvent) {
   dragging.value = false
@@ -200,6 +226,7 @@ onMounted(async () => {
 </script>
 
 <template>
+  <el-config-provider :locale="elLocale">
   <div v-if="loadError" class="fatal">
     <h2>启动失败</h2>
     <p class="selectable">{{ loadError }}</p>
@@ -236,6 +263,9 @@ onMounted(async () => {
       <SettingsView v-if="app.view === 'settings'" />
     </main>
     <DisclaimerDialog />
+    <OnboardingDialog />
+    <CommandPalette />
+    <PlayerDialog />
     <div v-if="dragging" class="dropzone">松开以导入链接（支持链接文本和 .txt 文件）</div>
     <el-dialog :model-value="!!countdown" :title="countdown?.action === 'shutdown' ? '即将关机' : '即将睡眠'" width="360px" :close-on-click-modal="false" :show-close="false">
       <p>全部下载已完成，将在 <b class="mono">{{ countdown?.left }}</b> 秒后{{ countdown?.action === 'shutdown' ? '关机' : '睡眠' }}。</p>
@@ -245,6 +275,7 @@ onMounted(async () => {
     </el-dialog>
   </div>
   <LockScreen />
+  </el-config-provider>
 </template>
 
 <style scoped>
