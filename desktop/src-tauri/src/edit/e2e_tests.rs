@@ -35,7 +35,7 @@ pub(super) fn strs(a: &[&str]) -> Vec<String> {
     a.iter().map(|s| s.to_string()).collect()
 }
 
-async fn gen(ff: &Path, d: &Path, name: &str, ins: &[&str], outs: &[&str]) -> Option<PathBuf> {
+pub(super) async fn gen(ff: &Path, d: &Path, name: &str, ins: &[&str], outs: &[&str]) -> Option<PathBuf> {
     let out = d.join(name);
     let mut a = strs(&["-hide_banner", "-loglevel", "error", "-y"]);
     a.extend(strs(ins));
@@ -93,7 +93,7 @@ pub(super) async fn render(ff: &Path, caps: &Caps, d: &Path, p: Project, mode: M
     static N: AtomicUsize = AtomicUsize::new(0);
     let mut p = p.checked().expect("工程校验");
     let mut src: HashMap<String, Source> = HashMap::new();
-    for path in p.clips.iter().map(|c| c.path.clone()).chain(p.audio.iter().map(|a| a.path.clone())) {
+    for path in p.clips.iter().map(|c| c.path.clone()).chain(p.overlays.iter().map(|o| o.path.clone())).chain(p.audio.iter().map(|a| a.path.clone())) {
         if let std::collections::hash_map::Entry::Vacant(e) = src.entry(path) {
             let f = facts::read(ff, Path::new(e.key())).await.expect("facts");
             e.insert(Source::from_facts(&f));
@@ -138,24 +138,24 @@ async fn rgb_at(ff: &Path, file: &Path, t: f64) -> (u8, u8, u8) {
     (o[0], o[1], o[2])
 }
 
-fn is_red(c: (u8, u8, u8)) -> bool {
+pub(super) fn is_red(c: (u8, u8, u8)) -> bool {
     c.0 > 180 && c.1 < 70 && c.2 < 70
 }
-fn is_green(c: (u8, u8, u8)) -> bool {
+pub(super) fn is_green(c: (u8, u8, u8)) -> bool {
     c.1 > 90 && c.0 < 70 && c.2 < 70
 }
-fn is_yellow(c: (u8, u8, u8)) -> bool {
+pub(super) fn is_yellow(c: (u8, u8, u8)) -> bool {
     c.0 > 180 && c.1 > 180 && c.2 < 80
 }
-fn is_blue(c: (u8, u8, u8)) -> bool {
+pub(super) fn is_blue(c: (u8, u8, u8)) -> bool {
     c.2 > 150 && c.0 < 70 && c.1 < 70
 }
 
-async fn facts_of(ff: &Path, f: &Path) -> facts::Facts {
+pub(super) async fn facts_of(ff: &Path, f: &Path) -> facts::Facts {
     facts::read(ff, f).await.expect("facts")
 }
 
-fn close(ms: Option<u64>, want: u64, tol: u64) -> bool {
+pub(super) fn close(ms: Option<u64>, want: u64, tol: u64) -> bool {
     ms.is_some_and(|m| m.abs_diff(want) <= tol)
 }
 
@@ -191,7 +191,7 @@ async fn timeline_has_the_right_length_colours_and_sound() {
 }
 
 /// 音轨的实际时长（毫秒）：把音频解码一遍数样本。
-async fn a_duration(ff: &Path, file: &Path) -> u64 {
+pub(super) async fn a_duration(ff: &Path, file: &Path) -> u64 {
     let a = strs(&["-hide_banner", "-i", &file.to_string_lossy(), "-vn", "-f", "null", "-"]);
     let log = match run_ffmpeg_capture(ff, &a, Duration::from_secs(60)).await {
         Ok((_, e)) => e,

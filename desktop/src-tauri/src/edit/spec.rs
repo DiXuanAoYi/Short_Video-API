@@ -11,6 +11,9 @@ use crate::track::TrackPt;
 pub const MAX_CLIPS: usize = 300;
 pub const MAX_TEXTS: usize = 100;
 pub const MAX_AUDIO: usize = 20;
+/// 叠加轨上最多的素材数、最多的轨道数
+pub const MAX_OVERLAYS: usize = 100;
+pub const MAX_OVERLAY_TRACKS: u32 = 8;
 /// 一个片段上最多的区域数
 pub const MAX_REGIONS: usize = 8;
 /// 一条区域轨迹最多的点数（追踪结果经过精简，正常远少于这个数）
@@ -19,6 +22,8 @@ pub const MAX_TRACK_POINTS: usize = 20_000;
 pub const MIN_MS: u64 = 100;
 /// 小于这个长度的转场当作没有（只会闪一下）
 pub const MIN_TRANSITION_MS: u64 = 100;
+/// 叠加素材、文字、音频最晚从多久开始（10 小时），防止数值溢出
+pub const MAX_START_MS: u64 = 36_000_000;
 
 /// 可选的转场（xfade 的名字）。用真实的 ffmpeg 逐个试过，见端到端测试。
 pub const TRANSITIONS: &[&str] = &[
@@ -283,6 +288,108 @@ impl Default for AudioTrack {
     }
 }
 
+/// 叠加轨上的素材（画中画、贴纸、GIF、水印）：盖在主轨画面上面，位置、大小和时间都自由。
+/// 轨道编号越大越在上面；同一条轨道上后开始的盖在先开始的上面。叠加素材不会撑长成片：超出主轨结尾的部分被截掉。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Overlay {
+    pub id: u32,
+    pub path: String,
+    pub kind: ClipKind,
+    /// 叠加轨编号 1–`MAX_OVERLAY_TRACKS`
+    pub track: u32,
+    /// 在时间线上从哪里开始（毫秒）
+    pub start_ms: u64,
+    /// 取素材的哪一段（毫秒）。图片：`in_ms` 为 0，`out_ms` 是显示时长
+    pub in_ms: u64,
+    pub out_ms: u64,
+    /// 播放速度 0.25–4（视频）
+    pub speed: f64,
+    /// 素材不够长时重复播放（GIF、短视频）：这时 `out_ms` 可以超过素材的长度
+    pub looped: bool,
+    pub volume: f64,
+    pub mute: bool,
+    /// 淡入 / 淡出：画面变透明，声音同步
+    pub fade_in_ms: u64,
+    pub fade_out_ms: u64,
+    /// 中心点在画面里的位置（占画面宽、高的比例，0.5 = 正中）
+    pub x: f64,
+    pub y: f64,
+    /// 素材的宽度占画面宽度的比例（1 = 和画面一样宽）
+    pub scale: f64,
+    /// 顺时针旋转的角度（度）
+    pub rotate: f64,
+    /// 不透明度 0–1
+    pub opacity: f64,
+    pub flip_h: bool,
+    pub flip_v: bool,
+    /// 调色，含义同片段
+    pub brightness: f64,
+    pub contrast: f64,
+    pub saturation: f64,
+}
+
+impl Default for Overlay {
+    fn default() -> Self {
+        Overlay {
+            id: 0,
+            path: String::new(),
+            kind: ClipKind::Video,
+            track: 1,
+            start_ms: 0,
+            in_ms: 0,
+            out_ms: 0,
+            speed: 1.0,
+            looped: false,
+            volume: 1.0,
+            mute: false,
+            fade_in_ms: 0,
+            fade_out_ms: 0,
+            x: 0.5,
+            y: 0.5,
+            scale: 0.4,
+            rotate: 0.0,
+            opacity: 1.0,
+            flip_h: false,
+            flip_v: false,
+            brightness: 0.0,
+            contrast: 1.0,
+            saturation: 1.0,
+        }
+    }
+}
+
+impl Overlay {
+    /// 在时间线上占的时长（毫秒）。
+    pub fn duration_ms(&self) -> u64 {
+        let span = self.out_ms.saturating_sub(self.in_ms);
+        match self.kind {
+            ClipKind::Image => span,
+            ClipKind::Video => (span as f64 / self.speed.max(0.01)).round() as u64,
+        }
+    }
+
+    pub fn end_ms(&self) -> u64 {
+        self.start_ms + self.duration_ms()
+    }
+
+    pub fn needs_tone(&self) -> bool {
+        tone_changed(self.brightness, self.contrast, self.saturation)
+    }
+
+    /// 旋转角度换算到 0–360 度
+    pub fn angle(&self) -> f64 {
+        self.rotate.rem_euclid(360.0)
+    }
+}
+
+/// 叠加素材从下到上的顺序（下标）：轨道编号小的在下，同一轨道上开始早的在下。
+pub fn overlay_order(list: &[Overlay]) -> Vec<usize> {
+    let mut v: Vec<usize> = (0..list.len()).collect();
+    v.sort_by_key(|&i| (list[i].track, list[i].start_ms, i));
+    v
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct OutputSpec {
@@ -313,6 +420,8 @@ pub struct Project {
     /// 输出文件名（不含扩展名）；留空沿用第一个片段的名字
     pub title: String,
     pub clips: Vec<Clip>,
+    /// 叠加轨上的素材（画中画、贴纸、GIF、水印）
+    pub overlays: Vec<Overlay>,
     pub texts: Vec<TextItem>,
     pub audio: Vec<AudioTrack>,
     pub out: OutputSpec,
@@ -430,6 +539,9 @@ impl Project {
         if self.clips.len() > MAX_CLIPS {
             return Err(format!("片段太多了（最多 {MAX_CLIPS} 个）。"));
         }
+        if self.overlays.len() > MAX_OVERLAYS {
+            return Err(format!("叠加素材太多了（最多 {MAX_OVERLAYS} 个）。"));
+        }
         if self.texts.len() > MAX_TEXTS {
             return Err(format!("文字太多了（最多 {MAX_TEXTS} 条）。"));
         }
@@ -477,6 +589,40 @@ impl Project {
                     c.transition = None;
                 }
             }
+        }
+        for (i, o) in self.overlays.iter_mut().enumerate() {
+            let n = i + 1;
+            if o.path.trim().is_empty() {
+                return Err(format!("第 {n} 个叠加素材没有素材文件。"));
+            }
+            match o.kind {
+                ClipKind::Image => {
+                    o.in_ms = 0;
+                    o.speed = 1.0;
+                    o.looped = false;
+                    o.out_ms = o.out_ms.max(MIN_MS);
+                }
+                ClipKind::Video => {
+                    if o.out_ms <= o.in_ms || o.out_ms - o.in_ms < MIN_MS {
+                        return Err(format!("第 {n} 个叠加素材的结束时间要比开始时间晚（至少 {MIN_MS} 毫秒）。"));
+                    }
+                    o.speed = clamp(o.speed, 0.25, 4.0, 1.0);
+                }
+            }
+            o.track = o.track.clamp(1, MAX_OVERLAY_TRACKS);
+            o.start_ms = o.start_ms.min(MAX_START_MS);
+            o.x = clamp(o.x, -1.0, 2.0, 0.5);
+            o.y = clamp(o.y, -1.0, 2.0, 0.5);
+            o.scale = clamp(o.scale, 0.02, 3.0, 0.4);
+            o.rotate = clamp(o.rotate, -3600.0, 3600.0, 0.0);
+            o.opacity = clamp(o.opacity, 0.0, 1.0, 1.0);
+            o.volume = clamp(o.volume, 0.0, 4.0, 1.0);
+            o.brightness = clamp(o.brightness, -1.0, 1.0, 0.0);
+            o.contrast = clamp(o.contrast, 0.0, 3.0, 1.0);
+            o.saturation = clamp(o.saturation, 0.0, 3.0, 1.0);
+            let d = o.duration_ms();
+            o.fade_in_ms = o.fade_in_ms.min(d);
+            o.fade_out_ms = o.fade_out_ms.min(d.saturating_sub(o.fade_in_ms));
         }
         self.texts.retain(|t| !t.text.trim().is_empty());
         for t in &mut self.texts {
@@ -530,7 +676,13 @@ impl Project {
     /// 所有用到的素材文件（去重，保持顺序）。
     pub fn media_paths(&self) -> Vec<String> {
         let mut out: Vec<String> = vec![];
-        let paths = self.clips.iter().map(|c| &c.path).chain(self.audio.iter().map(|a| &a.path)).chain(self.texts.iter().filter_map(|t| t.font.as_ref()));
+        let paths = self
+            .clips
+            .iter()
+            .map(|c| &c.path)
+            .chain(self.overlays.iter().map(|o| &o.path))
+            .chain(self.audio.iter().map(|a| &a.path))
+            .chain(self.texts.iter().filter_map(|t| t.font.as_ref()));
         for p in paths {
             if !out.contains(p) {
                 out.push(p.clone());
@@ -750,5 +902,109 @@ mod tests {
         // 界面可以只发要改的几个字段
         let r: Region = serde_json::from_str(r#"{"track":[{"tMs":0,"x":0.1,"y":0.1,"w":0.2,"h":0.2}],"effect":"blur"}"#).unwrap();
         assert_eq!((r.shape.as_str(), r.zoom, r.feather, r.start_ms), ("rect", 2.0, 0.2, None));
+    }
+
+    fn overlay(id: u32, track: u32, start: u64) -> Overlay {
+        Overlay { id, path: format!("/o/{id}.mp4"), track, start_ms: start, out_ms: 2000, ..Default::default() }
+    }
+
+    #[test]
+    fn overlays_are_checked_and_clamped() {
+        let wild = Overlay {
+            id: 1,
+            path: "/o/a.png".into(),
+            kind: ClipKind::Image,
+            track: 99,
+            start_ms: u64::MAX,
+            in_ms: 777,
+            out_ms: 10,
+            speed: 3.0,
+            looped: true,
+            x: 9.0,
+            y: f64::NAN,
+            scale: 0.0,
+            rotate: f64::INFINITY,
+            opacity: 7.0,
+            volume: -1.0,
+            brightness: 5.0,
+            contrast: 9.0,
+            saturation: -2.0,
+            fade_in_ms: 99_999,
+            fade_out_ms: 99_999,
+            ..Default::default()
+        };
+        let p = Project { clips: vec![clip(1, 3000)], overlays: vec![wild], ..Default::default() }.checked().unwrap();
+        let o = &p.overlays[0];
+        assert_eq!(
+            (o.track, o.start_ms, o.in_ms, o.out_ms, o.speed, o.looped),
+            (MAX_OVERLAY_TRACKS, MAX_START_MS, 0, MIN_MS, 1.0, false),
+            "图片：从头开始、不变速、不循环、至少 {MIN_MS} 毫秒"
+        );
+        assert_eq!((o.x, o.y, o.scale, o.rotate, o.opacity, o.volume), (2.0, 0.5, 0.02, 0.0, 1.0, 0.0));
+        assert_eq!((o.brightness, o.contrast, o.saturation), (1.0, 3.0, 0.0));
+        assert_eq!((o.fade_in_ms, o.fade_out_ms), (MIN_MS, 0), "淡入淡出加起来不超过自己的长度");
+
+        let mut v = overlay(2, 0, 0);
+        v.out_ms = v.in_ms;
+        let e = Project { clips: vec![clip(1, 3000)], overlays: vec![v], ..Default::default() }.checked().unwrap_err();
+        assert!(e.contains("第 1 个叠加素材") && e.contains("结束时间"), "{e}");
+        let mut v = overlay(2, 1, 0);
+        v.path = " ".into();
+        assert!(Project { clips: vec![clip(1, 3000)], overlays: vec![v], ..Default::default() }.checked().unwrap_err().contains("没有素材文件"));
+        let many = (0..=MAX_OVERLAYS as u32).map(|i| overlay(i, 1, 0)).collect();
+        assert!(Project { clips: vec![clip(1, 3000)], overlays: many, ..Default::default() }.checked().unwrap_err().contains("叠加素材太多"));
+        // 轨道编号 0 当作 1
+        let p = Project { clips: vec![clip(1, 3000)], overlays: vec![overlay(1, 0, 0)], ..Default::default() }.checked().unwrap();
+        assert_eq!(p.overlays[0].track, 1);
+    }
+
+    #[test]
+    fn overlays_stack_by_track_then_start_time() {
+        let list = vec![overlay(1, 2, 0), overlay(2, 1, 500), overlay(3, 1, 0), overlay(4, 3, 0), overlay(5, 1, 0)];
+        // 1 号轨：开始早的在下（3、5 同时开始，列表里靠前的在下），再 2 号轨、3 号轨
+        assert_eq!(overlay_order(&list), vec![2, 4, 1, 0, 3]);
+        assert!(overlay_order(&[]).is_empty());
+    }
+
+    #[test]
+    fn overlay_durations_follow_speed_and_kind() {
+        let mut o = overlay(1, 1, 1000);
+        o.in_ms = 500;
+        o.out_ms = 4500;
+        assert_eq!((o.duration_ms(), o.end_ms()), (4000, 5000));
+        o.speed = 2.0;
+        assert_eq!((o.duration_ms(), o.end_ms()), (2000, 3000));
+        o.kind = ClipKind::Image;
+        o.in_ms = 0;
+        o.out_ms = 2500;
+        assert_eq!(o.duration_ms(), 2500, "图片不变速");
+        o.rotate = -90.0;
+        assert_eq!(o.angle(), 270.0);
+        o.rotate = 725.0;
+        assert_eq!(o.angle(), 5.0);
+    }
+
+    #[test]
+    fn overlays_round_trip_and_old_projects_without_them_still_open() {
+        let mut o = overlay(3, 2, 1500);
+        o.rotate = 12.5;
+        o.looped = true;
+        let p = Project { clips: vec![clip(1, 3000)], overlays: vec![o], ..Default::default() };
+        let j = serde_json::to_string(&p).unwrap();
+        assert!(j.contains("\"overlays\"") && j.contains("\"startMs\":1500") && j.contains("\"track\":2") && j.contains("\"looped\":true"), "{j}");
+        assert_eq!(serde_json::from_str::<Project>(&j).unwrap(), p);
+        let old: Project = serde_json::from_str(r#"{"clips":[{"path":"/a.mp4","outMs":1000}]}"#).unwrap();
+        assert!(old.overlays.is_empty());
+        // 界面可以只发要改的几个字段
+        let o: Overlay = serde_json::from_str(r#"{"path":"/a.gif","outMs":2000,"startMs":300}"#).unwrap();
+        assert_eq!((o.track, o.scale, o.opacity, o.x, o.y), (1, 0.4, 1.0, 0.5, 0.5));
+    }
+
+    #[test]
+    fn media_paths_include_overlays_once() {
+        let mut p = Project { clips: vec![clip(1, 1000)], overlays: vec![overlay(2, 1, 0), overlay(3, 2, 0)], ..Default::default() };
+        p.overlays[1].path = p.overlays[0].path.clone();
+        p.audio = vec![AudioTrack { path: "/m/x.mp3".into(), ..Default::default() }];
+        assert_eq!(p.media_paths(), vec!["/m/1.mp4", "/o/2.mp4", "/m/x.mp3"]);
     }
 }

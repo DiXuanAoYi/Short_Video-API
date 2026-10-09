@@ -48,6 +48,23 @@ pub fn fit_to_sources(p: &mut Project, src: &HashMap<String, Source>) -> AppResu
             notes.push(format!("第 {} 个片段超出素材的长度，已缩短到素材结尾", n + 1));
         }
     }
+    for (n, o) in p.overlays.iter_mut().enumerate() {
+        if o.kind != ClipKind::Video {
+            continue;
+        }
+        let Some(d) = src.get(&o.path).and_then(|s| s.duration_ms) else { continue };
+        if o.in_ms + MIN_MS > d {
+            return Err(AppError::invalid(format!("第 {} 个叠加素材的开始时间（{}）已经超出素材的长度（{}）。", n + 1, show_ms(o.in_ms), show_ms(d))));
+        }
+        // 设了“循环播放”的可以比素材长（重复播放）；其他的缩短到素材结尾
+        if o.out_ms > d && !o.looped {
+            o.out_ms = d;
+            let dur = o.duration_ms();
+            o.fade_in_ms = o.fade_in_ms.min(dur);
+            o.fade_out_ms = o.fade_out_ms.min(dur.saturating_sub(o.fade_in_ms));
+            notes.push(format!("第 {} 个叠加素材超出素材的长度，已缩短到素材结尾", n + 1));
+        }
+    }
     for (n, a) in p.audio.iter_mut().enumerate() {
         let Some(d) = src.get(&a.path).and_then(|s| s.duration_ms) else { continue };
         if a.in_ms + MIN_MS > d {
@@ -63,7 +80,7 @@ pub fn fit_to_sources(p: &mut Project, src: &HashMap<String, Source>) -> AppResu
 /// 读取所有素材的信息。
 async fn read_sources(ffmpeg: &Path, p: &Project, ctx: &JobCtx) -> AppResult<HashMap<String, Source>> {
     let mut src: HashMap<String, Source> = HashMap::new();
-    let paths: Vec<&String> = p.clips.iter().map(|c| &c.path).chain(p.audio.iter().map(|a| &a.path)).collect();
+    let paths: Vec<&String> = p.clips.iter().map(|c| &c.path).chain(p.overlays.iter().map(|o| &o.path)).chain(p.audio.iter().map(|a| &a.path)).collect();
     for path in paths {
         if src.contains_key(path) {
             continue;
@@ -233,7 +250,7 @@ pub async fn run_preview(ctx: &JobCtx, project: &Project) -> AppResult<PathBuf> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::edit::spec::{AudioTrack, Clip};
+    use crate::edit::spec::{AudioTrack, Clip, Overlay};
 
     fn src(paths: &[(&str, Option<u64>)]) -> HashMap<String, Source> {
         paths
@@ -262,6 +279,24 @@ mod tests {
         p.clips[0].in_ms = 5000;
         let e = fit_to_sources(&mut p, &s).unwrap_err();
         assert!(e.message.contains("第 1 个片段的开始时间") && e.message.contains("0:05.0"), "{}", e.message);
+    }
+
+    #[test]
+    fn overlays_are_shortened_unless_they_loop() {
+        let mk = |looped: bool| Overlay { path: "/o/a.gif".into(), out_ms: 6000, looped, fade_out_ms: 500, ..Default::default() };
+        let mut p = Project {
+            clips: vec![Clip { path: "/m/a.mp4".into(), out_ms: 9000, ..Default::default() }],
+            overlays: vec![mk(false), mk(true)],
+            ..Default::default()
+        };
+        let s = src(&[("/m/a.mp4", Some(9000)), ("/o/a.gif", Some(2000))]);
+        let notes = fit_to_sources(&mut p, &s).unwrap();
+        assert_eq!(p.overlays[0].out_ms, 2000, "不循环：缩短到素材结尾");
+        assert_eq!(p.overlays[1].out_ms, 6000, "循环：可以比素材长");
+        assert!(notes.iter().any(|n| n.contains("第 1 个叠加素材")) && !notes.iter().any(|n| n.contains("第 2 个叠加素材")), "{notes:?}");
+        p.overlays[1].in_ms = 2000;
+        let e = fit_to_sources(&mut p, &s).unwrap_err();
+        assert!(e.message.contains("第 2 个叠加素材的开始时间"), "{}", e.message);
     }
 
     #[test]

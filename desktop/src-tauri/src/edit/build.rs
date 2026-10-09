@@ -15,7 +15,7 @@ use crate::vidnorm::build::{filter_path, fps_fraction, graph_args, hevc_args, ne
 use crate::vidnorm::facts::{Facts, Hdr};
 
 use super::region::{focus_knots, focus_window, knot_expr, MaskJob};
-use super::spec::{layout, tone_changed, total_ms, AudioTrack, Clip, ClipKind, Placed, Project, Region, TextItem};
+use super::spec::{layout, overlay_order, tone_changed, total_ms, AudioTrack, Clip, ClipKind, Overlay, Placed, Project, Region, TextItem};
 
 /// 命令行总长度的上限。Windows 的上限是 32767 个字符，留一点给 ffmpeg 路径和输出文件。
 const MAX_ARGS_LEN: usize = 30_000;
@@ -364,6 +364,105 @@ fn clip_audio(i: usize, c: &Clip, has_audio: bool, stmts: &mut Vec<String>) {
     }
 }
 
+/// 叠加素材放进画面前的尺寸（宽、高，偶数）：宽度 = 画面宽度 × 缩放，高度按素材的比例（90 / 270 度旋转后宽高互换）。
+fn overlay_size(o: &Overlay, sr: &Source, w: u32) -> (u32, u32) {
+    let quarter = quarter_turn(o);
+    let (sw, sh) = if matches!(quarter, Some(90 | 270)) { (sr.height, sr.width) } else { (sr.width, sr.height) };
+    let ow = (f64::from(w) * o.scale).round().clamp(2.0, 16384.0) as u32;
+    let oh = (f64::from(ow) * f64::from(sh.max(1)) / f64::from(sw.max(1))).round().clamp(2.0, 16384.0) as u32;
+    (even(ow), even(oh))
+}
+
+/// 恰好是 90 / 180 / 270 度的旋转用转置 / 翻转做（不重采样，边缘干净）；其他角度返回 None，用 `rotate` 滤镜。
+fn quarter_turn(o: &Overlay) -> Option<u32> {
+    let a = o.angle();
+    [90.0, 180.0, 270.0].into_iter().find(|q| (a - q).abs() < 1e-6).map(|q| q as u32)
+}
+
+/// 一个叠加素材的画面：处理成带透明度的小画面，时间平移到它在时间线上的位置，输出 `[ov{k}]`。
+/// 处理顺序：变速 → 帧率 → 翻转 → 90 度旋转 → 缩放 → 调色 → 任意角度旋转 → 不透明度 → 淡入淡出 → 平移时间。
+fn overlay_video(k: usize, idx: usize, o: &Overlay, sr: &Source, frame: (u32, &str), stmts: &mut Vec<String>) {
+    let (w, fps) = frame;
+    let (ow, oh) = overlay_size(o, sr, w);
+    let mut f: Vec<String> = vec![];
+    f.push(if o.kind == ClipKind::Video && (o.speed - 1.0).abs() > 1e-9 {
+        format!("setpts=(PTS-STARTPTS)/{:.6}", o.speed)
+    } else {
+        "setpts=PTS-STARTPTS".into()
+    });
+    f.push(format!("fps={fps}"));
+    if o.flip_h {
+        f.push("hflip".into());
+    }
+    if o.flip_v {
+        f.push("vflip".into());
+    }
+    match quarter_turn(o) {
+        Some(90) => f.push("transpose=1".into()),
+        Some(180) => f.extend(["hflip".into(), "vflip".into()]),
+        Some(270) => f.push("transpose=2".into()),
+        _ => {}
+    }
+    // 先转成 BT.709 电视范围的 YUV 再带上透明通道（图片是 RGB，不指定的话 ffmpeg 默认用 BT.601，颜色会偏）
+    f.push(format!("scale={ow}:{oh}:flags=bicubic:out_color_matrix=bt709:out_range=tv"));
+    f.push("format=yuva420p".into());
+    f.extend(tone_expr(o.brightness, o.contrast, o.saturation));
+    if quarter_turn(o).is_none() && o.angle() > 1e-6 {
+        let rad = o.angle().to_radians();
+        // 旋转后的外框变大，空出来的四角是透明的
+        f.push(format!("rotate={rad:.6}:ow='rotw({rad:.6})':oh='roth({rad:.6})':c=none"));
+    }
+    if o.opacity < 0.999 {
+        f.push(format!("lutyuv=a='val*{:.4}'", o.opacity));
+    }
+    let d = o.duration_ms();
+    if o.fade_in_ms > 0 {
+        f.push(format!("fade=t=in:st=0:d={}:alpha=1", sec(o.fade_in_ms)));
+    }
+    if o.fade_out_ms > 0 {
+        f.push(format!("fade=t=out:st={}:d={}:alpha=1", sec(d.saturating_sub(o.fade_out_ms)), sec(o.fade_out_ms)));
+    }
+    f.push(format!("setpts=PTS+{}/TB", sec(o.start_ms)));
+    stmts.push(format!("[{idx}:v:0]{}[ov{k}]", f.join(",")));
+}
+
+/// 把 `[ov{k}]` 盖到 `base` 上，返回新的画面标签。
+fn overlay_on(k: usize, base: &str, o: &Overlay, stmts: &mut Vec<String>) -> String {
+    let next = format!("ob{k}");
+    stmts.push(format!(
+        "[{base}][ov{k}]overlay=x='W*({:.5})-w/2':y='H*({:.5})-h/2':enable='between(t,{},{})':eof_action=pass:format=auto[{next}]",
+        o.x,
+        o.y,
+        sec(o.start_ms),
+        sec(o.end_ms())
+    ));
+    next
+}
+
+/// 叠加素材自带的声音 → `[oa{k}]`（对齐到它在时间线上的起点）；图片、静音、素材没有声音时返回 false。
+fn overlay_audio(k: usize, idx: usize, o: &Overlay, has_audio: bool, stmts: &mut Vec<String>) -> bool {
+    if o.kind != ClipKind::Video || o.mute || !has_audio || o.volume < 1e-6 {
+        return false;
+    }
+    let d = o.duration_ms();
+    let mut f: Vec<String> = vec!["asetpts=PTS-STARTPTS".into()];
+    if (o.speed - 1.0).abs() > 1e-9 {
+        f.push(atempo_chain(o.speed));
+    }
+    f.push(AFORMAT.into());
+    f.push(format!("apad=whole_dur={}", sec(d)));
+    f.push(format!("atrim=duration={}", sec(d)));
+    audio_fades(&mut f, d, o.fade_in_ms, o.fade_out_ms);
+    if (o.volume - 1.0).abs() > 1e-9 {
+        f.push(format!("volume={:.4}", o.volume));
+    }
+    if o.start_ms > 0 {
+        f.push(format!("adelay={0}|{0}", o.start_ms));
+    }
+    stmts.push(format!("[{idx}:a:0]{}[oa{k}]", f.join(",")));
+    true
+}
+
 fn color_arg(hex: &str, alpha: f64) -> String {
     format!("0x{}@{:.2}", hex.trim_start_matches('#'), alpha)
 }
@@ -491,6 +590,12 @@ pub fn build(p: &Project, src: &HashMap<String, Source>, caps: &Caps, tmp: &Path
             plan.warnings.push("有 HDR 素材：剪辑不做 HDR → SDR 转换，画面会发灰。请先用“视频规整”转成 SDR 再剪辑。".into());
         }
     }
+    for (n, o) in p.overlays.iter().enumerate() {
+        let sr = src.get(&o.path).ok_or_else(|| AppError::invalid(format!("没有读取到第 {} 个叠加素材的信息。", n + 1)))?;
+        if !sr.has_video || sr.width == 0 || sr.height == 0 {
+            return Err(AppError::invalid(format!("第 {} 个叠加素材里没有画面。", n + 1)));
+        }
+    }
     for (n, a) in p.audio.iter().enumerate() {
         let sr = src.get(&a.path).ok_or_else(|| AppError::invalid(format!("没有读取到第 {} 条音频轨的素材信息。", n + 1)))?;
         if !sr.has_audio {
@@ -527,8 +632,14 @@ pub fn build(p: &Project, src: &HashMap<String, Source>, caps: &Caps, tmp: &Path
     if p.audio.iter().any(|a| a.duck) {
         need("sidechaincompress", "无法自动压低配乐")?;
     }
-    if !p.audio.is_empty() {
-        need("amix", "无法混入配乐")?;
+    if !p.overlays.is_empty() {
+        need("overlay", "无法使用叠加轨")?;
+    }
+    if p.overlays.iter().any(|o| o.needs_tone() || o.opacity < 0.999) {
+        need("lutyuv", "无法调整叠加素材的颜色和透明度")?;
+    }
+    if p.overlays.iter().any(|o| quarter_turn(o).is_none() && o.angle() > 1e-6) {
+        need("rotate", "无法旋转叠加素材")?;
     }
 
     // 输出规格
@@ -569,11 +680,40 @@ pub fn build(p: &Project, src: &HashMap<String, Source>, caps: &Caps, tmp: &Path
     for a in &p.audio {
         args.extend(["-i".into(), a.path.clone()]);
     }
+    // 叠加素材：起点在成片结束之后的不会出现，不放进输入
+    let mut ovs: Vec<(usize, &Overlay)> = vec![];
+    for (n, o) in p.overlays.iter().enumerate() {
+        if o.start_ms >= total {
+            plan.warnings.push(format!("第 {} 个叠加素材的起点在成片结束之后，不会出现。", n + 1));
+        } else {
+            ovs.push((n, o));
+        }
+    }
+    let ov_first = p.clips.len() + p.audio.len();
+    for (_, o) in &ovs {
+        match o.kind {
+            ClipKind::Video => {
+                if o.looped {
+                    args.extend(["-stream_loop".into(), "-1".into()]);
+                }
+                if o.in_ms > 0 {
+                    args.extend(["-ss".into(), sec(o.in_ms)]);
+                }
+                args.extend(["-t".into(), sec(o.out_ms - o.in_ms), "-i".into(), o.path.clone()]);
+            }
+            ClipKind::Image => {
+                args.extend(["-loop".into(), "1".into(), "-framerate".into(), fps_txt.clone(), "-t".into(), sec(o.out_ms), "-i".into(), o.path.clone()]);
+            }
+        }
+    }
 
     // 滤镜图
-    let has_audio = !p.audio.is_empty() || p.clips.iter().any(|c| c.kind == ClipKind::Video && !c.mute && src.get(&c.path).is_some_and(|s| s.has_audio));
+    let ov_audio = |o: &Overlay| o.kind == ClipKind::Video && !o.mute && o.volume > 1e-6 && src.get(&o.path).is_some_and(|s| s.has_audio);
+    let has_audio = !p.audio.is_empty()
+        || ovs.iter().any(|(_, o)| ov_audio(o))
+        || p.clips.iter().any(|c| c.kind == ClipKind::Video && !c.mute && src.get(&c.path).is_some_and(|s| s.has_audio));
     let frame = Frame { w, h, fps: &fps_txt, fit: &p.out.fit, blur: caps.background_blur() };
-    let mut rg = Regions { preview, tmp, first_input: p.clips.len() + p.audio.len(), out_aspect: f64::from(w) / f64::from(h), masks: vec![] };
+    let mut rg = Regions { preview, tmp, first_input: ov_first + ovs.len(), out_aspect: f64::from(w) / f64::from(h), masks: vec![] };
     let mut stmts: Vec<String> = vec![];
     for (i, c) in p.clips.iter().enumerate() {
         clip_video(i, c, src.get(&c.path).expect("checked above"), &frame, &mut rg, &mut stmts);
@@ -582,6 +722,30 @@ pub fn build(p: &Project, src: &HashMap<String, Source>, caps: &Caps, tmp: &Path
         }
     }
     let (mut video, main_audio) = assemble(&placed, &p.clips, has_audio, &mut stmts, caps)?;
+
+    // 叠加轨：从下到上依次盖到主轨画面上
+    let mut ov_mix: Vec<String> = vec![];
+    if !ovs.is_empty() {
+        let mut slot: HashMap<usize, usize> = HashMap::new();
+        for (j, (n, _)) in ovs.iter().enumerate() {
+            slot.insert(*n, j);
+        }
+        for n in overlay_order(&p.overlays) {
+            let Some(&j) = slot.get(&n) else { continue };
+            let o = &p.overlays[n];
+            let sr = src.get(&o.path).expect("checked above");
+            let idx = ov_first + j;
+            overlay_video(j, idx, o, sr, (w, &fps_txt), &mut stmts);
+            video = overlay_on(j, &video, o, &mut stmts);
+            if has_audio && overlay_audio(j, idx, o, sr.has_audio, &mut stmts) {
+                ov_mix.push(format!("oa{j}"));
+            }
+            if o.end_ms() > total {
+                plan.notes.push(format!("第 {} 个叠加素材超出成片结尾，超出的部分被截掉", n + 1));
+            }
+        }
+        plan.notes.push(format!("叠加轨上有 {} 个素材", ovs.len()));
+    }
 
     // 文字
     if !p.texts.is_empty() {
@@ -598,16 +762,17 @@ pub fn build(p: &Project, src: &HashMap<String, Source>, caps: &Caps, tmp: &Path
         video = "vtx".into();
     }
 
-    // 配乐
+    // 配乐和叠加素材的声音：混在主轨声音上面
     let mut audio_out: Option<String> = main_audio;
-    if has_audio && !p.audio.is_empty() {
-        let main = audio_out.clone().expect("main audio exists when audio tracks exist");
-        let mut heard: Vec<(usize, bool)> = vec![];
+    if has_audio {
+        let main = audio_out.clone().expect("main audio exists when anything has sound");
+        // (标签, 要不要在主轨有声音时压低)
+        let mut heard: Vec<(String, bool)> = ov_mix.iter().map(|l| (l.clone(), false)).collect();
         for (k, a) in p.audio.iter().enumerate() {
             let idx = p.clips.len() + k;
             let sr = src.get(&a.path).expect("checked above");
             if music_track(k, idx, a, sr, total, &mut stmts) {
-                heard.push((k, a.duck));
+                heard.push((format!("m{k}"), a.duck));
             } else {
                 plan.warnings.push(format!("第 {} 条音频轨的起点在视频结束之后，不会被听到。", k + 1));
             }
@@ -622,15 +787,18 @@ pub fn build(p: &Project, src: &HashMap<String, Source>, caps: &Caps, tmp: &Path
             }
             let mut ins = format!("[{mix_main}]");
             let mut j = 0;
-            for (k, duck) in &heard {
+            for (label, duck) in &heard {
                 if *duck {
-                    stmts.push(format!("[m{k}][sc{j}]sidechaincompress=threshold=0.02:ratio=8:attack=30:release=500[d{k}]"));
-                    ins.push_str(&format!("[d{k}]"));
+                    // 压低后的标签沿用配乐的编号：[m0] → [d0]
+                    let d = format!("d{}", label.trim_start_matches('m'));
+                    stmts.push(format!("[{label}][sc{j}]sidechaincompress=threshold=0.02:ratio=8:attack=30:release=500[{d}]"));
+                    ins.push_str(&format!("[{d}]"));
                     j += 1;
                 } else {
-                    ins.push_str(&format!("[m{k}]"));
+                    ins.push_str(&format!("[{label}]"));
                 }
             }
+            need("amix", "无法混入配乐")?;
             stmts.push(format!("{ins}amix=inputs={}:duration=first:dropout_transition=0:normalize=0[amx]", heard.len() + 1));
             audio_out = Some("amx".into());
         }
@@ -750,6 +918,7 @@ mod tests {
             "concat",
             "alphamerge",
             "overlay",
+            "rotate",
         ];
         Caps {
             gpl: true,
@@ -1215,5 +1384,168 @@ mod tests {
         let g = graph_of(&plan);
         assert!(g.contains("[0:v:0]setpts=(PTS-STARTPTS)/2.000000,transpose=1,fps="), "{g}");
         assert!(plan.masks.is_empty() && !g.contains("rs0_"));
+    }
+
+    fn ov(path: &str, track: u32, start: u64, from: u64, to: u64) -> Overlay {
+        Overlay { id: 1, path: path.into(), track, start_ms: start, in_ms: from, out_ms: to, ..Default::default() }
+    }
+
+    fn built_ov(overlays: Vec<Overlay>, paths: &[&str]) -> EditPlan {
+        let p = Project { clips: vec![clip("/m/a.mp4", 0, 6000)], overlays, ..Default::default() }.checked().unwrap();
+        let mut all = vec!["/m/a.mp4"];
+        all.extend_from_slice(paths);
+        build(&p, &sources(&all), &caps(), &tmp(), Mode::Export, None).unwrap()
+    }
+
+    #[test]
+    fn overlays_become_inputs_after_the_clips_and_music() {
+        let mut gif = ov("/o/loop.gif", 1, 500, 0, 3000);
+        gif.looped = true;
+        let png = Overlay { kind: ClipKind::Image, ..ov("/o/p.png", 1, 1000, 0, 2000) };
+        let mut p = Project { clips: vec![clip("/m/a.mp4", 0, 6000)], overlays: vec![ov("/o/b.mp4", 2, 2000, 1000, 4000), gif, png], ..Default::default() }
+            .checked()
+            .unwrap();
+        p.audio = vec![AudioTrack { path: "/m/music.mp3".into(), ..Default::default() }];
+        let plan = build(&p, &sources(&["/m/a.mp4", "/m/music.mp3", "/o/b.mp4", "/o/loop.gif", "/o/p.png"]), &caps(), &tmp(), Mode::Export, None).unwrap();
+        let a = &plan.args;
+        let joined = a.join(" ");
+        // 输入顺序：主轨片段 → 音频轨 → 叠加素材（按列表顺序）
+        let order: Vec<usize> =
+            ["/m/a.mp4", "/m/music.mp3", "/o/b.mp4", "/o/loop.gif", "/o/p.png"].iter().map(|n| a.iter().position(|x| x == n).unwrap()).collect();
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{joined}");
+        assert!(joined.contains("-ss 1.000 -t 3.000 -i /o/b.mp4"), "视频叠加素材在输入端裁剪：{joined}");
+        assert!(joined.contains("-stream_loop -1 -t 3.000 -i /o/loop.gif"), "循环播放用 -stream_loop：{joined}");
+        assert!(joined.contains("-loop 1 -framerate 30000/1001 -t 2.000 -i /o/p.png"), "{joined}");
+        assert_eq!(a.iter().filter(|x| *x == "-stream_loop").count(), 1);
+        let g = graph_of(&plan);
+        // 层叠顺序：1 号轨的 gif（0.5 秒起）→ png（1 秒起）→ 2 号轨的 b.mp4
+        let pos = |s: &str| g.find(s).unwrap_or_else(|| panic!("{s} 不在图里：{g}"));
+        let (gif_at, png_at, mp4_at) = (pos("[ov1]overlay"), pos("[ov2]overlay"), pos("[ov0]overlay"));
+        assert!(gif_at < png_at && png_at < mp4_at, "{g}");
+        assert!(g.contains("setpts=PTS+2.000/TB[ov0]") && g.contains("setpts=PTS+0.500/TB[ov1]"), "{g}");
+        assert!(g.contains("enable='between(t,2.000,5.000)':eof_action=pass"), "{g}");
+        assert_eq!(plan.out_ms, 6000);
+    }
+
+    #[test]
+    fn an_overlay_is_scaled_rotated_and_faded_in_a_fixed_order() {
+        let mut o = ov("/o/b.mp4", 1, 1000, 0, 4000);
+        o.scale = 0.25;
+        o.x = 0.75;
+        o.y = 0.2;
+        o.rotate = 30.0;
+        o.opacity = 0.5;
+        o.flip_h = true;
+        o.brightness = 0.1;
+        o.fade_in_ms = 500;
+        o.fade_out_ms = 500;
+        o.speed = 2.0;
+        let plan = built_ov(vec![o], &["/o/b.mp4"]);
+        let g = graph_of(&plan);
+        // 1920 × 25% = 480 宽；素材 1920×1080 → 480×270
+        let chain = g.split(';').find(|s| s.starts_with("[1:v:0]")).expect(&g);
+        let order = [
+            "setpts=(PTS-STARTPTS)/2.000000",
+            "fps=30000/1001",
+            "hflip",
+            "scale=480:270",
+            "format=yuva420p",
+            "lutyuv=y=",
+            "rotate=0.523599",
+            "lutyuv=a='val*0.5000'",
+            "fade=t=in:st=0:d=0.500:alpha=1",
+            "fade=t=out:st=1.500:d=0.500:alpha=1",
+            "setpts=PTS+1.000/TB[ov0]",
+        ];
+        let mut at = 0;
+        for part in order {
+            let i = chain[at..].find(part).unwrap_or_else(|| panic!("{part} 不在 {chain} 里（或顺序不对）"));
+            at += i + part.len();
+        }
+        assert!(g.contains("overlay=x='W*(0.75000)-w/2':y='H*(0.20000)-h/2'"), "{g}");
+        assert!(g.contains("ow='rotw(0.523599)':oh='roth(0.523599)':c=none"), "{g}");
+        // 2 倍速：4 秒素材占 2 秒，从 1 秒到 3 秒
+        assert!(g.contains("between(t,1.000,3.000)"), "{g}");
+    }
+
+    #[test]
+    fn quarter_turns_use_transpose_and_swap_the_size() {
+        let mut o = ov("/o/b.mp4", 1, 0, 0, 2000);
+        o.scale = 0.25;
+        o.rotate = 90.0;
+        let g = graph_of(&built_ov(vec![o.clone()], &["/o/b.mp4"]));
+        // 90 度：先转置，宽 480、高按转置后的比例 1080:1920 → 853.3（取偶数 852）
+        assert!(g.contains("transpose=1,scale=480:852"), "{g}");
+        assert!(!g.contains("rotate="), "{g}");
+        o.rotate = -90.0;
+        let g = graph_of(&built_ov(vec![o.clone()], &["/o/b.mp4"]));
+        assert!(g.contains("transpose=2,scale=480:852"), "{g}");
+        o.rotate = 180.0;
+        let g = graph_of(&built_ov(vec![o], &["/o/b.mp4"]));
+        assert!(g.contains("hflip,vflip,scale=480:270"), "{g}");
+    }
+
+    #[test]
+    fn an_overlay_with_sound_joins_the_mix_even_without_music() {
+        let plan = built_ov(vec![ov("/o/b.mp4", 1, 2000, 0, 3000)], &["/o/b.mp4"]);
+        let g = graph_of(&plan);
+        assert!(g.contains("[1:a:0]asetpts=PTS-STARTPTS,aresample=48000"), "{g}");
+        assert!(g.contains("adelay=2000|2000[oa0]"), "{g}");
+        assert!(g.contains("[a0][oa0]amix=inputs=2:duration=first"), "{g}");
+        // 静音 / 图片 / 素材没有声音：不混
+        let mut muted = ov("/o/b.mp4", 1, 2000, 0, 3000);
+        muted.mute = true;
+        let g = graph_of(&built_ov(vec![muted], &["/o/b.mp4"]));
+        assert!(!g.contains("oa0") && !g.contains("amix"), "{g}");
+        let g = graph_of(&built_ov(vec![ov("/o/silent.mp4", 1, 0, 0, 3000)], &["/o/silent.mp4"]));
+        assert!(!g.contains("oa0"), "{g}");
+        // 和配乐一起混
+        let mut p = Project { clips: vec![clip("/m/a.mp4", 0, 6000)], overlays: vec![ov("/o/b.mp4", 1, 0, 0, 3000)], ..Default::default() }.checked().unwrap();
+        p.audio = vec![AudioTrack { path: "/m/music.mp3".into(), duck: true, ..Default::default() }];
+        let plan = build(&p, &sources(&["/m/a.mp4", "/m/music.mp3", "/o/b.mp4"]), &caps(), &tmp(), Mode::Export, None).unwrap();
+        let g = graph_of(&plan);
+        assert!(g.contains("[m0][sc0]sidechaincompress") && g.contains("[mm][oa0][d0]amix=inputs=3"), "{g}");
+    }
+
+    #[test]
+    fn overlays_that_start_after_the_end_are_dropped_with_a_warning() {
+        let plan = built_ov(vec![ov("/o/b.mp4", 1, 6000, 0, 2000), ov("/o/c.mp4", 1, 5000, 0, 3000)], &["/o/b.mp4", "/o/c.mp4"]);
+        assert!(plan.warnings.iter().any(|w| w.contains("第 1 个叠加素材") && w.contains("不会出现")), "{:?}", plan.warnings);
+        assert!(plan.notes.iter().any(|n| n.contains("第 2 个叠加素材超出成片结尾")), "{:?}", plan.notes);
+        assert!(!plan.args.contains(&"/o/b.mp4".to_string()), "起点在结尾之后的不放进输入");
+        let g = graph_of(&plan);
+        assert!(!g.contains("[ov1]"), "{g}");
+    }
+
+    #[test]
+    fn overlay_problems_are_reported_in_plain_words() {
+        let p = Project { clips: vec![clip("/m/a.mp4", 0, 3000)], overlays: vec![ov("/o/b.mp4", 1, 0, 0, 2000)], ..Default::default() }.checked().unwrap();
+        let mut c = caps();
+        c.filters.remove("overlay");
+        let e = build(&p, &sources(&["/m/a.mp4", "/o/b.mp4"]), &c, &tmp(), Mode::Export, None).unwrap_err();
+        assert!(e.message.contains("overlay") && e.message.contains("完整版"), "{}", e.message);
+        // 读不到素材信息
+        let e = build(&p, &sources(&["/m/a.mp4"]), &caps(), &tmp(), Mode::Export, None).unwrap_err();
+        assert!(e.message.contains("第 1 个叠加素材"), "{}", e.message);
+        // 素材里没有画面
+        let mut srcs = sources(&["/m/a.mp4", "/o/b.mp4"]);
+        srcs.get_mut("/o/b.mp4").unwrap().has_video = false;
+        let e = build(&p, &srcs, &caps(), &tmp(), Mode::Export, None).unwrap_err();
+        assert!(e.message.contains("没有画面"), "{}", e.message);
+        // 透明度 / 旋转需要的滤镜
+        let mut o = ov("/o/b.mp4", 1, 0, 0, 2000);
+        o.opacity = 0.5;
+        let p = Project { clips: vec![clip("/m/a.mp4", 0, 3000)], overlays: vec![o], ..Default::default() }.checked().unwrap();
+        let mut c = caps();
+        c.filters.remove("lutyuv");
+        assert!(build(&p, &sources(&["/m/a.mp4", "/o/b.mp4"]), &c, &tmp(), Mode::Export, None).unwrap_err().message.contains("lutyuv"));
+    }
+
+    #[test]
+    fn projects_without_overlays_build_exactly_as_before() {
+        let plan = built_ov(vec![], &[]);
+        let g = graph_of(&plan);
+        assert!(!g.contains("overlay") && !g.contains("[ov") && !g.contains("[ob"), "{g}");
+        assert!(!plan.notes.iter().any(|n| n.contains("叠加")));
     }
 }
