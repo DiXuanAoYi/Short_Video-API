@@ -7,6 +7,7 @@ import type { UnlistenFn } from '@tauri-apps/api/event'
 import { api, errorText, events } from '../../api'
 import type { EditProject, JobSnap } from '../../types'
 import { useEditProject, type AddReport } from '../../composables/useEditProject'
+import { useRegions } from '../../composables/useRegions'
 import { MAX_AUDIO, MAX_CLIPS, MAX_TEXTS, clamp, msText, outputSize } from '../../utils/edit'
 import FileInput from './FileInput.vue'
 import EditInspector from './edit/EditInspector.vue'
@@ -17,6 +18,7 @@ const props = defineProps<{ preset?: string[] }>()
 const emit = defineEmits<{ consumed: [] }>()
 
 const ed = useEditProject()
+const rg = useRegions(ed)
 const root = ref<HTMLElement | null>(null)
 const tlBox = ref<HTMLElement | null>(null)
 const timeline = ref<InstanceType<typeof EditTimeline> | null>(null)
@@ -296,7 +298,13 @@ function visible(): boolean {
 function onKey(e: KeyboardEvent) {
   if (!visible()) return
   const t = e.target as HTMLElement | null
-  if (t?.closest('input, textarea, select, [contenteditable="true"], .el-overlay, .el-popper')) return
+  if (t?.closest('textarea, select, [contenteditable="true"], .el-overlay, .el-popper')) return
+  const input = t?.closest('input') as HTMLInputElement | null
+  if (input) {
+    // 点过单选 / 复选按钮（比如检查器的标签页）后焦点会留在上面：快捷键照常生效，空格、方向键和回车留给它们自己用
+    if (input.type !== 'radio' && input.type !== 'checkbox') return
+    if (e.key === ' ' || e.key === 'Enter' || e.key.startsWith('Arrow')) return
+  }
   const mod = e.ctrlKey || e.metaKey
   const key = e.key.toLowerCase()
   if (mod && key === 'z') {
@@ -315,6 +323,12 @@ function onKey(e: KeyboardEvent) {
     togglePlay()
   } else if (key === 's') {
     split()
+  } else if (e.key === 'Escape' && rg.drawing.value) {
+    rg.cancelDraw()
+  } else if ((e.key === 'Delete' || e.key === 'Backspace') && rg.tabActive.value && rg.region.value) {
+    // 在“区域”页选中了区域时，删除键删的是区域，不是整个片段
+    e.preventDefault()
+    rg.remove(rg.region.value.id)
   } else if (e.key === 'Delete' || e.key === 'Backspace') {
     e.preventDefault()
     ed.removeSelected()
@@ -387,7 +401,7 @@ const sizeWarn = computed(() => (ed.project.value.clips.length >= MAX_CLIPS ? `�
     <div class="main">
       <!-- 监视器 -->
       <div class="left">
-        <EditMonitor :ed="ed" :mode="monitorMode" :preview-url="preview?.url ?? null" />
+        <EditMonitor :ed="ed" :rg="rg" :mode="monitorMode" :preview-url="preview?.url ?? null" />
         <div class="transport">
           <el-button size="small" :disabled="!hasClips" @click="goto(0)">回到开头</el-button>
           <el-button size="small" type="primary" :disabled="!hasClips" class="play" @click="togglePlay">{{ ed.playing.value ? '暂停' : '播放' }}</el-button>
@@ -413,7 +427,7 @@ const sizeWarn = computed(() => (ed.project.value.clips.length >= MAX_CLIPS ? `�
 
       <!-- 检查器 -->
       <div class="right">
-        <EditInspector :ed="ed" v-model:out-dir="outDir" @goto="goto" />
+        <EditInspector :ed="ed" :rg="rg" v-model:out-dir="outDir" @goto="goto" />
       </div>
     </div>
 

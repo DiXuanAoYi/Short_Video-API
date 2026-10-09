@@ -35,6 +35,9 @@ import type {
   NormPreset,
   NormSpec,
   EditProject,
+  NRect,
+  TrackDetect,
+  TrackResult,
   EditSource,
   OpenedEdit,
   LutInfo,
@@ -229,6 +232,9 @@ export const api = {
   editOpen: (path: string) => invoke<OpenedEdit>('edit_open', { path }),
   editMissing: (paths: string[]) => invoke<string[]>('edit_missing', { paths }),
   editFonts: () => invoke<{ default: string | null }>('edit_fonts'),
+  trackDetect: (path: string, atMs: number) => invoke<TrackDetect>('track_detect', { path, atMs }),
+  trackFollow: (req: { id: number; path: string; fromMs: number; toMs: number; refMs: number; rect: NRect }) => invoke<TrackResult>('track_follow', { req }),
+  trackCancel: (id: number) => invoke<void>('track_cancel', { id }),
   subtitleTool: (job: SubJob) => invoke<{ output: string; count: number }>('subtitle_tool', { job }),
 
   copyText: (text: string) => invoke<void>('copy_text', { text }),
@@ -289,6 +295,7 @@ export const events = {
   onInbox: (cb: (c: InboxCounts) => void): Promise<UnlistenFn> => listen<InboxCounts>('inbox://changed', (e) => cb(e.payload)),
   onLibraryProgress: (cb: (p: { task: string; done: number; total: number }) => void): Promise<UnlistenFn> =>
     listen<{ task: string; done: number; total: number }>('library://progress', (e) => cb(e.payload)),
+  onTrackProgress: (cb: (p: { id: number; percent: number }) => void): Promise<UnlistenFn> => listen<{ id: number; percent: number }>('edit://track', (e) => cb(e.payload)),
   onMediaJobs: (cb: (jobs: JobSnap[]) => void): Promise<UnlistenFn> => listen<JobSnap[]>('media://jobs', (e) => cb(e.payload)),
   onLibraryChanged: (cb: () => void): Promise<UnlistenFn> => listen('library://changed', () => cb()),
   onLock: (cb: (locked: boolean) => void): Promise<UnlistenFn> => listen<{ locked: boolean }>('security://lock', (e) => cb(e.payload.locked)),

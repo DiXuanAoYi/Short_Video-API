@@ -11,6 +11,7 @@ use crate::vidnorm::facts;
 
 use super::build::{build, EditPlan, Mode, Source};
 use super::fonts;
+use super::region::render_mask;
 use super::spec::{ClipKind, Project, MIN_MS};
 
 fn tmp_dir(ctx: &JobCtx) -> PathBuf {
@@ -119,6 +120,12 @@ fn note_text(notes: &[String], plan: &EditPlan) -> String {
 }
 
 async fn run(ctx: &JobCtx, pre: &Prepared, out: &Path) -> AppResult<()> {
+    // 区域效果的遮罩：先逐个生成好，ffmpeg 把它们当输入读
+    let total = pre.plan.masks.len();
+    for (k, m) in pre.plan.masks.iter().enumerate() {
+        ctx.note(format!("正在生成区域遮罩（{}/{}）…", k + 1, total));
+        render_mask(&pre.ffmpeg, m, || ctx.check()).await?;
+    }
     let mut args = pre.plan.args.clone();
     args.extend(muxer_args(pre.plan.ext, out));
     let on_percent = |p: f64| ctx.percent(p);

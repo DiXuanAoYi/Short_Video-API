@@ -13,6 +13,7 @@ import {
   clipDuration,
   clipFromSource,
   clipIndexAt,
+  copyRegion,
   emptyProject,
   layout,
   mediaPaths,
@@ -275,7 +276,7 @@ export function useEditProject() {
       if (s.kind === 'clip') {
         const i = p.clips.findIndex((c) => c.id === s.id)
         if (i < 0 || p.clips.length >= MAX_CLIPS) return
-        p.clips.splice(i + 1, 0, { ...p.clips[i], id, transition: null })
+        p.clips.splice(i + 1, 0, { ...p.clips[i], id, transition: null, regions: p.clips[i].regions.map(copyRegion) })
       } else if (s.kind === 'text') {
         const t = p.texts.find((c) => c.id === s.id)
         if (!t || p.texts.length >= MAX_TEXTS) return

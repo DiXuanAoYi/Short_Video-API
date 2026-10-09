@@ -5,22 +5,25 @@ import { open } from '@tauri-apps/plugin-dialog'
 import { ElMessage } from 'element-plus'
 import { errorText } from '../../../api'
 import type { EditApi } from '../../../composables/useEditProject'
+import type { RegionApi } from '../../../composables/useRegions'
 import type { EditClip, EditOutput } from '../../../types'
 import { MIN_MS, MIN_TRANSITION_MS, TRANSITIONS, clipDuration, msText, outputSize } from '../../../utils/edit'
 import EditField from './EditField.vue'
+import EditRegions from './EditRegions.vue'
 import EditSlider from './EditSlider.vue'
 import TimeInput from './TimeInput.vue'
 
-const props = defineProps<{ ed: EditApi }>()
+const props = defineProps<{ ed: EditApi; rg: RegionApi }>()
 const emit = defineEmits<{ goto: [ms: number] }>()
 const ed = props.ed
 const outDir = defineModel<string>('outDir', { default: '' })
 
-const tab = ref<'item' | 'out'>('item')
+const tab = ref<'item' | 'region' | 'out'>('item')
 watch(
   () => ed.sel.value,
   (s) => {
-    if (s) tab.value = 'item'
+    // 选了别的片段时留在“区域”页，方便连着给几个镜头加；选了文字、配乐就回到“属性”
+    if (s && !(tab.value === 'region' && s.kind === 'clip')) tab.value = 'item'
   },
 )
 
@@ -146,6 +149,7 @@ async function pickDir() {
   <div class="insp">
     <el-radio-group v-model="tab" size="small" class="seg">
       <el-radio-button value="item">属性</el-radio-button>
+      <el-radio-button value="region">区域</el-radio-button>
       <el-radio-button value="out">输出</el-radio-button>
     </el-radio-group>
 
@@ -308,6 +312,11 @@ async function pickDir() {
     <div v-else-if="tab === 'item'" class="sec mute small">
       在时间线上点一个片段、文字或配乐，在这里修改它的属性。<br />
       点时间线空白处可以移动播放位置；拖动片段可以换顺序，拖动两端可以裁剪。
+    </div>
+
+    <!-- 区域 -->
+    <div v-if="tab === 'region'" class="sec">
+      <EditRegions :ed="ed" :rg="rg" @goto="(ms) => emit('goto', ms)" />
     </div>
 
     <!-- 输出 -->

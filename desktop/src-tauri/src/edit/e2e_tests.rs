@@ -10,17 +10,18 @@ use std::time::Duration;
 use super::build::{build, EditPlan, Mode, Source};
 use super::fonts;
 use super::job::fit_to_sources;
+use super::region::render_mask;
 use super::spec::{AudioTrack, Clip, ClipKind, Project, TextItem, Transition, TRANSITIONS};
 use crate::media_tools::muxer_args;
 use crate::postprocess::{base_args, run_ffmpeg_capture};
 use crate::vidcaps::{self, Caps};
 use crate::vidnorm::facts;
 
-fn ffmpeg() -> Option<PathBuf> {
+pub(super) fn ffmpeg() -> Option<PathBuf> {
     std::process::Command::new("ffmpeg").arg("-version").output().ok().filter(|o| o.status.success()).map(|_| PathBuf::from("ffmpeg"))
 }
 
-fn dir(name: &str) -> PathBuf {
+pub(super) fn dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!(
         "clearclip-edit-e2e-{name}-{}-{}",
         std::process::id(),
@@ -30,7 +31,7 @@ fn dir(name: &str) -> PathBuf {
     d
 }
 
-fn strs(a: &[&str]) -> Vec<String> {
+pub(super) fn strs(a: &[&str]) -> Vec<String> {
     a.iter().map(|s| s.to_string()).collect()
 }
 
@@ -88,7 +89,7 @@ fn with_t(mut c: Clip, kind: &str, ms: u64) -> Clip {
 }
 
 /// 按任务的流程（读素材、核对、生成参数、运行）渲染一个工程。
-async fn render(ff: &Path, caps: &Caps, d: &Path, p: Project, mode: Mode) -> (PathBuf, EditPlan) {
+pub(super) async fn render(ff: &Path, caps: &Caps, d: &Path, p: Project, mode: Mode) -> (PathBuf, EditPlan) {
     static N: AtomicUsize = AtomicUsize::new(0);
     let mut p = p.checked().expect("工程校验");
     let mut src: HashMap<String, Source> = HashMap::new();
@@ -102,6 +103,9 @@ async fn render(ff: &Path, caps: &Caps, d: &Path, p: Project, mode: Mode) -> (Pa
     let font = fonts::default_font();
     let plan = build(&p, &src, caps, &d.join("tmp"), mode, font.as_deref()).expect("build");
     let out = d.join(format!("out-{}.{}", N.fetch_add(1, Ordering::SeqCst), plan.ext));
+    for m in &plan.masks {
+        render_mask(ff, m, || Ok(())).await.expect("遮罩");
+    }
     let mut a = base_args();
     a.extend(plan.args.clone());
     a.extend(muxer_args(plan.ext, &out));

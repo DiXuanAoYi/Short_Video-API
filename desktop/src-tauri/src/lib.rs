@@ -45,6 +45,7 @@ pub mod subtitle;
 pub mod subtitle_io;
 pub mod subtitle_tools;
 pub mod tools;
+pub mod track;
 mod tray;
 pub mod upload;
 pub mod vault;
@@ -518,6 +519,9 @@ pub fn run() {
             edit::cmds::edit_open,
             edit::cmds::edit_missing,
             edit::cmds::edit_fonts,
+            track::cmds::track_detect,
+            track::cmds::track_follow,
+            track::cmds::track_cancel,
             lut::cmds::lut_looks,
             lut::cmds::lut_inspect,
             lut::cmds::lut_sample,

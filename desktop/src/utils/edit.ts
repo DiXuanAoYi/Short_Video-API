@@ -2,13 +2,15 @@
 // 排布规则和后端 `src-tauri/src/edit/spec.rs` 的 `layout` 保持一致，改那边时要一起改这里。
 // 这个文件不要引入别的运行时模块（用 node 直接跑 scripts 里的检查时需要）。
 
-import type { EditAudio, EditClip, EditOutput, EditProject, EditSource, EditText } from '../types'
+import type { EditAudio, EditClip, EditOutput, EditProject, EditRegion, EditSource, EditText, NRect, RegionEffect, TrackPt } from '../types'
 
 export const MIN_MS = 100
 export const MIN_TRANSITION_MS = 100
 export const MAX_CLIPS = 300
 export const MAX_TEXTS = 100
 export const MAX_AUDIO = 20
+/** 一个片段最多几个区域（和后端 `MAX_REGIONS` 一致） */
+export const MAX_REGIONS = 8
 /** 图片、文字默认的时长 */
 export const DEFAULT_STILL_MS = 5000
 export const DEFAULT_TEXT_MS = 3000
@@ -56,7 +58,7 @@ export function normalizeProject(raw: Partial<EditProject> | null | undefined): 
   const r = raw ?? {}
   p.title = typeof r.title === 'string' ? r.title : ''
   p.out = { ...defaultOutput(), ...(r.out ?? {}) }
-  p.clips = (r.clips ?? []).map((c, i) => ({ ...blankClip(), ...c, id: c.id ?? i + 1 }))
+  p.clips = (r.clips ?? []).map((c, i) => ({ ...blankClip(), ...c, id: c.id ?? i + 1, regions: (c.regions ?? []).map((g, j) => ({ ...blankRegion(), ...g, id: g.id ?? j + 1 })) }))
   p.texts = (r.texts ?? []).map((t, i) => ({ ...blankText(), ...t, id: t.id ?? i + 1 }))
   p.audio = (r.audio ?? []).map((a, i) => ({ ...blankAudio(), ...a, id: a.id ?? i + 1 }))
   return p
@@ -80,6 +82,7 @@ function blankClip(): EditClip {
     brightness: 0,
     contrast: 1,
     saturation: 1,
+    regions: [],
     transition: null,
   }
 }
@@ -204,8 +207,8 @@ export function fadeFactor(c: EditClip, pl: Placed, t: number): number {
 export function splitClip(c: EditClip, pl: Placed, t: number, newId: number): [EditClip, EditClip] | null {
   const local = t - pl.startMs
   if (local < MIN_MS || pl.durMs - local < MIN_MS) return null
-  const first: EditClip = { ...c, transition: c.transition ? { ...c.transition } : null }
-  const second: EditClip = { ...c, id: newId, transition: null }
+  const first: EditClip = { ...c, transition: c.transition ? { ...c.transition } : null, regions: c.regions.map(copyRegion) }
+  const second: EditClip = { ...c, id: newId, transition: null, regions: c.regions.map(copyRegion) }
   if (c.kind === 'image') {
     first.outMs = local
     second.outMs = pl.durMs - local
@@ -216,6 +219,11 @@ export function splitClip(c: EditClip, pl: Placed, t: number, newId: number): [E
   }
   first.fadeOutMs = 0
   second.fadeInMs = 0
+  if (c.kind === 'video') {
+    // 区域的轨迹用的是素材时间，两半各留下自己那一段（边上多留一个点，插值才对得上）
+    first.regions = first.regions.map((r) => ({ ...r, track: trimTrack(r.track, first.inMs, first.outMs) }))
+    second.regions = second.regions.map((r) => ({ ...r, track: trimTrack(r.track, second.inMs, second.outMs) }))
+  }
   return [first, second]
 }
 
@@ -311,4 +319,299 @@ export function snap(v: number, candidates: number[], range: number): number {
     }
   }
   return best
+}
+
+
+// ---------- 跟着物体走的区域 ----------
+// 轨迹点的位置是相对整个画面的比例（左上角为原点），方向是素材的显示方向（旋转翻转之前），时间是素材里的时间。
+// 插值、放大的算法和后端 `src-tauri/src/track/mod.rs` 的 `interpolate`、`edit/region.rs` 的 `box_at` 保持一致。
+
+/** 拖动框时，这个时刻前后多长时间内自动追踪出来的点会被让开，路径从手动的点平滑过渡过去 */
+export const PIN_EASE_MS = 300
+/** 框的最小尺寸（占画面的比例） */
+export const MIN_BOX = 0.01
+/** 一次追踪最长（毫秒），和后端一致 */
+export const MAX_TRACK_SPAN_MS = 30 * 60 * 1000
+
+export const REGION_EFFECTS: { id: RegionEffect; label: string; hint: string }[] = [
+  { id: 'mosaic', label: '马赛克', hint: '把区域打上马赛克（遮住脸、车牌、水印）' },
+  { id: 'blur', label: '模糊', hint: '把区域虚化' },
+  { id: 'tone', label: '局部调色', hint: '只调区域里的亮度、对比度、饱和度' },
+  { id: 'focus', label: '跟随聚焦', hint: '放大并让画面始终跟着这个区域走（也可以把横屏素材裁成竖屏）' },
+]
+
+export function blankRegion(): EditRegion {
+  return {
+    id: 0,
+    name: '',
+    track: [],
+    shape: 'rect',
+    feather: 0.2,
+    grow: 0,
+    invert: false,
+    effect: 'mosaic',
+    strength: 0.5,
+    brightness: 0,
+    contrast: 1,
+    saturation: 1,
+    zoom: 2,
+    reframe: false,
+    smooth: 0.6,
+    startMs: null,
+    endMs: null,
+  }
+}
+
+export function copyRegion(r: EditRegion): EditRegion {
+  return { ...r, track: r.track.map((p) => ({ ...p })) }
+}
+
+export function nextRegionId(c: EditClip): number {
+  return c.regions.reduce((m, r) => Math.max(m, r.id), 0) + 1
+}
+
+/** 轨迹在 t（素材时间，毫秒）处的矩形：相邻两点之间直线插值，两头停在第一个 / 最后一个点。没有点返回 null。 */
+export function trackAt(pts: TrackPt[], t: number): NRect | null {
+  const first = pts[0]
+  const last = pts[pts.length - 1]
+  if (!first || !last) return null
+  const rect = (p: TrackPt): NRect => ({ x: p.x, y: p.y, w: p.w, h: p.h })
+  if (t <= first.tMs) return rect(first)
+  if (t >= last.tMs) return rect(last)
+  // 二分找到 t 所在的区间：第一个时间 > t 的点
+  let lo = 0
+  let hi = pts.length
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1
+    if (pts[mid].tMs <= t) lo = mid + 1
+    else hi = mid
+  }
+  const a = pts[lo - 1]
+  const b = pts[lo]
+  const span = b.tMs - a.tMs
+  const f = span > 0 ? (t - a.tMs) / span : 0
+  const l = (u: number, v: number) => u + (v - u) * f
+  return { x: l(a.x, b.x), y: l(a.y, b.y), w: l(a.w, b.w), h: l(a.h, b.h) }
+}
+
+/** 效果真正作用的范围：追踪的框按“扩大”系数放大（中心不变）。 */
+export function grownBox(r: EditRegion, t: number): NRect | null {
+  const b = trackAt(r.track, t)
+  if (!b) return null
+  const k = 1 + r.grow
+  const w = b.w * k
+  const h = b.h * k
+  return { x: b.x + (b.w - w) / 2, y: b.y + (b.h - h) / 2, w, h }
+}
+
+/** 效果在这个素材时刻生效吗（聚焦不受限制）。 */
+export function regionActiveAt(r: EditRegion, t: number): boolean {
+  return (r.startMs === null || t >= r.startMs) && (r.endMs === null || t < r.endMs)
+}
+
+/** 把框收进画面：尺寸不小于 MIN_BOX、不大于整个画面，位置不超出画面。 */
+export function clampBox(b: NRect): NRect {
+  const w = clamp(b.w, MIN_BOX, 1)
+  const h = clamp(b.h, MIN_BOX, 1)
+  return { x: clamp(b.x, 0, 1 - w), y: clamp(b.y, 0, 1 - h), w, h }
+}
+
+/** 由对角两点（拖出来的框）得到矩形。 */
+export function boxFromCorners(ax: number, ay: number, bx: number, by: number): NRect {
+  return { x: Math.min(ax, bx), y: Math.min(ay, by), w: Math.abs(bx - ax), h: Math.abs(by - ay) }
+}
+
+/** 新区域：参照时刻 `refMs` 只有一个手动指定的点。 */
+export function newRegion(id: number, rect: NRect, refMs: number, effect: RegionEffect = 'mosaic'): EditRegion {
+  const r = blankRegion()
+  const b = clampBox(rect)
+  r.id = id
+  r.effect = effect
+  r.track = [{ tMs: Math.round(refMs), ...b, pin: true }]
+  if (effect === 'tone') r.brightness = 0.2
+  return r
+}
+
+/** 手动把区域放到 `rect`：在 `tMs` 放一个手动点，前后 PIN_EASE_MS 内自动追踪出来的点让开。 */
+export function setPin(track: TrackPt[], tMs: number, rect: NRect): TrackPt[] {
+  const t = Math.round(tMs)
+  const keep = track.filter((p) => p.pin || Math.abs(p.tMs - t) > PIN_EASE_MS)
+  const next = keep.filter((p) => p.tMs !== t)
+  next.push({ tMs: t, ...rect, pin: true })
+  return next.sort((a, b) => a.tMs - b.tMs)
+}
+
+/** 改区域大小：整段一起变（每个点保持中心不变）。 */
+export function resizeAll(track: TrackPt[], w: number, h: number): TrackPt[] {
+  const nw = clamp(w, MIN_BOX, 1)
+  const nh = clamp(h, MIN_BOX, 1)
+  return track.map((p) => {
+    const cx = p.x + p.w / 2
+    const cy = p.y + p.h / 2
+    return { ...p, x: clamp(cx - nw / 2, 0, 1 - nw), y: clamp(cy - nh / 2, 0, 1 - nh), w: nw, h: nh }
+  })
+}
+
+/** 追踪出来的结果并进现有轨迹：范围外的老点保留；范围内用新点，但手动点（及其前后让开的范围）保持原样。 */
+export function mergeTracked(old: TrackPt[], fresh: TrackPt[], fromMs: number, toMs: number): TrackPt[] {
+  const outside = old.filter((p) => p.tMs < fromMs || p.tMs > toMs)
+  const pins = old.filter((p) => p.pin && p.tMs >= fromMs && p.tMs <= toMs)
+  const freshPins = fresh.filter((p) => p.pin)
+  // 这次追踪的参照点（也是手动点）盖过同一时刻的老点
+  const keepPins = pins.filter((p) => !freshPins.some((f) => f.tMs === p.tMs))
+  const tracked = fresh.filter((p) => p.pin || !keepPins.some((q) => Math.abs(q.tMs - p.tMs) <= PIN_EASE_MS))
+  const all = [...outside, ...keepPins, ...tracked].sort((a, b) => a.tMs - b.tMs)
+  // 同一时刻只留一个（手动点优先）
+  const out: TrackPt[] = []
+  for (const p of all) {
+    const last = out[out.length - 1]
+    if (last && last.tMs === p.tMs) {
+      if (p.pin && !last.pin) out[out.length - 1] = p
+    } else out.push(p)
+  }
+  return out
+}
+
+/** 只留下 [fromMs, toMs] 这一段用得到的点：范围里的，加上两边各最近的一个（让两端的插值不变）。 */
+export function trimTrack(track: TrackPt[], fromMs: number, toMs: number): TrackPt[] {
+  if (track.length <= 2) return track.map((p) => ({ ...p }))
+  const firstIn = track.findIndex((p) => p.tMs >= fromMs)
+  let lastIn = -1
+  for (let i = track.length - 1; i >= 0; i--) {
+    if (track[i].tMs <= toMs) {
+      lastIn = i
+      break
+    }
+  }
+  // 整条轨迹都在范围一边：留下离范围最近的那个点
+  if (firstIn < 0) return [{ ...track[track.length - 1] }]
+  if (lastIn < 0) return [{ ...track[0] }]
+  const from = Math.max(0, firstIn - 1)
+  const to = Math.min(track.length - 1, lastIn + 1)
+  return track.slice(from, Math.max(from, to) + 1).map((p) => ({ ...p }))
+}
+
+/** 追踪不到（丢失）的时间段（素材毫秒）：连续丢失的点合成一段。 */
+export function lostSpans(track: TrackPt[]): [number, number][] {
+  const out: [number, number][] = []
+  let start: number | null = null
+  for (let i = 0; i < track.length; i++) {
+    const p = track[i]
+    if (p.lost && !p.pin) {
+      if (start === null) start = i > 0 ? track[i - 1].tMs : p.tMs
+    } else if (start !== null) {
+      out.push([start, p.tMs])
+      start = null
+    }
+  }
+  if (start !== null) out.push([start, track[track.length - 1].tMs])
+  return out
+}
+
+/** 轨迹覆盖了素材的哪一段（没有点返回 null）。 */
+export function trackSpan(track: TrackPt[]): [number, number] | null {
+  return track.length ? [track[0].tMs, track[track.length - 1].tMs] : null
+}
+
+/** 只有一个点（还没追踪过，或者手动放的一个固定位置）。 */
+export const isStatic = (track: TrackPt[]) => track.length <= 1
+
+/** 画路径用：点太多时均匀抽稀（保留首尾）。 */
+export function thin<T>(list: T[], max: number): T[] {
+  if (list.length <= max) return list
+  const out: T[] = []
+  const step = (list.length - 1) / (max - 1)
+  for (let i = 0; i < max; i++) out.push(list[Math.round(i * step)])
+  return out
+}
+
+/** 区域给人看的名字：没起名就用序号（效果已经在旁边的标签里写了）。 */
+export function regionTitle(r: EditRegion, index: number): string {
+  return r.name.trim() || `#${index + 1}`
+}
+
+// ---------- 监视器里框和素材画面的对应 ----------
+
+export interface MonitorGeom {
+  /** 视频元素（旋转翻转之前）在舞台里的位置和大小 */
+  box: { left: number; top: number; w: number; h: number }
+  /** 画面内容在视频元素里的位置和大小（按“完整显示 / 铺满”缩放之后） */
+  content: { left: number; top: number; w: number; h: number }
+  /** 视频元素的 transform（旋转、翻转） */
+  transform: string
+  /** 舞台上的像素位置（相对舞台左上角）→ 素材画面里的比例（可以超出 0–1） */
+  toNorm(px: number, py: number): { x: number; y: number }
+  /** 素材画面里的比例 → 舞台上的像素位置 */
+  fromNorm(x: number, y: number): { px: number; py: number }
+}
+
+/**
+ * 监视器里素材画面的几何：和 EditMonitor 里视频元素的摆法一致——元素按“转之前”的宽高居中摆放，
+ * 画面按 object-fit 放进元素，再整体 `scale(翻转) rotate(旋转)`。框的位置据此换算，旋转、翻转、留黑边、铺满都对得上。
+ */
+export function monitorGeom(stage: { w: number; h: number }, c: { rotate: number; flipH: boolean; flipV: boolean }, src: { w: number; h: number }, fit: 'contain' | 'cover' | 'blur'): MonitorGeom {
+  const turned = c.rotate === 90 || c.rotate === 270
+  const bw = turned ? stage.h : stage.w
+  const bh = turned ? stage.w : stage.h
+  const sw = Math.max(1, src.w)
+  const sh = Math.max(1, src.h)
+  const k = fit === 'cover' ? Math.max(bw / sw, bh / sh) : Math.min(bw / sw, bh / sh)
+  const cw = sw * k
+  const ch = sh * k
+  const th = (c.rotate * Math.PI) / 180
+  const cos = Math.round(Math.cos(th) * 1e12) / 1e12
+  const sin = Math.round(Math.sin(th) * 1e12) / 1e12
+  const sx = c.flipH ? -1 : 1
+  const sy = c.flipV ? -1 : 1
+  return {
+    box: { left: (stage.w - bw) / 2, top: (stage.h - bh) / 2, w: bw, h: bh },
+    content: { left: (bw - cw) / 2, top: (bh - ch) / 2, w: cw, h: ch },
+    transform: `scale(${sx}, ${sy}) rotate(${c.rotate}deg)`,
+    toNorm(px, py) {
+      // transform 是 scale·rotate：先转再翻，反过来先翻再反向转
+      const ux = sx * (px - stage.w / 2)
+      const uy = sy * (py - stage.h / 2)
+      const lx = ux * cos + uy * sin
+      const ly = -ux * sin + uy * cos
+      return { x: lx / cw + 0.5, y: ly / ch + 0.5 }
+    },
+    fromNorm(x, y) {
+      const lx = (x - 0.5) * cw
+      const ly = (y - 0.5) * ch
+      const rx = lx * cos - ly * sin
+      const ry = lx * sin + ly * cos
+      return { px: stage.w / 2 + sx * rx, py: stage.h / 2 + sy * ry }
+    },
+  }
+}
+
+/**
+ * 跟随聚焦的取景窗口大小（占素材画面的比例）：不跟随成片比例时是整个画面除以放大倍数；
+ * 跟随成片比例（`aspect` = 成片宽 / 高，已换算成素材方向）时先取画面里最大的这个比例的矩形，再除以放大倍数。
+ * 和后端 `edit/region.rs` 的 `focus_window` 一致（后端算整数像素，这里只用来在监视器里画示意框）。
+ */
+export function focusWindow(zoom: number, src: { w: number; h: number }, aspect: number | null): { w: number; h: number } {
+  const sw = Math.max(1, src.w)
+  const sh = Math.max(1, src.h)
+  let bw = sw
+  let bh = sh
+  if (aspect !== null && Number.isFinite(aspect) && aspect > 0) {
+    if (aspect >= sw / sh) bh = sw / aspect
+    else bw = sh * aspect
+  }
+  const z = Math.max(1, zoom)
+  return { w: Math.min(1, bw / z / sw), h: Math.min(1, bh / z / sh) }
+}
+
+/** 取景窗口在 t 时刻的位置：以区域中心为中心，收在画面里（没有做镜头平滑，只是示意）。 */
+export function focusRect(r: EditRegion, t: number, win: { w: number; h: number }): NRect | null {
+  const b = trackAt(r.track, t)
+  if (!b) return null
+  return { x: clamp(b.x + b.w / 2 - win.w / 2, 0, 1 - win.w), y: clamp(b.y + b.h / 2 - win.h / 2, 0, 1 - win.h), w: win.w, h: win.h }
+}
+
+/** 成片比例换算到素材方向（旋转 90 / 270 度时宽高对调）。 */
+export function aspectInSource(outW: number, outH: number, rotate: number): number {
+  const a = outH > 0 ? outW / outH : 1
+  return rotate === 90 || rotate === 270 ? 1 / a : a
 }

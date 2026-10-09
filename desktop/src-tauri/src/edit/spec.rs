@@ -6,9 +6,15 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::track::TrackPt;
+
 pub const MAX_CLIPS: usize = 300;
 pub const MAX_TEXTS: usize = 100;
 pub const MAX_AUDIO: usize = 20;
+/// 一个片段上最多的区域数
+pub const MAX_REGIONS: usize = 8;
+/// 一条区域轨迹最多的点数（追踪结果经过精简，正常远少于这个数）
+pub const MAX_TRACK_POINTS: usize = 20_000;
 /// 片段、文字最短的长度
 pub const MIN_MS: u64 = 100;
 /// 小于这个长度的转场当作没有（只会闪一下）
@@ -57,6 +63,80 @@ impl Default for Transition {
     }
 }
 
+/// 区域效果：马赛克 / 模糊 / 局部调色作用在区域内（或区域以外），聚焦让画面跟着区域走。
+pub const REGION_EFFECTS: &[&str] = &["mosaic", "blur", "tone", "focus"];
+
+/// 跟着物体走的一块画面区域：位置来自追踪（素材时间 + 相对画面的矩形，方向是素材的显示方向，旋转翻转之前），
+/// 效果可以作用在区域里，也可以作用在区域以外。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Region {
+    pub id: u32,
+    pub name: String,
+    /// 轨迹；没有点的区域会被丢掉
+    pub track: Vec<TrackPt>,
+    /// rect / ellipse（框的内切椭圆）
+    pub shape: String,
+    /// 边缘羽化 0–1（占框短边的一半）
+    pub feather: f64,
+    /// 区域比追踪的框大多少（-0.5–2，0.2 = 各边放大 20%）
+    pub grow: f64,
+    /// 效果作用在区域以外
+    pub invert: bool,
+    /// mosaic / blur / tone / focus
+    pub effect: String,
+    /// 马赛克、模糊的力度 0–1
+    pub strength: f64,
+    /// 局部调色（含义同片段的调色）
+    pub brightness: f64,
+    pub contrast: f64,
+    pub saturation: f64,
+    /// 聚焦：放大倍数 1–4
+    pub zoom: f64,
+    /// 聚焦：窗口取输出画面的比例（竖屏成片里跟着横屏素材里的人走）
+    pub reframe: bool,
+    /// 聚焦：镜头平滑（秒），越大越稳、跟得越慢
+    pub smooth: f64,
+    /// 效果只在这段素材时间里生效（毫秒）；留空表示不限。聚焦不受这个限制
+    pub start_ms: Option<u64>,
+    pub end_ms: Option<u64>,
+}
+
+impl Default for Region {
+    fn default() -> Self {
+        Region {
+            id: 0,
+            name: String::new(),
+            track: vec![],
+            shape: "rect".into(),
+            feather: 0.2,
+            grow: 0.0,
+            invert: false,
+            effect: "mosaic".into(),
+            strength: 0.5,
+            brightness: 0.0,
+            contrast: 1.0,
+            saturation: 1.0,
+            zoom: 2.0,
+            reframe: false,
+            smooth: 0.6,
+            start_ms: None,
+            end_ms: None,
+        }
+    }
+}
+
+impl Region {
+    pub fn is_focus(&self) -> bool {
+        self.effect == "focus"
+    }
+}
+
+/// 调色参数是否有改动（亮度 / 对比度 / 饱和度不是原样）。
+pub fn tone_changed(brightness: f64, contrast: f64, saturation: f64) -> bool {
+    brightness.abs() > 1e-6 || (contrast - 1.0).abs() > 1e-6 || (saturation - 1.0).abs() > 1e-6
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Clip {
@@ -84,6 +164,8 @@ pub struct Clip {
     pub brightness: f64,
     pub contrast: f64,
     pub saturation: f64,
+    /// 跟着物体走的区域（只用于视频片段，图片会被忽略）
+    pub regions: Vec<Region>,
     pub transition: Option<Transition>,
 }
 
@@ -106,6 +188,7 @@ impl Default for Clip {
             brightness: 0.0,
             contrast: 1.0,
             saturation: 1.0,
+            regions: vec![],
             transition: None,
         }
     }
@@ -122,7 +205,7 @@ impl Clip {
     }
 
     pub fn needs_tone(&self) -> bool {
-        self.brightness.abs() > 1e-6 || (self.contrast - 1.0).abs() > 1e-6 || (self.saturation - 1.0).abs() > 1e-6
+        tone_changed(self.brightness, self.contrast, self.saturation)
     }
 }
 
@@ -296,6 +379,48 @@ fn clamp(v: f64, lo: f64, hi: f64, fallback: f64) -> f64 {
     }
 }
 
+/// 整理一个片段的区域：没有轨迹的丢掉，数值收紧，只留一个聚焦。
+fn check_regions(regions: &mut Vec<Region>, clip_no: usize) -> Result<(), String> {
+    regions.retain(|r| !r.track.is_empty());
+    if regions.len() > MAX_REGIONS {
+        return Err(format!("第 {clip_no} 个片段的区域太多了（最多 {MAX_REGIONS} 个）。"));
+    }
+    for r in regions.iter_mut() {
+        if r.track.len() > MAX_TRACK_POINTS {
+            return Err(format!("第 {clip_no} 个片段的区域轨迹点太多了（最多 {MAX_TRACK_POINTS} 个）。"));
+        }
+        r.track.retain(|p| [p.x, p.y, p.w, p.h].iter().all(|v| v.is_finite()));
+        for p in &mut r.track {
+            p.w = p.w.clamp(0.002, 1.0);
+            p.h = p.h.clamp(0.002, 1.0);
+            p.x = p.x.clamp(-1.0, 2.0);
+            p.y = p.y.clamp(-1.0, 2.0);
+        }
+        r.track.sort_by_key(|p| p.t_ms);
+        if !matches!(r.shape.as_str(), "rect" | "ellipse") {
+            r.shape = "rect".into();
+        }
+        if !REGION_EFFECTS.contains(&r.effect.as_str()) {
+            r.effect = "mosaic".into();
+        }
+        r.feather = clamp(r.feather, 0.0, 1.0, 0.2);
+        r.grow = clamp(r.grow, -0.5, 2.0, 0.0);
+        r.strength = clamp(r.strength, 0.0, 1.0, 0.5);
+        r.brightness = clamp(r.brightness, -1.0, 1.0, 0.0);
+        r.contrast = clamp(r.contrast, 0.0, 3.0, 1.0);
+        r.saturation = clamp(r.saturation, 0.0, 3.0, 1.0);
+        r.zoom = clamp(r.zoom, 1.0, 4.0, 2.0);
+        r.smooth = clamp(r.smooth, 0.0, 5.0, 0.6);
+        if r.end_ms.zip(r.start_ms).is_some_and(|(e, s)| e <= s) {
+            r.end_ms = None;
+        }
+    }
+    // 聚焦是改变整个镜头的取景，一个片段只能有一个：多的丢掉
+    let mut seen_focus = false;
+    regions.retain(|r| !r.is_focus() || !std::mem::replace(&mut seen_focus, true));
+    Ok(())
+}
+
 impl Project {
     /// 校验并整理：超出范围的数值收紧，结构性的错误（没有片段、素材路径为空、起止颠倒）返回提示。
     pub fn checked(mut self) -> Result<Project, String> {
@@ -328,6 +453,11 @@ impl Project {
                     }
                     c.speed = clamp(c.speed, 0.25, 4.0, 1.0);
                 }
+            }
+            if c.kind == ClipKind::Image {
+                c.regions.clear();
+            } else {
+                check_regions(&mut c.regions, n)?;
             }
             c.volume = clamp(c.volume, 0.0, 4.0, 1.0);
             c.brightness = clamp(c.brightness, -1.0, 1.0, 0.0);
@@ -551,5 +681,74 @@ mod tests {
         assert_eq!(total_ms(&p.clips), 8503);
         assert!((p.clips[0].volume - 1.05).abs() < 1e-9);
         assert_eq!(p.media_paths(), vec!["/media/red.webm", "/media/green.webm", "/media/music.ogg"]);
+        // 区域：界面导出的字段名（含手动点 pin、追踪不到 lost）后端都认得；没有 regions 字段的旧片段读出来是空的
+        assert_eq!(p.clips.iter().map(|c| c.regions.len()).collect::<Vec<_>>(), vec![1, 1, 0]);
+        let (a, b) = (&p.clips[0].regions[0], &p.clips[1].regions[0]);
+        assert_eq!((a.effect.as_str(), a.shape.as_str(), a.zoom, a.smooth, a.start_ms, a.end_ms), ("focus", "ellipse", 2.0, 0.6, Some(1500), Some(3000)));
+        assert_eq!(
+            a.track.iter().map(|p| (p.t_ms, p.pin)).collect::<Vec<_>>(),
+            vec![(0, false), (400, false), (1000, true), (1500, false), (2000, true), (2100, false)]
+        );
+        assert_eq!(b.track.iter().filter(|p| p.lost).count(), 7);
+        assert_eq!(b.track.iter().filter(|p| p.pin).map(|p| p.t_ms).collect::<Vec<_>>(), vec![2000]);
+        assert!((a.track[2].x - 0.45).abs() < 1e-9 && (a.track[2].w - 0.15).abs() < 1e-9);
+    }
+
+    #[test]
+    fn regions_are_cleaned_up_when_the_project_is_checked() {
+        use crate::track::TrackPt;
+        let tp = |t: u64, x: f64| TrackPt { t_ms: t, x, y: 0.5, w: 0.2, h: 0.2, ..Default::default() };
+        let focus = |zoom: f64| Region { effect: "focus".into(), zoom, track: vec![tp(0, 0.1)], ..Default::default() };
+        let mut c = clip(1, 3000);
+        c.regions = vec![
+            Region { track: vec![], ..Default::default() },
+            Region {
+                track: vec![tp(2000, 0.5), tp(0, f64::NAN), tp(0, 0.1), TrackPt { w: 0.0, h: 9.0, ..tp(1000, 5.0) }],
+                shape: "star".into(),
+                effect: "sparkle".into(),
+                feather: 7.0,
+                grow: -3.0,
+                strength: f64::NAN,
+                ..Default::default()
+            },
+            focus(9.0),
+            focus(2.0),
+            Region { track: vec![tp(0, 0.1)], start_ms: Some(500), end_ms: Some(400), brightness: 9.0, ..Default::default() },
+        ];
+        let p = Project { clips: vec![c], ..Default::default() }.checked().unwrap();
+        let rs = &p.clips[0].regions;
+        assert_eq!(rs.len(), 3, "空轨迹丢掉，多余的聚焦丢掉：{rs:?}");
+        let r = &rs[0];
+        assert_eq!((r.shape.as_str(), r.effect.as_str(), r.feather, r.grow, r.strength), ("rect", "mosaic", 1.0, -0.5, 0.5));
+        assert_eq!(r.track.iter().map(|p| p.t_ms).collect::<Vec<_>>(), vec![0, 1000, 2000], "按时间排序，丢掉不是数字的点");
+        assert_eq!((r.track[1].w, r.track[1].h, r.track[1].x), (0.002, 1.0, 2.0), "尺寸和位置收紧到合理范围");
+        assert_eq!(rs[1].zoom, 4.0, "留下的是第一个聚焦");
+        assert_eq!((rs[2].start_ms, rs[2].end_ms, rs[2].brightness), (Some(500), None, 1.0), "结束比开始早：当作不限结束");
+        // 区域太多
+        let mut c = clip(1, 3000);
+        c.regions = (0..=MAX_REGIONS).map(|_| Region { track: vec![tp(0, 0.1)], ..Default::default() }).collect();
+        assert!(Project { clips: vec![c], ..Default::default() }.checked().unwrap_err().contains("区域太多"));
+    }
+
+    #[test]
+    fn regions_round_trip_and_old_projects_without_them_still_open() {
+        let mut c = clip(1, 3000);
+        c.regions = vec![Region {
+            id: 4,
+            name: "球".into(),
+            track: vec![crate::track::TrackPt { t_ms: 100, x: 0.25, y: 0.5, w: 0.1, h: 0.2, pin: true, ..Default::default() }],
+            invert: true,
+            start_ms: Some(500),
+            ..Default::default()
+        }];
+        let p = Project { clips: vec![c], ..Default::default() };
+        let j = serde_json::to_string(&p).unwrap();
+        assert!(j.contains("\"regions\"") && j.contains("\"tMs\":100") && j.contains("\"startMs\":500") && j.contains("\"endMs\":null"), "{j}");
+        assert_eq!(serde_json::from_str::<Project>(&j).unwrap(), p);
+        let old: Project = serde_json::from_str(r#"{"clips":[{"path":"/a.mp4","outMs":1000}]}"#).unwrap();
+        assert!(old.clips[0].regions.is_empty());
+        // 界面可以只发要改的几个字段
+        let r: Region = serde_json::from_str(r#"{"track":[{"tMs":0,"x":0.1,"y":0.1,"w":0.2,"h":0.2}],"effect":"blur"}"#).unwrap();
+        assert_eq!((r.shape.as_str(), r.zoom, r.feather, r.start_ms), ("rect", 2.0, 0.2, None));
     }
 }

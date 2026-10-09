@@ -1249,6 +1249,67 @@ export interface EditTransition {
   durationMs: number
 }
 
+/** 轨迹上的一个点：这一时刻区域的矩形。位置是相对整个画面的比例（0–1，左上角为原点），方向是素材的显示方向（旋转翻转之前），时间是素材里的时间 */
+export interface TrackPt {
+  tMs: number
+  x: number
+  y: number
+  w: number
+  h: number
+  /** 追踪器在这里没有把握，位置是推测的 */
+  lost?: boolean
+  /** 用户手动指定（校正）的点：重新追踪不会改动 */
+  pin?: boolean
+}
+
+export interface NRect {
+  x: number
+  y: number
+  w: number
+  h: number
+}
+
+export type RegionEffect = 'mosaic' | 'blur' | 'tone' | 'focus'
+
+/** 跟着物体走的区域 */
+export interface EditRegion {
+  id: number
+  name: string
+  track: TrackPt[]
+  shape: 'rect' | 'ellipse'
+  feather: number
+  grow: number
+  invert: boolean
+  effect: RegionEffect
+  strength: number
+  brightness: number
+  contrast: number
+  saturation: number
+  zoom: number
+  reframe: boolean
+  smooth: number
+  startMs: number | null
+  endMs: number | null
+}
+
+export interface TrackCandidate {
+  rect: NRect
+  score: number
+}
+
+export interface TrackDetect {
+  candidates: TrackCandidate[]
+  /** 镜头在动的程度 */
+  camera: number
+  note: string | null
+}
+
+export interface TrackResult {
+  points: TrackPt[]
+  lostMs: number
+  note: string | null
+}
+
 export interface EditClip {
   id: number
   path: string
@@ -1266,6 +1327,7 @@ export interface EditClip {
   brightness: number
   contrast: number
   saturation: number
+  regions: EditRegion[]
   transition: EditTransition | null
 }
 

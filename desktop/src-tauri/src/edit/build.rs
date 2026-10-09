@@ -14,7 +14,8 @@ use crate::vidcaps::Caps;
 use crate::vidnorm::build::{filter_path, fps_fraction, graph_args, hevc_args, nearest_standard_fps};
 use crate::vidnorm::facts::{Facts, Hdr};
 
-use super::spec::{layout, total_ms, AudioTrack, Clip, ClipKind, Placed, Project, TextItem};
+use super::region::{focus_knots, focus_window, knot_expr, MaskJob};
+use super::spec::{layout, tone_changed, total_ms, AudioTrack, Clip, ClipKind, Placed, Project, Region, TextItem};
 
 /// 命令行总长度的上限。Windows 的上限是 32767 个字符，留一点给 ffmpeg 路径和输出文件。
 const MAX_ARGS_LEN: usize = 30_000;
@@ -69,6 +70,8 @@ pub struct EditPlan {
     pub fps: f64,
     pub notes: Vec<String>,
     pub warnings: Vec<String>,
+    /// 区域效果用的遮罩视频：跑 ffmpeg 之前要先生成好（见 `region::render_mask`）
+    pub masks: Vec<MaskJob>,
 }
 
 fn sec(ms: u64) -> String {
@@ -134,20 +137,139 @@ fn orient(c: &Clip) -> Vec<&'static str> {
 
 /// 调色。精简版 ffmpeg 没有（需要 GPL 的）`eq`，所以用 `lutyuv`：
 /// 对比度以中灰为轴，亮度直接加减（±1 对应 ±128 级），饱和度缩放色度。
-fn tone_filter(c: &Clip) -> Option<String> {
-    if !c.needs_tone() {
+fn tone_expr(brightness: f64, contrast: f64, saturation: f64) -> Option<String> {
+    if !tone_changed(brightness, contrast, saturation) {
         return None;
     }
     let mut opts: Vec<String> = vec![];
-    if c.brightness.abs() > 1e-6 || (c.contrast - 1.0).abs() > 1e-6 {
-        opts.push(format!("y='clip((val-128)*{:.4}+128+{:.2},0,255)'", c.contrast, c.brightness * 128.0));
+    if brightness.abs() > 1e-6 || (contrast - 1.0).abs() > 1e-6 {
+        opts.push(format!("y='clip((val-128)*{contrast:.4}+128+{:.2},0,255)'", brightness * 128.0));
     }
-    if (c.saturation - 1.0).abs() > 1e-6 {
-        let e = format!("'clip((val-128)*{:.4}+128,0,255)'", c.saturation);
+    if (saturation - 1.0).abs() > 1e-6 {
+        let e = format!("'clip((val-128)*{saturation:.4}+128,0,255)'");
         opts.push(format!("u={e}"));
         opts.push(format!("v={e}"));
     }
     Some(format!("lutyuv={}", opts.join(":")))
+}
+
+fn tone_filter(c: &Clip) -> Option<String> {
+    tone_expr(c.brightness, c.contrast, c.saturation)
+}
+
+/// 区域效果建图时要用到的环境。
+struct Regions<'a> {
+    preview: bool,
+    tmp: &'a Path,
+    /// 遮罩的输入编号从这里开始（排在片段和音频轨后面）
+    first_input: usize,
+    /// 成片的宽高比（聚焦“按成片比例取景”用）
+    out_aspect: f64,
+    masks: Vec<MaskJob>,
+}
+
+/// 预览时素材长边超过这个值就先缩小再做区域效果（预览本来就只有 360 高，没必要在 4K 上做模糊）
+const PREVIEW_WORK_LONG_SIDE: f64 = 1280.0;
+
+/// 区域效果处理时的画面尺寸（宽、高、是否要先缩小）：素材原尺寸，预览时过大的先缩小。
+fn region_work(sr: &Source, preview: bool) -> (u32, u32, bool) {
+    let (w, h) = (sr.width, sr.height);
+    let long = f64::from(w.max(h));
+    if preview && long > PREVIEW_WORK_LONG_SIDE {
+        let k = PREVIEW_WORK_LONG_SIDE / long;
+        (even((f64::from(w) * k).round() as u32), even((f64::from(h) * k).round() as u32), true)
+    } else {
+        (w, h, false)
+    }
+}
+
+/// 区域在片段这段时间里框的平均短边（像素），用来决定马赛克色块和模糊半径的大小。
+fn box_short_px(r: &Region, w: u32, h: u32, in_ms: u64, out_ms: u64) -> f64 {
+    const N: u32 = 16;
+    let span = out_ms.saturating_sub(in_ms) as f64;
+    let sum: f64 = (0..N)
+        .map(|k| {
+            let t = in_ms as f64 + span * (f64::from(k) + 0.5) / f64::from(N);
+            r.box_at(t).map_or(0.0, |b| (b.w * f64::from(w)).min(b.h * f64::from(h)))
+        })
+        .sum();
+    (sum / f64::from(N)).max(8.0)
+}
+
+/// 带效果的那一份画面（整幅都做，由遮罩决定哪里露出来）。
+fn region_effect(r: &Region, w: u32, h: u32, short_px: f64) -> String {
+    match r.effect.as_str() {
+        "blur" => {
+            let sigma = (short_px * (0.04 + 0.26 * r.strength)).max(1.0);
+            // 半径大的模糊先缩小再模糊再放大：结果几乎一样，速度快很多
+            let k = ((sigma / 4.0).floor() as u32).clamp(1, 8);
+            if k == 1 {
+                format!("gblur=sigma={sigma:.2}:steps=2")
+            } else {
+                let (sw, sh) = (w.div_ceil(k).max(2), h.div_ceil(k).max(2));
+                format!("scale={sw}:{sh}:flags=area,gblur=sigma={:.2}:steps=2,scale={w}:{h}:flags=bilinear", sigma / f64::from(k))
+            }
+        }
+        "tone" => tone_expr(r.brightness, r.contrast, r.saturation).unwrap_or_else(|| "null".into()),
+        _ => {
+            // 马赛克：框的短边上有 16（细）… 3（粗）个色块
+            let blocks = 16.0 - 13.0 * r.strength;
+            let b = (short_px / blocks).round().clamp(2.0, f64::from((w.min(h) / 4).max(2))) as u32;
+            let (sw, sh) = (w.div_ceil(b).max(2), h.div_ceil(b).max(2));
+            format!("scale={sw}:{sh}:flags=area,scale={w}:{h}:flags=neighbor")
+        }
+    }
+}
+
+/// 一个片段的区域效果。输入是片段的原始画面（`setpts` 之后、旋转翻转之前，方向和追踪时一致），返回处理后的画面标签。
+/// 效果区域用遮罩视频叠回原画面（`alphamerge` + `overlay`）；聚焦是一个跟着轨迹移动的 `crop`。
+fn region_stage(i: usize, c: &Clip, sr: &Source, setpts: String, rg: &mut Regions, stmts: &mut Vec<String>) -> String {
+    let (w, h, prescale) = region_work(sr, rg.preview);
+    // 统一成 yuv420p 再处理：带透明度的格式只有它这一族才齐全
+    let mut first = vec![setpts, "format=yuv420p".to_string()];
+    if prescale {
+        first.push(format!("scale={w}:{h}"));
+    }
+    let mut cur = format!("rs{i}_x");
+    stmts.push(format!("[{i}:v:0]{}[{cur}]", first.join(",")));
+    let dur = c.duration_ms();
+    let mut masked = false;
+    for (j, r) in c.regions.iter().enumerate().filter(|(_, r)| !r.is_focus()) {
+        let eff = region_effect(r, w, h, box_short_px(r, w, h, c.in_ms, c.out_ms));
+        if eff == "null" {
+            continue; // 没有设置任何调色：不需要这一层
+        }
+        let m = rg.first_input + rg.masks.len();
+        rg.masks.push(MaskJob::new(rg.tmp.join(format!("mask-{i}-{j}.nut")), r.clone(), c.in_ms, c.speed, dur, (w, h), sr.fps, rg.preview));
+        let (base, branch, fx, mask, alpha, next) =
+            (format!("rb{i}_{j}"), format!("re{i}_{j}"), format!("rf{i}_{j}"), format!("rm{i}_{j}"), format!("ra{i}_{j}"), format!("rs{i}_{j}"));
+        stmts.push(format!("[{cur}]split[{base}][{branch}]"));
+        stmts.push(format!("[{branch}]{eff}[{fx}]"));
+        stmts.push(format!("[{m}:v:0]scale={w}:{h}:flags=bilinear,format=gray[{mask}]"));
+        stmts.push(format!("[{fx}][{mask}]alphamerge[{alpha}]"));
+        stmts.push(format!("[{base}][{alpha}]overlay=format=auto[{next}]"));
+        cur = next;
+        masked = true;
+    }
+    if masked {
+        // 遮罩视频比片段长一点：叠完之后裁回片段的长度
+        let next = format!("rt{i}");
+        stmts.push(format!("[{cur}]trim=end={}[{next}]", sec(dur)));
+        cur = next;
+    }
+    if let Some(r) = c.regions.iter().find(|r| r.is_focus()) {
+        // 窗口取成片的宽高比时，旋转 90 / 270 度的片段要在旋转之前取横竖相反的比例
+        let aspect = r.reframe.then(|| if matches!(c.rotate, 90 | 270) { 1.0 / rg.out_aspect } else { rg.out_aspect });
+        let win = focus_window(r.zoom, (w, h), aspect);
+        if win != (w, h) {
+            let knots = focus_knots(r, c.in_ms, c.speed, dur, (w, h), win);
+            let (xe, ye) = (knot_expr(&knots, |k| k.x), knot_expr(&knots, |k| k.y));
+            let next = format!("rz{i}");
+            stmts.push(format!("[{cur}]crop=w={}:h={}:x='{xe}':y='{ye}':exact=1[{next}]", win.0, win.1));
+            cur = next;
+        }
+    }
+    cur
 }
 
 struct Frame<'a> {
@@ -160,14 +282,19 @@ struct Frame<'a> {
 }
 
 /// 一个片段的画面处理，输出 `[v{i}]`。
-fn clip_video(i: usize, c: &Clip, f: &Frame, stmts: &mut Vec<String>) {
+fn clip_video(i: usize, c: &Clip, sr: &Source, f: &Frame, rg: &mut Regions, stmts: &mut Vec<String>) {
     let (w, h) = (f.w, f.h);
     let mut head: Vec<String> = vec![];
-    head.push(if c.kind == ClipKind::Video && (c.speed - 1.0).abs() > 1e-9 {
-        format!("setpts=(PTS-STARTPTS)/{:.6}", c.speed)
+    let setpts =
+        if c.kind == ClipKind::Video && (c.speed - 1.0).abs() > 1e-9 { format!("setpts=(PTS-STARTPTS)/{:.6}", c.speed) } else { "setpts=PTS-STARTPTS".into() };
+    // 有区域效果时，变速之后先做区域（还在素材的方向上，和追踪的坐标一致），再旋转翻转
+    let input = if c.kind == ClipKind::Video && !c.regions.is_empty() {
+        let label = region_stage(i, c, sr, setpts, rg, stmts);
+        format!("[{label}]")
     } else {
-        "setpts=PTS-STARTPTS".into()
-    });
+        head.push(setpts);
+        format!("[{i}:v:0]")
+    };
     head.extend(orient(c).into_iter().map(String::from));
     head.push(format!("fps={}", f.fps));
     // 色彩：统一转成 BT.709 电视范围。图片（RGB）转 YUV 时不指定的话 ffmpeg 默认用 BT.601，颜色会偏
@@ -182,7 +309,6 @@ fn clip_video(i: usize, c: &Clip, f: &Frame, stmts: &mut Vec<String>) {
         tail.push(format!("fade=t=out:st={}:d={}", sec(d.saturating_sub(c.fade_out_ms)), sec(c.fade_out_ms)));
     }
     tail.extend(["format=yuv420p".into(), "setsar=1".into(), "settb=AVTB".into()]);
-    let input = format!("[{i}:v:0]");
     let head = head.join(",");
     let tail = tail.join(",");
     match f.fit {
@@ -384,6 +510,20 @@ pub fn build(p: &Project, src: &HashMap<String, Source>, caps: &Caps, tmp: &Path
     if p.clips.iter().any(Clip::needs_tone) {
         need("lutyuv", "无法调色")?;
     }
+    let regions = || p.clips.iter().flat_map(|c| c.regions.iter());
+    if regions().any(|r| !r.is_focus()) {
+        need("alphamerge", "无法使用区域效果")?;
+        need("overlay", "无法使用区域效果")?;
+    }
+    if regions().any(|r| r.effect == "blur") {
+        need("gblur", "无法使用区域模糊")?;
+    }
+    if regions().any(|r| r.effect == "tone") {
+        need("lutyuv", "无法使用区域调色")?;
+    }
+    if regions().any(Region::is_focus) {
+        need("crop", "无法使用跟随聚焦")?;
+    }
     if p.audio.iter().any(|a| a.duck) {
         need("sidechaincompress", "无法自动压低配乐")?;
     }
@@ -433,9 +573,10 @@ pub fn build(p: &Project, src: &HashMap<String, Source>, caps: &Caps, tmp: &Path
     // 滤镜图
     let has_audio = !p.audio.is_empty() || p.clips.iter().any(|c| c.kind == ClipKind::Video && !c.mute && src.get(&c.path).is_some_and(|s| s.has_audio));
     let frame = Frame { w, h, fps: &fps_txt, fit: &p.out.fit, blur: caps.background_blur() };
+    let mut rg = Regions { preview, tmp, first_input: p.clips.len() + p.audio.len(), out_aspect: f64::from(w) / f64::from(h), masks: vec![] };
     let mut stmts: Vec<String> = vec![];
     for (i, c) in p.clips.iter().enumerate() {
-        clip_video(i, c, &frame, &mut stmts);
+        clip_video(i, c, src.get(&c.path).expect("checked above"), &frame, &mut rg, &mut stmts);
         if has_audio {
             clip_audio(i, c, src.get(&c.path).is_some_and(|s| s.has_audio), &mut stmts);
         }
@@ -545,6 +686,15 @@ pub fn build(p: &Project, src: &HashMap<String, Source>, caps: &Caps, tmp: &Path
     // 收尾：像素格式（编码器要求的）和色彩标记（BT.709、电视范围）
     stmts.push(format!("[{video}]format={pix},setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv[vout]"));
 
+    // 区域效果的遮罩视频：作为额外的输入，排在片段和音频轨之后
+    for m in &rg.masks {
+        args.extend(["-i".into(), m.path.to_string_lossy().into_owned()]);
+    }
+    if !rg.masks.is_empty() {
+        plan.notes.push(format!("有 {} 个区域效果，导出前会先生成遮罩", rg.masks.len()));
+    }
+    plan.masks = rg.masks;
+
     let graph = stmts.join(";");
     args.extend(graph_args(&graph, caps, tmp)?);
     args.extend(s(&["-map", "[vout]"]));
@@ -598,6 +748,8 @@ mod tests {
             "aloop",
             "atempo",
             "concat",
+            "alphamerge",
+            "overlay",
         ];
         Caps {
             gpl: true,
@@ -903,5 +1055,165 @@ mod tests {
         let p = Project { clips: vec![clip("/m/a.mp4", 0, 4000)], ..Default::default() }.checked().unwrap();
         let plan = build(&p, &srcs, &caps(), &tmp(), Mode::Export, None).unwrap();
         assert!(plan.warnings.iter().any(|w| w.contains("HDR")));
+    }
+
+    // ---- 区域效果 ----
+
+    use super::super::spec::Region;
+    use crate::track::TrackPt;
+
+    fn track(x: f64) -> Vec<TrackPt> {
+        vec![
+            TrackPt { t_ms: 0, x, y: 0.4, w: 0.2, h: 0.2, ..Default::default() },
+            TrackPt { t_ms: 3000, x: x + 0.3, y: 0.4, w: 0.2, h: 0.2, ..Default::default() },
+        ]
+    }
+
+    fn with_region(mut c: Clip, r: Region) -> Clip {
+        c.regions.push(Region { track: track(0.1), ..r });
+        c
+    }
+
+    fn effect(kind: &str) -> Region {
+        Region { effect: kind.into(), ..Default::default() }
+    }
+
+    fn built(p: Project, caps: &Caps, mode: Mode) -> EditPlan {
+        let p = p.checked().unwrap();
+        build(&p, &sources(&["/m/a.mp4", "/m/b.mp4"]), caps, &tmp(), mode, None).unwrap()
+    }
+
+    #[test]
+    fn a_mosaic_region_is_merged_back_through_a_mask_before_rotation() {
+        let mut c = with_region(clip("/m/a.mp4", 1000, 7000), effect("mosaic"));
+        c.speed = 2.0;
+        c.rotate = 90;
+        let plan = built(Project { clips: vec![c], ..Default::default() }, &caps(), Mode::Export);
+        let g = graph_of(&plan);
+        // 变速 → 统一格式 → 区域（还在素材的方向上）→ 裁回片段长度 → 旋转、帧率……
+        assert!(g.contains("[0:v:0]setpts=(PTS-STARTPTS)/2.000000,format=yuv420p[rs0_x]"), "{g}");
+        assert!(g.contains("[rs0_x]split[rb0_0][re0_0]"), "{g}");
+        // 框的短边 = 0.2×1080 = 216 像素，强度 0.5 → 9.5 个色块 → 约 23 像素一块
+        assert!(g.contains("[re0_0]scale=84:47:flags=area,scale=1920:1080:flags=neighbor[rf0_0]"), "{g}");
+        assert!(g.contains("[1:v:0]scale=1920:1080:flags=bilinear,format=gray[rm0_0]"), "遮罩是第 2 个输入：{g}");
+        assert!(g.contains("[rf0_0][rm0_0]alphamerge[ra0_0]") && g.contains("[rb0_0][ra0_0]overlay=format=auto[rs0_0]"), "{g}");
+        assert!(g.contains("[rs0_0]trim=end=3.000[rt0]"), "{g}");
+        assert!(g.contains("[rt0]transpose=1,fps=30000/1001"), "{g}");
+        // 遮罩作为额外的输入排在片段后面；任务里先生成它
+        assert_eq!(plan.masks.len(), 1);
+        let m = &plan.masks[0];
+        assert_eq!((m.w, m.h, m.fps, m.in_ms, m.speed), (800, 450, 60, 1000, 2.0));
+        assert!(plan.args.windows(2).any(|w| w[0] == "-i" && w[1] == m.path.to_string_lossy()), "{:?}", plan.args);
+        let clip_in = plan.args.iter().position(|a| a == "/m/a.mp4").unwrap();
+        let mask_in = plan.args.iter().position(|a| a.ends_with("mask-0-0.nut")).unwrap();
+        assert!(clip_in < mask_in);
+        assert!(plan.notes.iter().any(|n| n.contains("1 个区域效果")), "{:?}", plan.notes);
+    }
+
+    #[test]
+    fn blur_and_tone_regions_and_stacking_order() {
+        let mut c = with_region(clip("/m/a.mp4", 0, 3000), Region { effect: "blur".into(), strength: 1.0, ..Default::default() });
+        c = with_region(c, Region { effect: "tone".into(), brightness: 0.3, saturation: 0.0, invert: true, ..Default::default() });
+        // 没有设置任何调色的调色区域：不产生遮罩
+        c = with_region(c, Region { effect: "tone".into(), ..Default::default() });
+        let plan = built(Project { clips: vec![c], ..Default::default() }, &caps(), Mode::Export);
+        let g = graph_of(&plan);
+        // 模糊：短边 216 像素，强度 1 → sigma 64.8，先缩小 8 倍再模糊
+        assert!(g.contains("[re0_0]scale=240:135:flags=area,gblur=sigma=8.10:steps=2,scale=1920:1080:flags=bilinear[rf0_0]"), "{g}");
+        assert!(
+            g.contains(
+                "[re0_1]lutyuv=y='clip((val-128)*1.0000+128+38.40,0,255)':u='clip((val-128)*0.0000+128,0,255)':v='clip((val-128)*0.0000+128,0,255)'[rf0_1]"
+            ),
+            "{g}"
+        );
+        // 第二层叠在第一层的结果上
+        assert!(g.contains("[rs0_0]split[rb0_1][re0_1]"), "{g}");
+        assert!(!g.contains("re0_2"), "{g}");
+        assert_eq!(plan.masks.len(), 2);
+        assert!(plan.masks[1].region.invert);
+        assert!(g.contains("[1:v:0]scale") && g.contains("[2:v:0]scale"), "{g}");
+    }
+
+    #[test]
+    fn focus_is_a_moving_crop_and_can_match_the_output_shape() {
+        // 横屏素材做竖屏成片：窗口取 9:16
+        let r = Region { effect: "focus".into(), zoom: 1.5, reframe: true, smooth: 0.0, ..Default::default() };
+        let mut p = Project { clips: vec![with_region(clip("/m/a.mp4", 0, 3000), r.clone())], ..Default::default() };
+        (p.out.width, p.out.height) = (1080, 1920);
+        let plan = built(p, &caps(), Mode::Export);
+        let g = graph_of(&plan);
+        assert!(g.contains("[rs0_x]crop=w=404:h=720:x='if(lt(t,"), "{g}");
+        assert!(g.contains(":y='") && g.contains(":exact=1[rz0]"), "{g}");
+        assert!(g.contains("[rz0]fps="), "旋转之前：{g}");
+        assert!(plan.masks.is_empty() && !g.contains("alphamerge") && !g.contains("trim=end"), "聚焦不用遮罩：{g}");
+        // 片段旋转 90 度：在旋转之前取横竖相反的窗口（旋转后正好是 9:16）
+        let mut c = with_region(clip("/m/a.mp4", 0, 3000), Region { zoom: 1.0, ..r.clone() });
+        c.rotate = 90;
+        let mut p = Project { clips: vec![c], ..Default::default() };
+        (p.out.width, p.out.height) = (1080, 1920);
+        let g = graph_of(&built(p, &caps(), Mode::Export));
+        assert!(!g.contains("crop=w="), "整幅画面旋转后就是 9:16，不用裁：{g}");
+        // 放大 1 倍且不改比例：什么都不做
+        let flat = Region { zoom: 1.0, reframe: false, ..r };
+        let g = graph_of(&built(Project { clips: vec![with_region(clip("/m/a.mp4", 0, 3000), flat)], ..Default::default() }, &caps(), Mode::Export));
+        assert!(!g.contains("crop=w="), "{g}");
+    }
+
+    #[test]
+    fn previews_shrink_big_sources_before_the_region_effect_and_use_small_masks() {
+        let mut srcs = sources(&["/m/a.mp4"]);
+        let s = srcs.get_mut("/m/a.mp4").unwrap();
+        (s.width, s.height) = (3840, 2160);
+        let p = Project { clips: vec![with_region(clip("/m/a.mp4", 0, 3000), effect("blur"))], ..Default::default() }.checked().unwrap();
+        let plan = build(&p, &srcs, &caps(), &tmp(), Mode::Preview, None).unwrap();
+        let g = graph_of(&plan);
+        assert!(g.contains("format=yuv420p,scale=1280:720[rs0_x]") && g.contains("scale=1280:720:flags=bilinear,format=gray"), "{g}");
+        assert_eq!((plan.masks[0].w, plan.masks[0].h), (480, 270));
+        // 导出：原尺寸
+        let g = graph_of(&build(&p, &srcs, &caps(), &tmp(), Mode::Export, None).unwrap());
+        assert!(!g.contains("scale=1280:720") && g.contains("scale=3840:2160:flags=bilinear,format=gray"), "{g}");
+    }
+
+    #[test]
+    fn region_effects_need_their_filters_and_images_ignore_them() {
+        let p = |kind: &str| Project { clips: vec![with_region(clip("/m/a.mp4", 0, 3000), effect(kind))], ..Default::default() }.checked().unwrap();
+        let srcs = sources(&["/m/a.mp4"]);
+        for (kind, missing) in [("mosaic", "alphamerge"), ("blur", "gblur"), ("tone", "lutyuv"), ("focus", "crop")] {
+            let mut c = caps();
+            c.filters.insert("alphamerge".into());
+            c.filters.insert("overlay".into());
+            c.filters.remove(missing);
+            let mut proj = p(kind);
+            if kind == "tone" {
+                proj.clips[0].regions[0].brightness = 0.2;
+            }
+            if kind == "focus" {
+                proj.clips[0].regions[0].zoom = 2.0;
+            }
+            let e = build(&proj, &srcs, &c, &tmp(), Mode::Export, None).unwrap_err();
+            assert!(e.message.contains(missing) && e.message.contains("完整版"), "{kind}: {}", e.message);
+        }
+        // 图片没有区域效果（校验时就丢掉了）
+        let img = Clip {
+            kind: ClipKind::Image,
+            path: "/m/p.png".into(),
+            out_ms: 2000,
+            regions: vec![Region { track: track(0.1), ..Default::default() }],
+            ..Default::default()
+        };
+        let q = Project { clips: vec![img], ..Default::default() }.checked().unwrap();
+        assert!(q.clips[0].regions.is_empty());
+    }
+
+    #[test]
+    fn clips_without_regions_keep_their_exact_chain() {
+        // 没有区域效果时滤镜图和以前完全一样：变速、旋转、帧率连在一条链上，没有额外的输入
+        let mut c = clip("/m/a.mp4", 0, 3000);
+        c.speed = 2.0;
+        c.rotate = 90;
+        let plan = built(Project { clips: vec![c], ..Default::default() }, &caps(), Mode::Export);
+        let g = graph_of(&plan);
+        assert!(g.contains("[0:v:0]setpts=(PTS-STARTPTS)/2.000000,transpose=1,fps="), "{g}");
+        assert!(plan.masks.is_empty() && !g.contains("rs0_"));
     }
 }
