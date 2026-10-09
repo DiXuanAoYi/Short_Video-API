@@ -211,13 +211,25 @@ fn mime_for(p: &Path) -> &'static str {
         Some("mov") => "video/quicktime",
         Some("avi") => "video/x-msvideo",
         Some("flv") => "video/x-flv",
-        Some("ts") => "video/mp2t",
+        Some("ts" | "m2ts" | "mts") => "video/mp2t",
+        Some("ogv") => "video/ogg",
+        Some("3gp") => "video/3gpp",
+        Some("mpg" | "mpeg") => "video/mpeg",
         Some("mp3") => "audio/mpeg",
         Some("m4a") => "audio/mp4",
         Some("aac") => "audio/aac",
         Some("flac") => "audio/flac",
         Some("wav") => "audio/wav",
         Some("ogg" | "opus") => "audio/ogg",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg" | "jfif") => "image/jpeg",
+        Some("avif") => "image/avif",
+        Some("tif" | "tiff") => "image/tiff",
+        Some("heic") => "image/heic",
+        Some("heif") => "image/heif",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        Some("bmp") => "image/bmp",
         _ => "application/octet-stream",
     }
 }
@@ -267,6 +279,23 @@ mod tests {
         assert_eq!(parse_range("bytes=0-1,5-6", 1000), Ok(None), "multi-range falls back to the whole file");
         assert_eq!(parse_range("items=0-1", 1000), Ok(None));
         assert_eq!(parse_range("bytes=0-0", 0), Err(()));
+    }
+
+    #[test]
+    fn content_types_cover_the_formats_the_editor_accepts() {
+        for (name, mime) in [
+            ("a.GIF", "image/gif"),
+            ("a.avif", "image/avif"),
+            ("a.tif", "image/tiff"),
+            ("a.jfif", "image/jpeg"),
+            ("a.heic", "image/heic"),
+            ("a.ogv", "video/ogg"),
+            ("a.mts", "video/mp2t"),
+            ("a.mp4", "video/mp4"),
+            ("a.xyz", "application/octet-stream"),
+        ] {
+            assert_eq!(mime_for(Path::new(name)), mime, "{name}");
+        }
     }
 
     #[test]

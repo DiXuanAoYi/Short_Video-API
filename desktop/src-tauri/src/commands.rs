@@ -39,6 +39,10 @@ pub struct AppInfo {
     /// Cookie 加密密钥是否存放在系统钥匙串
     key_in_keyring: bool,
     shortcut_error: Option<String>,
+    /// 构建所对应的提交（短哈希）
+    commit: &'static str,
+    /// 调试版（desktop-debug 流水线或本机 debug 构建）
+    debug: bool,
 }
 
 #[tauri::command]
@@ -50,6 +54,8 @@ pub fn get_app_info(app: AppHandle, state: St<'_>) -> AppInfo {
         os: std::env::consts::OS,
         key_in_keyring: state.cookies.key_in_keyring,
         shortcut_error: state.shortcut_error.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        commit: crate::COMMIT,
+        debug: cfg!(debug_assertions),
     }
 }
 

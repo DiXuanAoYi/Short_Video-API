@@ -284,6 +284,7 @@ export type ToolOp =
   | { op: 'chapters'; chapters: Chapter[] }
   | { op: 'normalize'; spec: NormSpec; preset?: string | null }
   | { op: 'stabilize'; strength: 'light' | 'normal' | 'strong' }
+  | { op: 'edit'; project: EditProject }
   | { op: 'tags'; title?: string | null; artist?: string | null; album?: string | null; year?: string | null; genre?: string | null; comment?: string | null; cover?: string | null }
 
 export type ToolJob = ToolOp & { inputs: string[]; outputDir?: string | null }
@@ -301,6 +302,18 @@ export interface NormSpec {
   hdr: boolean
   fixColor: boolean
   levels: number
+  /** 输出电平：tv 为 16–235（电视范围，游戏、美术等素材的要求，默认），pc 为 0–255，keep 沿用素材 */
+  outRange: 'tv' | 'pc' | 'keep'
+  /** 降噪档位 */
+  denoise: 'off' | 'light' | 'medium' | 'strong' | 'best'
+  /** 分段色彩匹配的强度（0 关闭）：把和整体色调不一致的镜头校正到和整体一致 */
+  matchColor: number
+  /** 统一调节：作用在所有没有单独调节的镜头上 */
+  matchTone: ToneAdjust
+  /** 单独调节的镜头（只能选检测出来和整体不一致的镜头） */
+  matchShots: ShotAdjust[]
+  /** 排除在外的时间段：不参与统计，也不被校正，保持原样 */
+  matchSkip: SkipSpan[]
   lut: string | null
   lutStrength: number
   autocrop: boolean
@@ -310,6 +323,53 @@ export interface NormSpec {
   fixSync: boolean
   codec: 'keep' | 'h264' | 'hevc'
   quality: 'small' | 'balanced' | 'high'
+}
+
+/** 手动调节，每项在 -1 到 1 之间，0 为不动。 */
+export interface ToneAdjust {
+  brightness: number
+  contrast: number
+  saturation: number
+  temperature: number
+  tint: number
+}
+
+/** 单独调节的镜头：`id` 是检测结果里镜头开头的毫秒数；`strength` 为 null 时和统一的校正强度一样。 */
+export interface ShotAdjust {
+  id: number
+  strength: number | null
+  tone: ToneAdjust
+}
+
+/** 排除的一段时间（毫秒）；`endMs` 为 null 表示一直到结尾。 */
+export interface SkipSpan {
+  startMs: number
+  endMs: number | null
+}
+
+export interface ColorTimelineSeg {
+  startMs: number
+  endMs: number
+  off: boolean
+}
+
+export interface ColorFlaggedShot {
+  id: number
+  startMs: number
+  endMs: number
+  defects: string[]
+}
+
+/** 各个镜头的色彩是否一致的检测结果。 */
+export interface ColorReport {
+  durationMs: number
+  shotsTotal: number
+  timeline: ColorTimelineSeg[]
+  flagged: ColorFlaggedShot[]
+  /** 排除的时间段（结尾已补成视频时长）和因此没有参与统计的镜头数 */
+  skipped: { startMs: number; endMs: number }[]
+  shotsExcluded: number
+  note: string | null
 }
 
 export interface NormPreset {
@@ -992,6 +1052,10 @@ export interface AppInfo {
   os: string
   keyInKeyring: boolean
   shortcutError: string | null
+  /** 构建所对应的提交（短哈希） */
+  commit: string
+  /** 调试版 */
+  debug: boolean
 }
 
 export interface UpdateInfo {
@@ -1104,4 +1168,269 @@ export interface PlayerSource {
   kind: 'video' | 'audio'
   ext: string
   tracks: PlayerTrack[]
+}
+
+// ---------- LUT 工作室 ----------
+
+export interface SplitTone {
+  /** 色相 0–360 */
+  hue: number
+  /** 0–1，0 为不染色 */
+  amount: number
+}
+
+export interface LutAdjust {
+  exposure: number
+  black: number
+  white: number
+  gamma: number
+  contrast: number
+  shadows: number
+  highlights: number
+  temperature: number
+  tint: number
+  saturation: number
+  vibrance: number
+  hue: number
+  shadowTone: SplitTone
+  highlightTone: SplitTone
+  strength: number
+}
+
+export interface LutLayer {
+  path: string
+  strength: number
+}
+
+export interface LutReference {
+  path: string
+  /** 明暗匹配强度 0–1 */
+  tone: number
+  /** 色彩匹配强度 0–1 */
+  color: number
+}
+
+export interface LutSample {
+  path: string
+  atMs: number
+}
+
+export interface LutRecipe {
+  name: string
+  size: 17 | 33 | 65
+  base: LutLayer[]
+  adjust: LutAdjust
+  reference: LutReference | null
+  sample: LutSample | null
+}
+
+export interface LutLook {
+  id: string
+  name: string
+  desc: string
+  adjust: LutAdjust
+}
+
+export interface LutInfo {
+  title: string
+  size: number
+}
+
+export interface LutSaved {
+  path: string
+  size: number
+  bytes: number
+}
+
+// ---------- 剪辑 ----------
+
+export interface EditTransition {
+  kind: string
+  durationMs: number
+}
+
+/** 轨迹上的一个点：这一时刻区域的矩形。位置是相对整个画面的比例（0–1，左上角为原点），方向是素材的显示方向（旋转翻转之前），时间是素材里的时间 */
+export interface TrackPt {
+  tMs: number
+  x: number
+  y: number
+  w: number
+  h: number
+  /** 追踪器在这里没有把握，位置是推测的 */
+  lost?: boolean
+  /** 用户手动指定（校正）的点：重新追踪不会改动 */
+  pin?: boolean
+}
+
+export interface NRect {
+  x: number
+  y: number
+  w: number
+  h: number
+}
+
+export type RegionEffect = 'mosaic' | 'blur' | 'tone' | 'focus'
+
+/** 跟着物体走的区域 */
+export interface EditRegion {
+  id: number
+  name: string
+  track: TrackPt[]
+  shape: 'rect' | 'ellipse'
+  feather: number
+  grow: number
+  invert: boolean
+  effect: RegionEffect
+  strength: number
+  brightness: number
+  contrast: number
+  saturation: number
+  zoom: number
+  reframe: boolean
+  smooth: number
+  startMs: number | null
+  endMs: number | null
+}
+
+export interface TrackCandidate {
+  rect: NRect
+  score: number
+}
+
+export interface TrackDetect {
+  candidates: TrackCandidate[]
+  /** 镜头在动的程度 */
+  camera: number
+  note: string | null
+}
+
+export interface TrackResult {
+  points: TrackPt[]
+  lostMs: number
+  note: string | null
+}
+
+export interface EditClip {
+  id: number
+  path: string
+  kind: 'video' | 'image'
+  inMs: number
+  outMs: number
+  speed: number
+  volume: number
+  mute: boolean
+  fadeInMs: number
+  fadeOutMs: number
+  rotate: 0 | 90 | 180 | 270
+  flipH: boolean
+  flipV: boolean
+  brightness: number
+  contrast: number
+  saturation: number
+  regions: EditRegion[]
+  transition: EditTransition | null
+}
+
+export interface EditText {
+  id: number
+  text: string
+  startMs: number
+  endMs: number
+  x: number
+  y: number
+  size: number
+  color: string
+  opacity: number
+  outline: boolean
+  outlineColor: string
+  boxed: boolean
+  boxColor: string
+  boxOpacity: number
+  font: string | null
+}
+
+export interface EditAudio {
+  id: number
+  path: string
+  startMs: number
+  inMs: number
+  outMs: number | null
+  volume: number
+  fadeInMs: number
+  fadeOutMs: number
+  looped: boolean
+  duck: boolean
+}
+
+/** 叠加轨上的素材（画中画、贴纸、GIF、水印）：盖在主轨画面上面，位置、大小和时间都自由。轨号越大越在上面 */
+export interface EditOverlay {
+  id: number
+  path: string
+  kind: 'video' | 'image'
+  /** 叠加轨编号 1–8 */
+  track: number
+  /** 在时间线上从哪里开始（毫秒） */
+  startMs: number
+  inMs: number
+  outMs: number
+  speed: number
+  /** 素材不够长时重复播放（GIF、短视频） */
+  looped: boolean
+  volume: number
+  mute: boolean
+  fadeInMs: number
+  fadeOutMs: number
+  /** 中心点在画面里的位置（占画面宽、高的比例，0.5 = 正中） */
+  x: number
+  y: number
+  /** 素材宽度占画面宽度的比例 */
+  scale: number
+  /** 顺时针旋转的角度（度） */
+  rotate: number
+  opacity: number
+  flipH: boolean
+  flipV: boolean
+  brightness: number
+  contrast: number
+  saturation: number
+}
+
+export interface EditOutput {
+  width: number
+  height: number
+  fps: number
+  fit: 'contain' | 'cover' | 'blur'
+  quality: 'small' | 'balanced' | 'high'
+  codec: 'h264' | 'hevc'
+  format: 'mp4' | 'mkv'
+}
+
+export interface EditProject {
+  title: string
+  clips: EditClip[]
+  overlays: EditOverlay[]
+  texts: EditText[]
+  audio: EditAudio[]
+  out: EditOutput
+}
+
+/** 素材文件的信息（`edit_probe`） */
+export interface EditSource {
+  path: string
+  name: string
+  kind: 'video' | 'audio' | 'image'
+  durationMs: number | null
+  width: number
+  height: number
+  fps: number | null
+  hasVideo: boolean
+  hasAudio: boolean
+  hdr: boolean
+  thumb: string | null
+  url: string
+}
+
+export interface OpenedEdit {
+  project: EditProject
+  missing: string[]
 }

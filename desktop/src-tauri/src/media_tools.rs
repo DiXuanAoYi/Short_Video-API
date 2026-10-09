@@ -87,6 +87,10 @@ pub enum ToolOp {
     Stabilize {
         strength: String,
     },
+    /// 剪辑：多段素材在时间线上排布，加转场、文字、配乐，导出成一个视频（见 `edit`）。`inputs` 是工程用到的素材文件
+    Edit {
+        project: crate::edit::spec::Project,
+    },
     /// 写入标签。None 表示不改，Some("") 表示清除
     Tags {
         title: Option<String>,
@@ -118,6 +122,7 @@ impl ToolOp {
             ToolOp::Tags { .. } => "音频标签",
             ToolOp::Normalize { .. } => "视频规整",
             ToolOp::Stabilize { .. } => "防抖",
+            ToolOp::Edit { .. } => "剪辑",
         }
     }
 }
@@ -741,7 +746,7 @@ pub fn plan(job: &ToolJob, inputs: &[Input], enc: &Encoders) -> AppResult<Plan> 
             p.args = s(&["-i", &inp, "-i", &path_arg(&meta), "-map", "0", "-map_metadata", "0", "-map_chapters", "1", "-c", "copy"]);
             p.args.extend(muxer_args(ext, &p.output));
         }
-        ToolOp::Normalize { .. } | ToolOp::Stabilize { .. } => return Err(AppError::msg("视频规整和防抖由专用流程处理。")),
+        ToolOp::Normalize { .. } | ToolOp::Stabilize { .. } | ToolOp::Edit { .. } => return Err(AppError::msg("视频规整、防抖和剪辑由专用流程处理。")),
         ToolOp::Tags { title, artist, album, year, genre, comment, cover } => {
             if !first.probe.has_audio {
                 return Err(AppError::invalid("文件里没有音频。"));
@@ -1105,8 +1110,12 @@ where
 }
 
 /// 创建 ffmpeg 处理任务并在后台运行，返回任务编号。
-pub fn start(app: &tauri::AppHandle, job: ToolJob) -> AppResult<u64> {
+pub fn start(app: &tauri::AppHandle, mut job: ToolJob) -> AppResult<u64> {
     use tauri::Manager;
+    // 剪辑的素材就是工程里用到的文件，先在这里校验工程，错误马上提示，不用等任务启动
+    if let ToolOp::Edit { project } = &job.op {
+        job.inputs = project.clone().checked().map_err(AppError::invalid)?.media_paths();
+    }
     if job.inputs.is_empty() {
         return Err(AppError::invalid("请先选择文件。"));
     }
@@ -1117,7 +1126,13 @@ pub fn start(app: &tauri::AppHandle, job: ToolJob) -> AppResult<u64> {
     }
     let st = app.state::<Arc<crate::AppState>>().inner().clone();
     find_ffmpeg(&st).ok_or_else(|| AppError::new(crate::error::ErrorKind::NeedUpdate, "需要 ffmpeg。请在“设置 → 组件”中安装 ffmpeg 后重试。"))?;
-    let title = if job.inputs.len() > 1 {
+    let edit_title = match &job.op {
+        ToolOp::Edit { project } if !project.title.trim().is_empty() => Some(project.title.trim().to_string()),
+        _ => None,
+    };
+    let title = if let Some(t) = edit_title {
+        t
+    } else if job.inputs.len() > 1 {
         format!("{} 等 {} 个文件", stem_of(Path::new(&job.inputs[0])), job.inputs.len())
     } else {
         stem_of(Path::new(&job.inputs[0]))
@@ -1137,6 +1152,7 @@ async fn run_job(ctx: &JobCtx, job: &ToolJob) -> AppResult<PathBuf> {
     match &job.op {
         ToolOp::Normalize { spec, .. } => return crate::vidnorm::job::run_normalize(ctx, job, spec).await,
         ToolOp::Stabilize { strength } => return crate::vidnorm::job::run_stabilize(ctx, job, strength).await,
+        ToolOp::Edit { project } => return crate::edit::job::run_edit(ctx, job, project).await,
         _ => {}
     }
     let st = &ctx.st;
