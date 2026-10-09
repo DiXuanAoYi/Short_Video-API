@@ -10,8 +10,15 @@ import AccountsPanel from '../components/AccountsPanel.vue'
 import NetworkPanel from '../components/NetworkPanel.vue'
 import ComponentsPanel from '../components/ComponentsPanel.vue'
 import PhonePanel from '../components/PhonePanel.vue'
+import AiPanel from '../components/AiPanel.vue'
+import SiteRulesPanel from '../components/SiteRulesPanel.vue'
+import NotifyPanel from '../components/NotifyPanel.vue'
+import UploadPanel from '../components/UploadPanel.vue'
+import RulesPanel from '../components/RulesPanel.vue'
+import SecurityPanel from '../components/SecurityPanel.vue'
 import type { HealthResult } from '../types'
 import { copyDiagnostics } from '../composables/diagnostics'
+import { LANGUAGES } from '../i18n'
 
 const app = useAppStore()
 const form = ref<Settings>(JSON.parse(JSON.stringify(app.settings!)))
@@ -29,6 +36,11 @@ function saveSubLangs() {
     .map((l) => l.trim())
     .filter(Boolean)
   subLangsText.value = form.value.subtitleLangs.join(', ')
+}
+const DAYS = ['一', '二', '三', '四', '五', '六', '日']
+
+function addSpeedWindow() {
+  form.value.speedSchedule.push({ days: [], start: '08:00', end: '23:00', limitKbps: 1024 })
 }
 const health = ref<HealthResult[] | null>(null)
 const checkingHealth = ref(false)
@@ -213,6 +225,32 @@ function insertVar(v: string) {
           </section>
 
           <section class="group card">
+            <h3>限速计划与省流量</h3>
+            <div class="col">
+              <span>限速计划<small class="mute block">在指定时段改用另一个限速，没命中任何时段时使用上面的全局限速；多个时段重叠时取最先匹配的</small></span>
+              <div v-for="(w, i) in form.speedSchedule" :key="i" class="win">
+                <el-checkbox-group v-model="w.days" size="small">
+                  <el-checkbox-button v-for="(d, k) in DAYS" :key="k" :value="k + 1">{{ d }}</el-checkbox-button>
+                </el-checkbox-group>
+                <el-time-select v-model="w.start" size="small" class="tsel" start="00:00" end="23:30" step="00:30" :clearable="false" />
+                <span class="mute small">到</span>
+                <el-time-select v-model="w.end" size="small" class="tsel" start="00:00" end="23:30" step="00:30" :clearable="false" />
+                <el-input-number v-model="w.limitKbps" :min="0" :max="1048576" :step="256" size="small" class="lim" />
+                <span class="mute small">KB/s</span>
+                <el-button link size="small" @click="form.speedSchedule.splice(i, 1)">删除</el-button>
+              </div>
+              <div>
+                <el-button size="small" @click="addSpeedWindow">添加时段</el-button>
+                <span class="mute small"> {{ form.speedSchedule.length ? '限速填 0 表示这个时段不限速；不选星期表示每天；结束早于开始表示跨过午夜' : '例如白天限速、半夜不限速' }}</span>
+              </div>
+            </div>
+            <div class="kv">
+              <span>省流量模式<small class="mute block">用于手机热点等按流量计费的网络：下载并发降为 1、分段数减少、默认画质改为省空间（不超过 720p）、不自动下载订阅更新、不自动上传和调用 AI，已排队的任务不受影响</small></span>
+              <el-switch v-model="form.meteredMode" />
+            </div>
+          </section>
+
+          <section class="group card">
             <h3>整理</h3>
             <div class="kv">
               <span>把标题、作者、封面写入文件<small class="mute block">需要 ffmpeg；视频和音频在播放器、音乐软件里能显示信息</small></span>
@@ -320,6 +358,28 @@ function insertVar(v: string) {
               <span>B站弹幕转成 ASS<small class="mute block">播放器（PotPlayer、VLC、mpv 等）可以直接显示滚动弹幕；关闭则保存 XML 原文</small></span>
               <el-switch v-model="form.danmakuAss" />
             </div>
+            <template v-if="form.danmakuAss">
+              <div class="kv">
+                <span>弹幕字号<small class="mute block">以 1080 高度的画面为准</small></span>
+                <el-input-number v-model="form.danmaku.fontSize" size="small" :min="18" :max="80" controls-position="right" />
+              </div>
+              <div class="kv">
+                <span>弹幕不透明度（%）</span>
+                <el-slider v-model="form.danmaku.opacity" :min="20" :max="100" :step="5" size="small" class="slim" />
+              </div>
+              <div class="kv">
+                <span>滚动一屏的时间（秒）<small class="mute block">越小越快</small></span>
+                <el-input-number v-model="form.danmaku.scrollSecs" size="small" :min="3" :max="20" controls-position="right" />
+              </div>
+              <div class="kv">
+                <span>弹幕占画面高度（%）<small class="mute block">留出底部给字幕</small></span>
+                <el-slider v-model="form.danmaku.area" :min="10" :max="100" :step="5" size="small" class="slim" />
+              </div>
+              <div class="field">
+                <label>弹幕字体</label>
+                <el-input v-model="form.danmaku.font" size="small" placeholder="留空使用微软雅黑（没有时播放器自动换用其他中文字体）" />
+              </div>
+            </template>
           </section>
           <section class="group card">
             <h3>解析方式</h3>
@@ -353,6 +413,14 @@ function insertVar(v: string) {
               </el-select>
             </div>
             <div class="kv">
+              <span>大小上限（MB）<small class="mute block">默认选中的格式预估超过上限时，改选不超过的最高清晰度；0 表示不限制。网站没给出大小时按码率和时长估算</small></span>
+              <el-input-number v-model="form.maxSizeMb" size="small" :min="0" :max="1000000" :step="50" controls-position="right" />
+            </div>
+            <div class="kv">
+              <span>失败时自动降级<small class="mute block">网络、文件损坏等原因下载失败时，自动改用低一档的清晰度重新下载（最多 3 次）</small></span>
+              <el-switch v-model="form.autoDowngrade" />
+            </div>
+            <div class="kv">
               <span>同等清晰度优先 H.264<small class="mute block">兼容性最好；AV1、H.265 体积更小，但老设备可能播不了</small></span>
               <el-switch v-model="form.preferH264" />
             </div>
@@ -371,6 +439,7 @@ function insertVar(v: string) {
               <small class="mute">变量：{series} 剧名或列表名、{season} 季、{episode} 集数，以及 {title} {author} 等；“/” 表示子文件夹。留空则使用普通文件命名。</small>
             </div>
           </section>
+          <SiteRulesPanel v-model="form.customSites" />
           <section class="group card">
             <h3>其他网站</h3>
             <div class="kv">
@@ -403,6 +472,22 @@ function insertVar(v: string) {
 
       <el-tab-pane label="手机与浏览器扩展" name="phone">
         <PhonePanel />
+      </el-tab-pane>
+
+      <el-tab-pane label="自动化" name="automation">
+        <div class="groups">
+          <NotifyPanel v-model="form.notify" />
+          <UploadPanel v-model="form.upload" />
+          <RulesPanel v-model="form.rules" class="wide" />
+        </div>
+      </el-tab-pane>
+
+      <el-tab-pane label="AI" name="ai">
+        <AiPanel v-model="form.ai" />
+      </el-tab-pane>
+
+      <el-tab-pane label="安全与隐私" name="security">
+        <SecurityPanel v-model="form.security" />
       </el-tab-pane>
 
       <el-tab-pane label="组件" name="components">
@@ -456,11 +541,38 @@ function insertVar(v: string) {
                 <el-radio-button value="light">浅色</el-radio-button>
               </el-radio-group>
             </div>
+            <div class="kv">
+              <span>界面语言<small class="mute block">English 界面由机器翻译整理，较长的提示和软件返回的错误消息仍可能是中文</small></span>
+              <el-radio-group v-model="form.language" size="small">
+                <el-radio-button v-for="l in LANGUAGES" :key="l.value" :value="l.value">{{ l.label }}</el-radio-button>
+              </el-radio-group>
+            </div>
             <div class="kv"><span>关闭窗口时最小化到托盘</span><el-switch v-model="form.closeToTray" /></div>
+            <div class="kv"><span>悬浮拖拽窗<small class="mute block">桌面上的小窗口：把浏览器里的链接拖进去就开始下载，也可以点一下后按 Ctrl+V 粘贴；双击回到主窗口</small></span><el-switch v-model="form.floatBall" /></div>
             <div class="kv"><span>开机自动启动<small class="mute block">在托盘运行，用于订阅的定期检查</small></span><el-switch v-model="form.launchAtLogin" /></div>
             <div class="kv"><span>订阅与追更<small class="mute block">在“订阅”页面管理</small></span><el-switch v-model="form.subscriptionsEnabled" /></div>
             <div class="kv"><span>启动时检查更新</span><el-switch v-model="form.checkUpdate" /></div>
             <small v-if="portable" class="mute">便携模式：设置、数据库和日志保存在程序目录下的 data 文件夹。</small>
+          </section>
+          <section class="group card">
+            <h3>媒体库</h3>
+            <div class="kv">
+              <span>删除文件时先放进回收站<small class="mute block">在媒体库里删除文件时移到下载目录里的隐藏文件夹，可以还原</small></span>
+              <el-switch v-model="form.library.useTrash" />
+            </div>
+            <div v-if="form.library.useTrash" class="kv">
+              <span>回收站保留天数<small class="mute block">超过天数的文件在启动时永久删除，0 表示不自动清空</small></span>
+              <el-input-number v-model="form.library.trashKeepDays" size="small" :min="0" :max="3650" controls-position="right" />
+            </div>
+            <div class="kv">
+              <span>下载完成后记录时长并截取封面<small class="mute block">用 ffmpeg 读取视频时长；没有封面的视频会截一张图</small></span>
+              <el-switch v-model="form.library.probeNewFiles" />
+            </div>
+            <div class="field">
+              <span>“整理文件夹”的默认规则</span>
+              <el-input v-model="form.library.reorganizeTemplate" size="small" class="mono" placeholder="{platform}/{author}" />
+              <small class="mute">变量：{platform} {author} {year} {month} {day} {date} {kind}</small>
+            </div>
           </section>
           <section class="group card">
             <h3>关于</h3>
@@ -484,6 +596,12 @@ function insertVar(v: string) {
 </template>
 
 <style scoped>
+.wide {
+  grid-column: 1 / -1;
+}
+.slim {
+  width: 180px;
+}
 .page {
   padding: 20px 24px;
   max-width: 1040px;
@@ -530,9 +648,30 @@ h3 {
 .kv > span {
   min-width: 0;
 }
+.kv :deep(.el-radio-group) {
+  flex-shrink: 0;
+  flex-wrap: nowrap;
+}
 .block {
   display: block;
   font-size: 11px;
+}
+.col {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.win {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.tsel {
+  width: 110px;
+}
+.lim {
+  width: 130px;
 }
 .field {
   display: flex;

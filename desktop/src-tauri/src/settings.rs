@@ -286,6 +286,379 @@ pub struct Settings {
     pub danmaku_ass: bool,
     /// 下载完成后用 ffmpeg 检查文件能否正常读取，损坏时自动重新下载一次
     pub verify_downloads: bool,
+    /// 媒体库：回收站、整理规则
+    pub library: LibrarySettings,
+    /// 弹幕转 ASS 时的样式
+    pub danmaku: DanmakuStyle,
+    /// 默认选中的视频格式预估超过这个大小（MB）时，改选不超过的最高清晰度；0 表示不限
+    pub max_size_mb: u64,
+    /// 下载失败（网络、文件损坏等）时自动改用更低一档的清晰度重新下载
+    pub auto_downgrade: bool,
+    /// AI：语音转文字、字幕翻译、摘要与章节
+    pub ai: AiSettings,
+    /// 自定义站点规则：用正则从网页源码里找视频地址
+    pub custom_sites: Vec<SiteRule>,
+    /// 把事件推送到手机 / 聊天工具
+    pub notify: NotifySettings,
+    /// 下载完成后自动上传 / 复制
+    pub upload: UploadSettings,
+    /// 下载完成后的自动规则
+    pub rules: Vec<AutoRule>,
+    /// 限速计划：不同时段用不同的限速
+    pub speed_schedule: Vec<SpeedWindow>,
+    /// 省流量模式（按流量计费的网络）：一次只下一个任务、默认选低清晰度、订阅不自动下载、不自动上传和 AI 处理
+    pub metered_mode: bool,
+    /// 安全与隐私
+    pub security: SecuritySettings,
+    /// 已完成首次使用引导（升级前就在使用的用户不再弹出）
+    pub onboarded: bool,
+    /// 界面语言：zh / en / ja
+    pub language: String,
+    /// 悬浮拖拽窗：把链接拖到桌面上的小圆标就能下载
+    pub float_ball: bool,
+}
+
+/// 限速计划里的一个时段。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SpeedWindow {
+    /// 星期几：1 = 周一 … 7 = 周日；为空表示每天
+    pub days: Vec<u8>,
+    pub start: String,
+    pub end: String,
+    /// 这个时段的限速（KB/s），0 表示不限速
+    pub limit_kbps: u64,
+}
+
+impl Default for SpeedWindow {
+    fn default() -> Self {
+        SpeedWindow { days: vec![], start: "09:00".into(), end: "18:00".into(), limit_kbps: 500 }
+    }
+}
+
+impl SpeedWindow {
+    pub fn contains(&self, weekday: u8, minute: u32) -> bool {
+        crate::live::in_schedule(&[crate::live::TimeWindow { days: self.days.clone(), start: self.start.clone(), end: self.end.clone() }], weekday, minute)
+    }
+}
+
+/// 计划里此刻生效的限速（KB/s，0 表示不限）；不在任何时段里返回 None（用全局限速）。
+pub fn schedule_limit(windows: &[SpeedWindow], weekday: u8, minute: u32) -> Option<u64> {
+    windows.iter().find(|w| w.contains(weekday, minute)).map(|w| w.limit_kbps)
+}
+
+/// 自动规则：下载完成后，满足条件就执行动作。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AutoRule {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub when: RuleWhen,
+    pub then: RuleThen,
+}
+
+/// 条件：留空的不限制，填了的必须全部满足。文字条件用 `|` 分隔多个关键词（满足任意一个），以 `re:` 开头表示正则。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RuleWhen {
+    /// 平台 ID（douyin / bilibili / …）或平台名称
+    pub platform: String,
+    pub author: String,
+    pub title: String,
+    /// video / audio / image / subtitle
+    pub kind: String,
+    /// manual / subscription / live …
+    pub source: String,
+    pub min_size_mb: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RuleThen {
+    pub add_tags: Vec<String>,
+    pub favorite: bool,
+    /// 移动到下载目录下的这个子目录（可用 {platform} {author} {year} {month} {day} {date} {kind}）
+    pub move_to: String,
+    /// 另外提取音频：mp3 / m4a / flac / opus；留空不提取
+    pub extract_audio: String,
+    /// 上传（需要在“自动上传”里填好目标，不论是否启用自动上传）
+    pub upload: bool,
+    /// 命中时推送一条通知
+    pub notify: bool,
+}
+
+/// 下载完成后自动上传到 WebDAV（Nextcloud、坚果云、Alist 等），或复制到另一个文件夹（NAS 挂载盘等）。
+/// WebDAV 密码保存在加密的保险箱里（`upload.webdav`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct UploadSettings {
+    pub enabled: bool,
+    /// webdav / folder
+    pub kind: String,
+    /// WebDAV 地址，或目标文件夹路径
+    pub url: String,
+    pub user: String,
+    /// 目标下的子目录规则；变量同“整理文件夹”：{platform} {author} {year} {month} {day} {date} {kind}
+    pub remote_dir: String,
+    /// 哪些类型的文件要上传
+    pub kinds: Vec<String>,
+    /// 上传成功后删除本地文件（默认保留）
+    pub delete_after: bool,
+}
+
+impl Default for UploadSettings {
+    fn default() -> Self {
+        UploadSettings {
+            enabled: false,
+            kind: "webdav".into(),
+            url: String::new(),
+            user: String::new(),
+            remote_dir: "ClearClip/{platform}".into(),
+            kinds: vec!["video".into(), "audio".into()],
+            delete_after: false,
+        }
+    }
+}
+
+/// 外部通知渠道。令牌 / Webhook 地址保存在加密的保险箱里（`notify.<id>`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct NotifyChannel {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    /// webhook / telegram / bark / serverchan / wecom / dingtalk / feishu / ntfy
+    pub kind: String,
+    /// Telegram 的 chat id、Bark 的服务器地址等不敏感的部分
+    pub target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct NotifySettings {
+    pub channels: Vec<NotifyChannel>,
+    /// 下载完成
+    pub on_done: bool,
+    /// 下载失败
+    pub on_failed: bool,
+    /// 直播开播 / 录制开始 / 结束 / 异常
+    pub on_live: bool,
+    /// 订阅有新内容
+    pub on_sub: bool,
+    /// 登录失效 / 即将失效
+    pub on_account: bool,
+}
+
+impl Default for NotifySettings {
+    fn default() -> Self {
+        NotifySettings { channels: vec![], on_done: true, on_failed: true, on_live: true, on_sub: true, on_account: true }
+    }
+}
+
+/// 安全与隐私选项。应用锁的密码不在这里（只保存校验值，放在加密的密钥保险箱里）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SecuritySettings {
+    /// 空闲多少分钟后自动锁定（需要先设置应用锁密码）；0 表示不自动锁定
+    pub auto_lock_minutes: u32,
+    /// 窗口收进托盘时自动锁定
+    pub lock_on_hide: bool,
+    /// 隐私模式：不记录解析历史、不进媒体库、任务结束即清除记录、通知不显示标题
+    pub privacy_mode: bool,
+    /// 禁止截屏和录屏（Windows、macOS 有效）
+    pub content_protection: bool,
+    /// 老板键：立刻隐藏窗口并锁定；留空表示不启用
+    pub panic_shortcut: String,
+    /// 保险箱空闲多少分钟后自动上锁；0 表示不自动上锁
+    pub safebox_auto_lock_minutes: u32,
+}
+
+impl Default for SecuritySettings {
+    fn default() -> Self {
+        SecuritySettings {
+            auto_lock_minutes: 10,
+            lock_on_hide: true,
+            privacy_mode: false,
+            content_protection: false,
+            panic_shortcut: String::new(),
+            safebox_auto_lock_minutes: 15,
+        }
+    }
+}
+
+/// 自定义站点规则。内置解析器、yt-dlp 都不支持的网站，可以自己写一条正则来取视频地址。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SiteRule {
+    pub name: String,
+    pub enabled: bool,
+    /// 网址里包含这段文字时使用本规则；以 `re:` 开头表示正则
+    pub pattern: String,
+    /// 在网页源码里找视频地址的正则：取第一个捕获组，没有捕获组就取整个匹配
+    pub video_regex: String,
+    /// 标题的正则（取第一个捕获组）；留空用网页标题
+    pub title_regex: String,
+    /// 封面的正则（取第一个捕获组）；留空用 og:image
+    pub cover_regex: String,
+    /// 下载时的 Referer；留空用网页地址
+    pub referer: String,
+    /// 请求网页和下载时的 User-Agent；留空用电脑浏览器的
+    pub user_agent: String,
+}
+
+impl Default for SiteRule {
+    fn default() -> Self {
+        SiteRule {
+            name: String::new(),
+            enabled: true,
+            pattern: String::new(),
+            video_regex: String::new(),
+            title_regex: String::new(),
+            cover_regex: String::new(),
+            referer: String::new(),
+            user_agent: String::new(),
+        }
+    }
+}
+
+/// AI 功能的设置。API 密钥不在这里，保存在加密的保险箱里（`ai.api_key`、`stt.api_key`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AiSettings {
+    /// 兼容 OpenAI 接口的地址（OpenAI、DeepSeek、通义、月之暗面、本机 Ollama 等），如 `https://api.openai.com/v1`
+    pub base_url: String,
+    pub model: String,
+    /// 翻译成什么语言（直接写进提示词，如“简体中文”“English”）
+    pub target_lang: String,
+    /// 翻译结果同时保留原文（原文在上，译文在下）
+    pub bilingual: bool,
+    /// 每次请求翻译多少条字幕
+    pub batch_size: usize,
+    /// 语音转文字：`api`（兼容 OpenAI 的 `/audio/transcriptions`）或 `local`（本机的 whisper.cpp）
+    pub stt_engine: String,
+    /// 语音转文字接口地址；留空与上面相同
+    pub stt_base_url: String,
+    pub stt_model: String,
+    /// 音频语言代码（zh / en / ja…），留空自动识别
+    pub stt_language: String,
+    /// whisper.cpp 可执行文件（whisper-cli），留空时在 PATH 里找
+    pub whisper_bin: String,
+    /// whisper.cpp 的 ggml 模型文件
+    pub whisper_model: String,
+    /// 下载到的字幕不是目标语言时自动翻译
+    pub auto_translate: bool,
+    /// 下载的视频没有字幕时自动转写
+    pub auto_transcribe: bool,
+}
+
+impl Default for AiSettings {
+    fn default() -> Self {
+        AiSettings {
+            base_url: "https://api.openai.com/v1".into(),
+            model: "gpt-4o-mini".into(),
+            target_lang: "简体中文".into(),
+            bilingual: true,
+            batch_size: 40,
+            stt_engine: "api".into(),
+            stt_base_url: String::new(),
+            stt_model: "whisper-1".into(),
+            stt_language: String::new(),
+            whisper_bin: String::new(),
+            whisper_model: String::new(),
+            auto_translate: false,
+            auto_transcribe: false,
+        }
+    }
+}
+
+impl AiSettings {
+    pub fn normalize(&mut self) {
+        let clean = |u: &str| -> String {
+            let u = u.trim().trim_end_matches('/').to_string();
+            if u.starts_with("http://") || u.starts_with("https://") {
+                u
+            } else {
+                String::new()
+            }
+        };
+        self.base_url = clean(&self.base_url);
+        self.stt_base_url = clean(&self.stt_base_url);
+        self.model = self.model.trim().to_string();
+        self.stt_model = self.stt_model.trim().to_string();
+        self.target_lang = self.target_lang.trim().chars().filter(|c| !c.is_control()).take(40).collect();
+        if self.target_lang.is_empty() {
+            self.target_lang = AiSettings::default().target_lang;
+        }
+        self.batch_size = self.batch_size.clamp(5, 100);
+        if !matches!(self.stt_engine.as_str(), "api" | "local") {
+            self.stt_engine = "api".into();
+        }
+        self.stt_language = self.stt_language.trim().to_ascii_lowercase();
+        self.whisper_bin = self.whisper_bin.trim().to_string();
+        self.whisper_model = self.whisper_model.trim().to_string();
+    }
+
+    /// 语音转文字用的接口地址。
+    pub fn stt_url(&self) -> &str {
+        if self.stt_base_url.is_empty() {
+            &self.base_url
+        } else {
+            &self.stt_base_url
+        }
+    }
+}
+
+/// 弹幕样式（B站弹幕 XML 转成 ASS 时使用）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DanmakuStyle {
+    /// 字号（以 1080 高度的画面为准）
+    pub font_size: u32,
+    /// 不透明度 20–100（%）
+    pub opacity: u32,
+    /// 滚动弹幕从右到左穿过屏幕的大致秒数，越小越快
+    pub scroll_secs: u32,
+    /// 弹幕占画面高度的比例（%），避免挡住底部字幕
+    pub area: u32,
+    /// 字体名；留空使用微软雅黑（没有时播放器会自动换用其他中文字体）
+    pub font: String,
+}
+
+impl Default for DanmakuStyle {
+    fn default() -> Self {
+        DanmakuStyle { font_size: 40, opacity: 100, scroll_secs: 7, area: 75, font: String::new() }
+    }
+}
+
+impl DanmakuStyle {
+    pub fn normalize(&mut self) {
+        self.font_size = self.font_size.clamp(18, 80);
+        self.opacity = self.opacity.clamp(20, 100);
+        self.scroll_secs = self.scroll_secs.clamp(3, 20);
+        self.area = self.area.clamp(10, 100);
+        self.font = self.font.trim().chars().filter(|c| !matches!(c, ',' | '\n' | '\r')).take(60).collect();
+    }
+}
+
+/// 媒体库设置。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LibrarySettings {
+    /// 删除文件时先放进回收站（下载目录里的隐藏文件夹），可以还原
+    pub use_trash: bool,
+    /// 回收站里的文件保留多少天后自动清空（0 表示不自动清空）
+    pub trash_keep_days: u32,
+    /// “整理目录”使用的子目录规则；变量：{platform} {author} {year} {month} {day} {date} {kind}
+    pub reorganize_template: String,
+    /// 下载完成后给没有封面的视频截一张图，并记录时长
+    pub probe_new_files: bool,
+}
+
+impl Default for LibrarySettings {
+    fn default() -> Self {
+        LibrarySettings { use_trash: true, trash_keep_days: 30, reorganize_template: "{platform}/{author}".into(), probe_new_files: true }
+    }
 }
 
 /// 收到的链接的记录与保留。
@@ -396,13 +769,34 @@ impl Default for Settings {
             subtitle_convert: true,
             danmaku_ass: true,
             verify_downloads: true,
+            library: LibrarySettings::default(),
+            danmaku: DanmakuStyle::default(),
+            max_size_mb: 0,
+            auto_downgrade: true,
+            ai: AiSettings::default(),
+            custom_sites: vec![],
+            notify: NotifySettings::default(),
+            upload: UploadSettings::default(),
+            rules: vec![],
+            speed_schedule: vec![],
+            metered_mode: false,
+            security: SecuritySettings::default(),
+            onboarded: false,
+            language: "zh".into(),
+            float_ball: false,
         }
     }
 }
 
 impl Settings {
     pub fn load(path: &Path, default_download_dir: &Path) -> Settings {
-        let mut s: Settings = std::fs::read_to_string(path).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default();
+        let raw = std::fs::read_to_string(path).ok();
+        let mut s: Settings = raw.as_deref().and_then(|text| serde_json::from_str(text).ok()).unwrap_or_default();
+        // 升级前就已经在用的（同意过使用说明、设置里还没有这个字段）：不再弹出首次引导
+        let has_key = raw.as_deref().and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok()).is_some_and(|v| v.get("onboarded").is_some());
+        if !has_key && s.disclaimer_accepted {
+            s.onboarded = true;
+        }
         if s.download_dir.trim().is_empty() {
             s.download_dir = default_download_dir.to_string_lossy().into_owned();
         }
@@ -462,6 +856,75 @@ impl Settings {
             self.filename_template = Settings::default().filename_template;
         }
         self.remote_endpoint = self.remote_endpoint.trim().to_string();
+        self.danmaku.normalize();
+        self.ai.normalize();
+        self.speed_schedule
+            .retain(|w| crate::live::parse_hhmm(&w.start).is_some() && crate::live::parse_hhmm(&w.end).is_some() && w.start.trim() != w.end.trim());
+        self.speed_schedule.truncate(14);
+        for w in &mut self.speed_schedule {
+            w.days.retain(|d| (1..=7).contains(d));
+            w.days.sort_unstable();
+            w.days.dedup();
+            w.start = w.start.trim().to_string();
+            w.end = w.end.trim().to_string();
+            w.limit_kbps = w.limit_kbps.min(10_000_000);
+        }
+        self.rules.truncate(50);
+        for r in &mut self.rules {
+            r.id = r.id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(32).collect();
+            r.name = r.name.trim().to_string();
+            r.then.add_tags = r.then.add_tags.iter().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+            r.then.move_to = r.then.move_to.trim().to_string();
+            if !matches!(r.then.extract_audio.as_str(), "" | "mp3" | "m4a" | "flac" | "opus") {
+                r.then.extract_audio.clear();
+            }
+        }
+        self.upload.url = self.upload.url.trim().to_string();
+        self.upload.user = self.upload.user.trim().to_string();
+        self.upload.remote_dir = self.upload.remote_dir.trim().to_string();
+        if !matches!(self.upload.kind.as_str(), "webdav" | "folder") {
+            self.upload.kind = "webdav".into();
+        }
+        self.upload.kinds.retain(|k| matches!(k.as_str(), "video" | "audio" | "image" | "cover" | "subtitle"));
+        self.notify.channels.truncate(10);
+        for c in &mut self.notify.channels {
+            c.name = c.name.trim().to_string();
+            c.target = c.target.trim().to_string();
+            c.id = c.id.chars().filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_').take(32).collect();
+        }
+        self.notify.channels.retain(|c| !c.id.is_empty());
+        self.custom_sites.truncate(50);
+        for r in &mut self.custom_sites {
+            for f in [&mut r.name, &mut r.pattern, &mut r.video_regex, &mut r.title_regex, &mut r.cover_regex, &mut r.referer, &mut r.user_agent] {
+                *f = f.trim().to_string();
+            }
+        }
+        if !matches!(self.language.as_str(), "zh" | "en" | "ja") {
+            self.language = "zh".into();
+        }
+        self.security.auto_lock_minutes = self.security.auto_lock_minutes.min(24 * 60);
+        self.security.safebox_auto_lock_minutes = self.security.safebox_auto_lock_minutes.min(24 * 60);
+        self.security.panic_shortcut = self.security.panic_shortcut.trim().to_string();
+        self.max_size_mb = self.max_size_mb.min(1_000_000);
+        self.library.trash_keep_days = self.library.trash_keep_days.min(3650);
+        self.library.reorganize_template = self.library.reorganize_template.trim().to_string();
+        if self.library.reorganize_template.is_empty() {
+            self.library.reorganize_template = LibrarySettings::default().reorganize_template;
+        }
+    }
+
+    /// 省流量模式下实际生效的设置（不改保存的设置本身）。
+    pub fn metered_view(mut self) -> Settings {
+        if self.metered_mode {
+            self.concurrency = 1;
+            self.per_site_concurrency = 1;
+            self.segments = self.segments.min(2);
+            self.hls_concurrency = self.hls_concurrency.min(2);
+            if matches!(self.quality_preset, QualityPreset::Best | QualityPreset::Max1080) {
+                self.quality_preset = QualityPreset::Small;
+            }
+        }
+        self
     }
 
     pub fn download_root(&self) -> PathBuf {
@@ -499,9 +962,54 @@ mod tests {
     }
 
     #[test]
+    fn speed_schedule_picks_the_window() {
+        let w = |days: &[u8], s: &str, e: &str, l: u64| SpeedWindow { days: days.to_vec(), start: s.into(), end: e.into(), limit_kbps: l };
+        let plan = vec![w(&[1, 2, 3, 4, 5], "09:00", "18:00", 300), w(&[], "00:00", "06:00", 0)];
+        assert_eq!(schedule_limit(&plan, 3, 10 * 60), Some(300), "Wednesday 10:00");
+        assert_eq!(schedule_limit(&plan, 6, 10 * 60), None, "Saturday daytime: global limit");
+        assert_eq!(schedule_limit(&plan, 6, 3 * 60), Some(0), "night: unlimited");
+        assert_eq!(schedule_limit(&plan, 3, 18 * 60), None, "end is exclusive");
+        let mut s = Settings { speed_schedule: vec![w(&[9], "x", "y", 1), w(&[2, 2, 0], "10:00", "11:00", 99_999_999_999)], ..Default::default() };
+        s.normalize();
+        assert_eq!(s.speed_schedule, vec![w(&[2], "10:00", "11:00", 10_000_000)]);
+    }
+
+    #[test]
+    fn metered_mode_overlays_without_touching_saved_values() {
+        let s = Settings { metered_mode: true, concurrency: 5, quality_preset: QualityPreset::Best, ..Default::default() };
+        let v = s.clone().metered_view();
+        assert_eq!((v.concurrency, v.per_site_concurrency, v.quality_preset), (1, 1, QualityPreset::Small));
+        assert_eq!(s.concurrency, 5, "the original is untouched");
+        let audio = Settings { metered_mode: true, quality_preset: QualityPreset::Audio, ..Default::default() }.metered_view();
+        assert_eq!(audio.quality_preset, QualityPreset::Audio, "audio-only stays audio-only");
+        let off = Settings { metered_mode: false, concurrency: 4, ..Default::default() }.metered_view();
+        assert_eq!(off.concurrency, 4);
+    }
+
+    #[test]
     fn normalize_clamps_concurrency() {
         let mut s = Settings { concurrency: 99, ..Settings::default() };
         s.normalize();
         assert_eq!(s.concurrency, 8);
+    }
+
+    #[test]
+    fn upgraders_skip_onboarding_but_new_installs_get_it() {
+        let dir = std::env::temp_dir().join(format!("clearclip-onb-{}-{}", std::process::id(), crate::db::now()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("settings.json");
+        let dl = dir.join("dl");
+        // 没有设置文件：新安装
+        assert!(!Settings::load(&p, &dl).onboarded);
+        // 旧版本的设置：同意过说明但没有 onboarded 字段
+        std::fs::write(&p, r#"{"disclaimerAccepted": true, "concurrency": 2}"#).unwrap();
+        assert!(Settings::load(&p, &dl).onboarded);
+        // 同意了说明但还没做完引导（字段明确为 false）：仍然显示
+        std::fs::write(&p, r#"{"disclaimerAccepted": true, "onboarded": false}"#).unwrap();
+        assert!(!Settings::load(&p, &dl).onboarded);
+        // 语言只接受已知值
+        std::fs::write(&p, r#"{"language": "xx"}"#).unwrap();
+        assert_eq!(Settings::load(&p, &dl).language, "zh");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

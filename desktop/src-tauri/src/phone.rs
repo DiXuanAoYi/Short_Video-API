@@ -420,7 +420,19 @@ async fn handle(app: AppHandle, mut sock: TcpStream, peer: SocketAddr) {
             }
         }
         ("GET", "/favicon.ico") => respond(&mut sock, "404 Not Found", "text/plain", b"").await,
+        // 网页控制台：查看和控制下载（需要令牌，和手机发送页同一个令牌）
+        ("GET", "/console") => {
+            if authorized {
+                respond(&mut sock, "200 OK", "text/html; charset=utf-8", crate::console::page(&token).as_bytes()).await;
+            } else {
+                respond(&mut sock, "403 Forbidden", "text/html; charset=utf-8", "<meta name=viewport content='width=device-width'><p style='font:16px sans-serif;padding:24px'>访问令牌无效。请在电脑上的清影“设置 → 手机与浏览器扩展”里复制带令牌的地址。</p>".as_bytes()).await;
+            }
+        }
         (_, p) if p.starts_with("/api/") && !authorized => json(&mut sock, "403 Forbidden", serde_json::json!({"error": "访问令牌无效，请重新扫码"})).await,
+        (_, p) if p.starts_with("/api/v1/") => {
+            let (status, body) = crate::api::handle(&app, &req, &peer).unwrap_or(("404 Not Found", serde_json::json!({"error": "未知接口"})));
+            json(&mut sock, status, body).await;
+        }
         ("POST", "/api/send") => {
             let body: Result<SendBody, _> = serde_json::from_slice(&req.body).or_else(|_| {
                 // 快捷指令也可以直接发送纯文本
@@ -471,6 +483,16 @@ async fn handle(app: AppHandle, mut sock: TcpStream, peer: SocketAddr) {
         }
         _ => respond(&mut sock, "404 Not Found", "text/plain", b"not found").await,
     }
+}
+
+/// 已经通过令牌验证的来源（本机接口、命令行）发来的链接：不用配对，直接处理。
+pub fn receive_trusted(app: &AppHandle, source: &str, device: &str, name: &str, text: String) -> Option<i64> {
+    let id = inbox::record(app, source, device, name, &text, "resolving")?;
+    let _ = app.emit(EVT_RECEIVED, text);
+    // 接口 / 命令行是明确要求下载的，不再弹出确认
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move { inbox::process(&app2, id).await });
+    Some(id)
 }
 
 /// 收到一条链接：记录到收件箱；已配对的设备直接处理，新设备先请求配对。返回编号和状态。

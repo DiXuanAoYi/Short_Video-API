@@ -10,6 +10,12 @@
 | **下载队列** | **设置** |
 | ![队列](../docs/screenshots/queue.png) | ![设置](../docs/screenshots/settings.png) |
 
+| 内置播放器（字幕跳转） | 命令面板（Ctrl+K） |
+| --- | --- |
+| ![播放器](../docs/screenshots/player.png) | ![命令面板](../docs/screenshots/palette.png) |
+| **安全与隐私** | **加密保险箱** |
+| ![安全与隐私](../docs/screenshots/security.png) | ![保险箱](../docs/screenshots/safebox.png) |
+
 ## 功能
 
 - 粘贴整段分享文案即可解析，自动提取链接；一次粘贴多条链接可批量下载
@@ -57,6 +63,31 @@
 - 远程 API 模式：可继续使用已部署的旧版 `jxindex.php`（仅抖音、快手），也可作为本地解析失败时的备用
 - 首次启动免责声明；通过 GitHub Releases 检查新版本
 
+**媒体库与工具**（[说明](../docs/library-and-tools.md)）
+
+- 媒体库：标签、收藏、评分、备注，多条件筛选和排序；导入已有文件夹；回收站；按模板整理文件夹；重复文件检测（内容相同 / 画面相似）；磁盘占用统计；字幕全文搜索并跳到播放位置；视频预览图和镜头检测；导出 CSV / JSON；备份与还原
+- 内置播放器：自动加载同名字幕、点字幕跳转、倍速；打不开时给出错误码和替代办法
+- 工具箱：压缩、转 GIF、竖屏转横屏、倍速、响度标准化、旋转翻转、拼接、截图、转封装 / 转 MP4 / 提取音频、裁剪片段、写入章节；字幕偏移 / 帧率换算 / 双语合并 / 整理 / 格式互转；音频标签；弹幕样式
+- 按大小上限自动选清晰度；下载失败自动降一档重试
+- AI（可选）：语音转文字（在线接口或本机 whisper.cpp）、LLM 字幕翻译与双语字幕、摘要与章节
+
+**自动化与集成**（[说明](../docs/automation.md)）
+
+- 自动规则（按平台 / 作者 / 标题 / 类型 / 来源 / 大小匹配 → 加标签、收藏、移动、提取音频、上传、通知）；自动上传到 WebDAV 或另一个文件夹
+- 通知推送：Webhook、Telegram、Bark、Server酱、企业微信 / 钉钉 / 飞书群机器人、ntfy
+- 自定义站点规则（正则取视频地址）；播客 RSS；浏览器扩展嗅探页面里的视频
+- HTTP 接口 `/api/v1`、局域网网页控制台、命令行 `clearclip add / list / pause …`
+- 订阅保留策略；直播预约时段
+
+**网络与桌面体验**（[说明](../docs/desktop-experience.md)）
+
+- 限速计划（按星期和时段）、省流量模式、线路测速并一键设为某网站的出口
+- 首次引导、命令面板（Ctrl+K）、悬浮拖拽窗、任务详情（原始请求和过程记录）、托盘显示总速度、中文 / English 界面
+
+**安全与隐私**（[说明](../docs/security-and-privacy.md)）
+
+- 应用锁（空闲自动锁、老板键）、隐私模式、加密保险箱（AES-256-GCM）、一键清除、禁止截屏
+
 ## 开发
 
 需要 Node.js 20+、Rust 1.80+，以及 [Tauri 的系统依赖](https://tauri.app/start/prerequisites/)（Linux 需要 `libwebkit2gtk-4.1-dev` 等）。
@@ -72,6 +103,7 @@ npm run tauri build    # 打包安装包，产物在 src-tauri/target/release/bu
 
 ```bash
 npm run build                                   # 前端类型检查 + 构建
+npm run i18n                                    # 列出还没有英文译文的界面文字
 cd src-tauri
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
@@ -80,7 +112,7 @@ cargo test                                      # 解析器、下载器、数据
 
 ## 发布
 
-在 GitHub 的 Actions 页面手动运行 `desktop-release`（选 `main` 分支），或推送 `desktop-v*` 标签（例如 `desktop-v0.1.1`），`.github/workflows/desktop-release.yml` 会构建 Windows（msi / nsis、便携版 zip）、macOS（Apple Silicon 与 Intel 的 dmg）、Linux（AppImage / deb / rpm）和浏览器扩展 zip，并发布 Release。发布前先把 `tauri.conf.json`、`Cargo.toml`、`package.json` 的版本号改成一致。
+在 GitHub 的 Actions 页面手动运行 `desktop-release`（选 `main` 分支），或推送 `desktop-v*` 标签（例如 `desktop-v0.2.0`），`.github/workflows/desktop-release.yml` 会构建 Windows x64（msi / nsis、便携版 zip）、Windows ARM64（nsis、便携版 zip，实验性：失败不影响其它平台）、macOS（Apple 芯片和 Intel 通用的一个 dmg）、Linux（AppImage / deb / rpm）和浏览器扩展 zip，并发布 Release。`desktop-ci` 会在每次提交时对 macOS 两个架构和 Windows ARM64 做编译检查。发布前先把 `tauri.conf.json`、`Cargo.toml`、`package.json` 的版本号改成一致，并在 `CHANGELOG.md` 里补上这一版的内容。
 
 更新签名密钥、macOS / Windows 代码签名和扩展上架的完整步骤见 [docs/release-guide/](../docs/release-guide/README.md)。
 
@@ -124,6 +156,17 @@ desktop/
     │   providers/listing.rs   #   各平台“最新条目”列表
     ├── organize.rs            # 元数据、信息 JSON、NFO
     ├── power.rs               # 阻止休眠、完成后睡眠 / 关机
+    ├── library*.rs            # 媒体库：整理、导入、回收站、重复检测、字幕索引、预览图（library_cmds / library_media）
+    ├── media_tools.rs         # 后台任务系统 + 工具箱的 ffmpeg 处理（media_cmds、subtitle_tools）
+    ├── ai.rs                  # 语音转文字、字幕翻译、摘要与章节
+    ├── rules.rs notify.rs upload.rs   # 自动规则、通知推送、自动上传
+    ├── api.rs console.rs cli.rs       # HTTP 接口 v1、网页控制台、命令行
+    ├── security.rs            # 应用锁、老板键、隐私模式清理、一键清除
+    ├── safebox.rs             # 加密保险箱（Argon2id + 分块 AES-256-GCM）
+    ├── vault.rs               # 加密保存 API 密钥等小密钥
+    ├── player.rs media_server.rs      # 内置播放器：字幕查找、本机 Range 媒体服务
+    ├── backup.rs              # 备份与还原
+    ├── i18n.rs                # 托盘菜单、通知标题的英文（界面文字的翻译在前端 src/i18n）
     ├── db.rs                  # SQLite：历史与媒体库
     ├── naming.rs              # 文件命名
     ├── settings.rs            # 设置（JSON）
@@ -152,8 +195,20 @@ desktop/
 - 小红书网页链接通常需要带 `xsec_token`，部分笔记、微博需要先在设置中登录。
 - B站未登录一般最高 480P / 720P，登录后 1080P，大会员清晰度需要大会员账号；付费内容不支持。
 - yt-dlp 和 ffmpeg 需要在“设置 → 组件”中安装（或使用系统已安装的版本）。macOS 不提供 ffmpeg 自动下载，请用 Homebrew 安装后导入。自动下载的 ffmpeg 为 LGPL 版本，不含 x264，Pixiv 动图会合成为 WebM。
-- DRM 加密内容、直播流（直播录制在后续阶段）不支持下载。
+- DRM 加密内容不支持下载。直播流请用“直播”页面录制。
 - 单元测试使用按页面结构编写的样本数据（`src-tauri/tests/fixtures/`），不访问线上。
+
+### 没有做的
+
+下面这些我评估后没有做，或做不了：
+
+- 无界面的 Docker / NAS 版本（需要把下载核心和控制台从桌面外壳里拆出来单独构建）；Flatpak / Snap 打包
+- 绕过付费、会员或 DRM 的下载；音乐平台下载
+- 人声分离、画面超分辨率、按画面内容的语义搜索（需要体积很大的本地模型）；实时转码、自动切精彩片段
+- 评论抓取、整页转 PDF / 长截图
+- 指纹等系统生物识别解锁（应用锁用密码）；自动检测计量网络（省流量模式需要手动开）
+- 日语界面
+- 应用更新签名、代码签名、浏览器扩展上架：需要你自己的密钥和账号，步骤见 [docs/release-guide/](../docs/release-guide/README.md)
 
 ## 免责声明
 

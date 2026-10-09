@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { api, errorText, events } from './api'
+import { useLanguage } from './i18n/useLanguage'
 import { useAppStore, useQueueStore } from './stores/app'
 import type { ClipboardLink } from './types'
 import { formatSpeed } from './utils/format'
 
 const app = useAppStore()
+useLanguage()
 const queue = useQueueStore()
 const link = ref<ClipboardLink | null>(null)
 const busy = ref(false)

@@ -20,3 +20,16 @@ export function formatClock(ms: number): string {
   const secText = Number.isInteger(sec) ? String(sec).padStart(2, '0') : sec.toFixed(1).padStart(4, '0')
   return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${secText}` : `${m}:${secText}`
 }
+
+/** 章节文本（每行 `0:00 标题`）→ 章节列表；结束时间取下一章的开始，最后一章用 `totalMs`。 */
+export function parseChapterLines(text: string, totalMs: number): { title: string; startMs: number; endMs: number }[] {
+  const list: { title: string; startMs: number; endMs: number }[] = []
+  for (const line of text.split(/\r?\n/)) {
+    const m = line.trim().match(/^(\d+(?::\d{1,2}){1,2})\s+(.+)$/)
+    if (!m) continue
+    const start = parseClock(m[1])
+    if (start !== null) list.push({ title: m[2].trim(), startMs: start, endMs: start })
+  }
+  list.sort((a, b) => a.startMs - b.startMs)
+  return list.map((c, i) => ({ ...c, endMs: Math.max(list[i + 1]?.startMs ?? totalMs, c.startMs + 1) }))
+}

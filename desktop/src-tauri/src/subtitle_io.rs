@@ -131,16 +131,27 @@ pub async fn fetch_converted(
     clip: Option<&Clip>,
 ) -> Result<(String, String), DlError> {
     let (raw, ext) = fetch_raw(st, settings, media, asset).await?;
-    convert_text(media, &raw, &ext, to, clip).map_err(|e| DlError::Other(e.message))
+    convert_text_styled(media, &raw, &ext, to, clip, &settings.danmaku).map_err(|e| DlError::Other(e.message))
 }
 
 /// 纯转换部分（便于测试）。
 pub fn convert_text(media: &MediaInfo, raw: &str, ext: &str, to: Option<&str>, clip: Option<&Clip>) -> crate::error::AppResult<(String, String)> {
-    let layout = DanmakuLayout::for_video(media.width, media.height);
+    convert_text_styled(media, raw, ext, to, clip, &crate::settings::DanmakuStyle::default())
+}
+
+pub fn convert_text_styled(
+    media: &MediaInfo,
+    raw: &str,
+    ext: &str,
+    to: Option<&str>,
+    clip: Option<&Clip>,
+    style: &crate::settings::DanmakuStyle,
+) -> crate::error::AppResult<(String, String)> {
+    let layout = DanmakuLayout::for_video(media.width, media.height).styled(style);
     let range = clip.map(|c| c.range());
     let (mut text, mut cur) = (raw.to_string(), ext.to_string());
     if let Some(to) = to {
-        if let Some(converted) = subtitle::convert(ext, to, raw, layout, range)? {
+        if let Some(converted) = subtitle::convert_with_font(ext, to, raw, layout, range, &style.font)? {
             text = converted;
             cur = to.to_string();
         }

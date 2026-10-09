@@ -44,11 +44,11 @@ fn parse_time(s: &str) -> Option<u64> {
     Some(secs * 1000 + frac_ms)
 }
 
-fn fmt_srt_time(ms: u64) -> String {
+pub(crate) fn fmt_srt_time(ms: u64) -> String {
     format!("{:02}:{:02}:{:02},{:03}", ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60, ms % 1000)
 }
 
-fn fmt_ass_time(cs_total: u64) -> String {
+pub(crate) fn fmt_ass_time(cs_total: u64) -> String {
     format!("{}:{:02}:{:02}.{:02}", cs_total / 360_000, cs_total / 6000 % 60, cs_total / 100 % 60, cs_total % 100)
 }
 
@@ -164,11 +164,17 @@ pub struct DanmakuLayout {
     pub height: u32,
     /// 弹幕占屏幕高度的比例（避免挡住底部字幕）
     pub area: f64,
+    /// 基础字号
+    pub font_size: f64,
+    /// 不透明度 0–1
+    pub opacity: f64,
+    /// 滚动弹幕穿过屏幕的秒数
+    pub scroll_secs: f64,
 }
 
 impl Default for DanmakuLayout {
     fn default() -> Self {
-        DanmakuLayout { width: 1920, height: 1080, area: 0.75 }
+        DanmakuLayout { width: 1920, height: 1080, area: 0.75, font_size: 40.0, opacity: 1.0, scroll_secs: 7.0 }
     }
 }
 
@@ -180,6 +186,17 @@ impl DanmakuLayout {
                 DanmakuLayout { width: ((1080.0 * w as f64 / h as f64).round() as u32).clamp(360, 3840), ..Default::default() }
             }
             _ => Self::default(),
+        }
+    }
+
+    /// 套用用户设置的弹幕样式。
+    pub fn styled(self, s: &crate::settings::DanmakuStyle) -> Self {
+        DanmakuLayout {
+            area: s.area as f64 / 100.0,
+            font_size: s.font_size as f64,
+            opacity: s.opacity as f64 / 100.0,
+            scroll_secs: s.scroll_secs as f64,
+            ..self
         }
     }
 }
@@ -233,6 +250,11 @@ fn ass_escape(text: &str) -> String {
 ///
 /// `clip` 为 `(起点毫秒, 终点毫秒)` 时只保留这一段，时间平移到从 0 开始（对应裁剪后的视频）。
 pub fn danmaku_xml_to_ass(xml: &str, layout: DanmakuLayout, clip: Option<(u64, Option<u64>)>) -> AppResult<String> {
+    danmaku_xml_to_ass_font(xml, layout, clip, "")
+}
+
+/// 同 [`danmaku_xml_to_ass`]，并指定字体名（留空使用微软雅黑）。
+pub fn danmaku_xml_to_ass_font(xml: &str, layout: DanmakuLayout, clip: Option<(u64, Option<u64>)>, font: &str) -> AppResult<String> {
     let mut list = parse_danmaku(xml);
     if let Some((start, end)) = clip {
         let (start, end) = (start as f64 / 1000.0, end.map(|e| e as f64 / 1000.0));
@@ -245,11 +267,11 @@ pub fn danmaku_xml_to_ass(xml: &str, layout: DanmakuLayout, clip: Option<(u64, O
         return Err(AppError::not_found("这个视频没有弹幕。"));
     }
     let (w, h) = (layout.width as f64, layout.height as f64);
-    let base_fs = 40.0;
+    let base_fs = layout.font_size.clamp(18.0, 80.0);
     let row_h = base_fs * 1.2;
     let rows = ((h * layout.area) / row_h).floor().max(1.0) as usize;
     // 滚动速度（像素 / 秒）：所有弹幕同速，后面的不会追上前面的
-    let speed = w / 7.0;
+    let speed = w / layout.scroll_secs.max(1.0);
     let fixed_secs = 4.0;
 
     // 每行最后一条弹幕“尾部离开右边缘”的时间 / 固定弹幕结束的时间
@@ -260,8 +282,9 @@ pub fn danmaku_xml_to_ass(xml: &str, layout: DanmakuLayout, clip: Option<(u64, O
     let mut events = String::new();
     let mut kept = 0usize;
     for d in list.iter().take(60_000) {
-        let fs = (d.size * 1.6).clamp(24.0, 72.0);
-        let fs = if (fs - base_fs).abs() < 4.0 { base_fs } else { fs };
+        // 弹幕自带的字号按基础字号等比缩放（B站默认 25 对应基础字号）
+        let fs = (d.size * 1.6 * base_fs / 40.0).clamp(base_fs * 0.6, base_fs * 1.8);
+        let fs = if (fs - base_fs).abs() < base_fs * 0.1 { base_fs } else { fs };
         let tw = text_width(&d.text, fs);
         let lines = d.text.lines().count().max(1);
         let span = ((fs * 1.2 * lines as f64) / row_h).ceil().max(1.0) as usize;
@@ -317,12 +340,17 @@ pub fn danmaku_xml_to_ass(xml: &str, layout: DanmakuLayout, clip: Option<(u64, O
     if kept == 0 {
         return Err(AppError::not_found("这个视频没有可显示的弹幕。"));
     }
+    let font = if font.trim().is_empty() { "Microsoft YaHei" } else { font.trim() };
+    // ASS 的透明度是反的：00 不透明，FF 全透明
+    let alpha = ((1.0 - layout.opacity.clamp(0.0, 1.0)) * 255.0).round() as u8;
     Ok(format!(
         "[Script Info]\nScriptType: v4.00+\nPlayResX: {}\nPlayResY: {}\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n\
          [V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
-         Style: Danmaku,Microsoft YaHei,{base_fs},&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,1.8,0,7,0,0,0,1\n\n\
+         Style: Danmaku,{font},{},&H{alpha:02X}FFFFFF,&H{alpha:02X}FFFFFF,&H{alpha:02X}000000,&H64000000,0,0,0,0,100,100,0,0,1,1.8,0,7,0,0,0,1\n\n\
          [Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n{events}",
-        layout.width, layout.height
+        layout.width,
+        layout.height,
+        base_fs.round() as u32
     ))
 }
 
@@ -399,10 +427,14 @@ pub fn iso639_2(code: &str) -> &'static str {
 /// 下载下来的字幕文件内容转换为目标格式；返回新内容。`to` 为 `srt` 或 `ass`。
 /// 已经是目标格式、或没有可做的转换时返回 None。
 pub fn convert(ext: &str, to: &str, content: &str, layout: DanmakuLayout, clip: Option<(u64, Option<u64>)>) -> AppResult<Option<String>> {
+    convert_with_font(ext, to, content, layout, clip, "")
+}
+
+pub fn convert_with_font(ext: &str, to: &str, content: &str, layout: DanmakuLayout, clip: Option<(u64, Option<u64>)>, font: &str) -> AppResult<Option<String>> {
     match (ext, to) {
         ("vtt", "srt") => Ok(Some(vtt_to_srt(content))),
         ("json", "srt") => bilibili_json_to_srt(content).map(Some),
-        ("xml", "ass") => danmaku_xml_to_ass(content, layout, clip).map(Some),
+        ("xml", "ass") => danmaku_xml_to_ass_font(content, layout, clip, font).map(Some),
         _ => Ok(None),
     }
 }
@@ -433,6 +465,23 @@ mod tests {
 00:00:03.010 --> 00:00:05.000 align:start position:0%\nhello world\nthis<00:00:03.500><c> is</c><00:00:04.000><c> next</c>\n\n\
 00:00:05.000 --> 00:00:05.010 align:start position:0%\nthis is next\n\n\
 00:00:05.010 --> 00:00:07.000 align:start position:0%\nthis is next\nand the end\n";
+
+    #[test]
+    fn danmaku_style_changes_font_speed_and_opacity() {
+        let xml = r#"<i><d p="0,1,25,16777215,0,0,0,0">hello</d></i>"#;
+        let style = crate::settings::DanmakuStyle { font_size: 60, opacity: 50, scroll_secs: 14, area: 50, font: "Noto Sans CJK SC".into() };
+        let ass = danmaku_xml_to_ass_font(xml, DanmakuLayout::default().styled(&style), None, &style.font).unwrap();
+        assert!(ass.contains("Style: Danmaku,Noto Sans CJK SC,60,&H80FFFFFF"), "{ass}");
+        let slow = ass.lines().find(|l| l.starts_with("Dialogue")).unwrap().to_string();
+        let fast = danmaku_xml_to_ass(xml, DanmakuLayout::default(), None).unwrap();
+        let fast = fast.lines().find(|l| l.starts_with("Dialogue")).unwrap().to_string();
+        // 滚动更慢，所以显示时间更长
+        let end = |l: &str| l.split(',').nth(2).unwrap().to_string();
+        assert_ne!(end(&slow), end(&fast));
+        let mut s = crate::settings::DanmakuStyle { font_size: 1, opacity: 0, scroll_secs: 0, area: 0, font: "a,b\n".into() };
+        s.normalize();
+        assert_eq!((s.font_size, s.opacity, s.scroll_secs, s.area, s.font.as_str()), (18, 20, 3, 10, "ab"));
+    }
 
     #[test]
     fn rolling_auto_captions_are_deduplicated() {
@@ -505,7 +554,7 @@ mod tests {
 
     #[test]
     fn scroll_lane_is_reused_after_it_clears() {
-        let layout = DanmakuLayout { width: 1920, height: 1080, area: 0.0 }; // 只有一行
+        let layout = DanmakuLayout { area: 0.0, ..DanmakuLayout::default() }; // 只有一行
         let xml = r#"<i><d p="0,1,25,16777215,1,0,a,1">短</d><d p="0.1,1,25,16777215,1,0,a,2">被丢弃</d><d p="9,1,25,16777215,1,0,a,3">后面的</d></i>"#;
         let ass = danmaku_xml_to_ass(xml, layout, None).unwrap();
         let n = ass.lines().filter(|l| l.starts_with("Dialogue")).count();

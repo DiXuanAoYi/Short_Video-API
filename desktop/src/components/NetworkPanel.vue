@@ -2,7 +2,7 @@
 import { computed, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api, errorText } from '../api'
-import type { NetworkSettings, Route, RouteTest } from '../types'
+import type { NetworkSettings, Route, RouteSpeed, RouteTest } from '../types'
 
 const net = defineModel<NetworkSettings>({ required: true })
 
@@ -95,6 +95,41 @@ function removeProxy(i: number) {
   net.value = { ...net.value, proxies }
 }
 
+const speedUrl = ref('')
+const speeding = ref(false)
+const speeds = ref<RouteSpeed[]>([])
+
+async function runSpeed() {
+  const url = speedUrl.value.trim()
+  if (!url) return ElMessage.warning('请填写要测速的地址（最好是一个视频文件，或这个网站上较大的资源）。')
+  speeding.value = true
+  speeds.value = []
+  try {
+    speeds.value = await api.routeSpeedtest(url)
+  } catch (e) {
+    ElMessage.error(errorText(e))
+  } finally {
+    speeding.value = false
+  }
+}
+
+const fastest = computed(() => [...speeds.value].filter((s) => s.ok).sort((a, b) => b.kbps - a.kbps)[0])
+
+/** 把测速最快的线路设成这个网站的出口规则。 */
+function useRoute(r: RouteSpeed) {
+  let host = ''
+  try {
+    host = new URL(speedUrl.value.trim()).hostname
+  } catch {
+    return
+  }
+  const pattern = host.split('.').slice(-2).join('.')
+  const rules = net.value.rules.filter((x) => x.pattern !== pattern)
+  rules.push({ pattern, route: r.route })
+  net.value = { ...net.value, rules }
+  ElMessage.success(`已把 ${pattern} 的出口设为“${r.name}”`)
+}
+
 async function runTest() {
   testing.value = true
   testResult.value = null
@@ -111,6 +146,21 @@ async function runTest() {
 
 <template>
   <div class="panel">
+    <section class="card block">
+      <h3>线路测速</h3>
+      <p class="mute small">对直连、系统代理和每个自定义代理，各下载这个地址开头的一小段（最多 1.5 MB / 6 秒），比较首字节耗时和速度。找出访问某个网站最快的出口后，可以一键设为这个网站的出口规则。</p>
+      <div class="row">
+        <el-input v-model="speedUrl" size="small" class="grow mono" placeholder="https://example.com/video.mp4" @keyup.enter="runSpeed" />
+        <el-button size="small" :loading="speeding" @click="runSpeed">开始测速</el-button>
+      </div>
+      <div v-for="r in speeds" :key="r.name" class="speedrow">
+        <span class="sname">{{ r.name }}<el-tag v-if="fastest && fastest.name === r.name" size="small" type="success" effect="plain">最快</el-tag></span>
+        <span v-if="r.ok" class="mono">{{ r.kbps >= 1024 ? (r.kbps / 1024).toFixed(1) + ' MB/s' : r.kbps + ' KB/s' }} · 首字节 {{ r.ttfbMs }} ms</span>
+        <span v-else class="bad">{{ r.error }}</span>
+        <el-button v-if="r.ok" size="small" link type="primary" @click="useRoute(r)">设为此网站的出口</el-button>
+      </div>
+    </section>
+
     <section class="card block">
       <h3>默认出口与测试</h3>
       <p class="mute small">国内平台（抖音、B站等）走海外代理时常被拦截，默认直连；YouTube、Pornhub、Pixiv 等默认走系统代理。没有匹配规则的网站使用默认出口。</p>
@@ -179,6 +229,19 @@ h3 {
   color: var(--cc-mute);
   font-weight: 500;
   letter-spacing: 0.08em;
+}
+.speedrow {
+  display: grid;
+  grid-template-columns: 150px 1fr auto;
+  gap: 10px;
+  align-items: center;
+  font-size: 12.5px;
+  padding: 3px 0;
+}
+.sname {
+  display: flex;
+  gap: 6px;
+  align-items: center;
 }
 .row {
   display: flex;

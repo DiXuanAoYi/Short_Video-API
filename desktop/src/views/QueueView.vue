@@ -7,6 +7,7 @@ import { api, errorText } from '../api'
 import { useAppStore, useQueueStore } from '../stores/app'
 import type { OrphanPart, TaskSnapshot } from '../types'
 import { formatBytes, formatDateTime, formatEta, formatSpeed } from '../utils/format'
+import TaskDrawer from '../components/TaskDrawer.vue'
 
 const queue = useQueueStore()
 const app = useAppStore()
@@ -14,6 +15,7 @@ const orphans = ref<OrphanPart[]>([])
 const orphanSize = computed(() => orphans.value.reduce((s, o) => s + o.size, 0))
 
 const afterAll = ref('none')
+const detailId = ref<number | null>(null)
 const scheduling = ref<TaskSnapshot | null>(null)
 const scheduleAt = ref<Date | null>(null)
 
@@ -176,6 +178,7 @@ async function run<A extends unknown[]>(fn: (...args: A) => Promise<unknown>, ..
           <el-button v-if="t.status === 'failed' || t.status === 'canceled'" link size="small" type="primary" @click="run(api.resumeTask, t.id)">重试</el-button>
           <el-button v-if="t.status === 'done'" link size="small" type="primary" @click="run(api.openFile, t.filePath)">打开</el-button>
           <el-button v-if="t.status === 'done'" link size="small" @click="run(api.revealFile, t.filePath)">文件夹</el-button>
+          <el-button link size="small" @click="detailId = t.id">详情</el-button>
           <el-button v-if="t.status === 'running' || t.status === 'paused' || t.status === 'queued'" link size="small" @click="run(api.cancelTask, t.id)">取消</el-button>
           <el-button v-else link size="small" @click="run(api.removeTask, t.id)">移除</el-button>
           <el-dropdown v-if="isWaiting(t)" trigger="click" @command="(c: string) => onMore(t, c)">
@@ -196,6 +199,8 @@ async function run<A extends unknown[]>(fn: (...args: A) => Promise<unknown>, ..
     </div>
       </template>
     </VirtualList>
+
+    <TaskDrawer v-model="detailId" />
 
     <el-dialog :model-value="!!scheduling" title="定时开始" width="380px" append-to-body @close="scheduling = null">
       <p class="mute small">到时间后自动开始下载“{{ scheduling?.title }}”。程序需要保持运行（可最小化到托盘）。</p>

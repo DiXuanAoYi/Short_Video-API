@@ -15,15 +15,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # macOS：一个同时包含 Apple 芯片和 Intel 的通用安装包
           - platform: macos-latest
-            args: --target aarch64-apple-darwin
-          - platform: macos-latest
-            args: --target x86_64-apple-darwin
+            args: --target universal-apple-darwin
           - platform: ubuntu-22.04
             args: ''
           - platform: windows-latest
             args: ''
+          # Windows ARM64：只有 NSIS 安装包（WiX 不支持 ARM64）。标为实验性：失败不影响其他平台发布
+          - platform: windows-latest
+            args: --target aarch64-pc-windows-msvc --bundles nsis
+            arch: arm64
+            target_dir: aarch64-pc-windows-msvc/release
+            experimental: true
     runs-on: ${{ matrix.platform }}
+    continue-on-error: ${{ matrix.experimental == true }}
     steps:
       - uses: actions/checkout@v4
 
@@ -108,8 +114,8 @@ jobs:
             | 系统 | 下载哪个文件 |
             | --- | --- |
             | Windows 10 / 11 | `ClearClip_<版本>_x64-setup.exe`（安装版，推荐）或 `.msi`；免安装选 `ClearClip-<版本>-portable-windows-x64.zip` |
-            | macOS（M 系列芯片） | `ClearClip_<版本>_aarch64.dmg` |
-            | macOS（Intel 芯片） | `ClearClip_<版本>_x64.dmg` |
+            | Windows 11 ARM（骁龙等 ARM 设备） | `ClearClip_<版本>_arm64-setup.exe`；免安装选 `ClearClip-<版本>-portable-windows-arm64.zip` |
+            | macOS（Apple 芯片和 Intel 通用） | `ClearClip_<版本>_universal.dmg` |
             | Linux | `.AppImage`（赋予执行权限后直接运行）或 `.deb` |
             | 浏览器扩展（Chrome / Edge / Firefox） | `ClearClip-extension-<版本>.zip`，解压后按 [扩展说明](https://github.com/DiXuanAoYi/Short_Video-API/tree/main/desktop/extension) 加载 |
 
@@ -117,6 +123,8 @@ jobs:
             - Windows：安装包未做代码签名，如出现“Windows 已保护你的电脑”，点“更多信息 → 仍要运行”。
             - macOS：安装包未经 Apple 公证。首次打开如果被拦截，到“系统设置 → 隐私与安全性”，在页面下方点“仍要打开”；如果提示“已损坏，无法打开”，在终端执行 `xattr -cr /Applications/ClearClip.app` 后再打开。
             - YouTube 等网站需要的 yt-dlp、ffmpeg 组件在“设置 → 组件”中一键安装，国内网络可填写 GitHub 镜像。
+
+            本版本的新增内容见 [更新记录](https://github.com/DiXuanAoYi/Short_Video-API/blob/main/desktop/CHANGELOG.md)。
 
             仅用于下载你有权保存的内容。
           releaseDraft: false
@@ -132,7 +140,10 @@ jobs:
           echo "app: $app"
           codesign -dv --verbose=2 "$app" 2>&1 | grep -E "Identifier|Signature|Authority|flags" || true
           codesign --verify --deep --strict --verbose=2 "$app"
-          lipo -archs "$app/Contents/MacOS/clearclip"
+          archs=$(lipo -archs "$app/Contents/MacOS/clearclip")
+          echo "archs: $archs"
+          # 通用二进制必须同时包含两种架构
+          echo "$archs" | grep -q arm64 && echo "$archs" | grep -q x86_64
 
       # Windows 便携版：免安装 zip，数据保存在程序目录的 data 文件夹（旁边放一个 portable 文件即启用）
       - name: Upload Windows portable zip
@@ -144,10 +155,14 @@ jobs:
           $version = (Get-Content desktop/src-tauri/tauri.conf.json | ConvertFrom-Json).version
           $dir = "ClearClip-$version-portable"
           New-Item -ItemType Directory -Force $dir | Out-Null
-          Copy-Item desktop/src-tauri/target/release/clearclip.exe $dir/
+          $targetDir = "${{ matrix.target_dir }}"
+          if (-not $targetDir) { $targetDir = "release" }
+          $arch = "${{ matrix.arch }}"
+          if (-not $arch) { $arch = "x64" }
+          Copy-Item "desktop/src-tauri/target/$targetDir/clearclip.exe" $dir/
           Set-Content -Path "$dir/portable" -Value "设置、数据和日志保存在本目录的 data 文件夹。删除此文件则改用系统应用数据目录。"
-          Compress-Archive -Path $dir -DestinationPath "$dir-windows-x64.zip" -Force
-          gh release upload "desktop-v$version" "$dir-windows-x64.zip" --clobber
+          Compress-Archive -Path $dir -DestinationPath "$dir-windows-$arch.zip" -Force
+          gh release upload "desktop-v$version" "$dir-windows-$arch.zip" --clobber
 
       # 浏览器扩展：打包为 zip，可直接上传到扩展商店，或解压后以开发者模式加载
       - name: Upload browser extension zip

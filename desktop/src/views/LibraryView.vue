@@ -2,12 +2,14 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { convertFileSrc } from '@tauri-apps/api/core'
-import { api, errorText } from '../api'
+import { api, errorText, events } from '../api'
 import VirtualList from '../components/VirtualList.vue'
 import InboxPanel from '../components/InboxPanel.vue'
+import ItemDrawer from '../components/library/ItemDrawer.vue'
+import LibraryTools, { type ToolTab } from '../components/library/LibraryTools.vue'
 import { useAppStore, useParseStore, useQueueStore } from '../stores/app'
-import type { HistoryItem, LibraryItem, PlatformCount } from '../types'
-import { formatBytes, formatDateTime } from '../utils/format'
+import type { HistoryItem, LibraryFilter, LibraryItem, PlatformCount, TagCount } from '../types'
+import { formatBytes, formatDateTime, formatDuration } from '../utils/format'
 
 const app = useAppStore()
 const parse = useParseStore()
@@ -23,8 +25,133 @@ const fPlatform = ref('')
 const fKind = ref('')
 const fSince = ref('')
 const fMissing = ref(false)
+const fTag = ref('')
+const fFavorite = ref(false)
+const fRating = ref(0)
+const fSort = ref<NonNullable<LibraryFilter['sort']>>('finished')
+const tags = ref<TagCount[]>([])
 const mode = ref<'list' | 'grid'>('list')
 const COLS = 5
+
+// 多选
+const selecting = ref(false)
+const selected = ref<Set<number>>(new Set())
+// 详情抽屉与工具
+const detailId = ref<number | null>(null)
+const detailOpen = ref(false)
+const detail = computed(() => files.value.find((f) => f.id === detailId.value) ?? null)
+const toolsOpen = ref(false)
+const toolTab = ref<ToolTab>('stats')
+
+function openTools(tab: ToolTab) {
+  toolTab.value = tab
+  toolsOpen.value = true
+}
+
+function openDetail(f: LibraryItem) {
+  detailId.value = f.id
+  detailOpen.value = true
+}
+
+function toggleSelect(id: number) {
+  const next = new Set(selected.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  selected.value = next
+}
+
+function selectAll() {
+  selected.value = new Set(files.value.map((f) => f.id))
+}
+
+function stopSelecting() {
+  selecting.value = false
+  selected.value = new Set()
+}
+
+const selectedIds = computed(() => [...selected.value])
+
+async function askTags(title: string): Promise<string[] | null> {
+  try {
+    const { value } = await ElMessageBox.prompt('多个标签用逗号分隔', title, { confirmButtonText: '确定', cancelButtonText: '取消', inputPattern: /\S/, inputErrorMessage: '请输入标签' })
+    return String(value).split(/[,，、]/).map((t) => t.trim()).filter(Boolean)
+  } catch {
+    return null
+  }
+}
+
+async function bulkTag(remove: boolean) {
+  const list = await askTags(remove ? '去掉标签' : '添加标签')
+  if (!list?.length) return
+  await run(api.libraryBulkTags, selectedIds.value, list, remove)
+  await load()
+}
+
+async function bulkFavorite(on: boolean) {
+  await run(api.libraryBulkFavorite, selectedIds.value, on)
+  await load()
+}
+
+async function bulkDelete() {
+  const trash = app.settings?.library.useTrash ?? true
+  try {
+    await ElMessageBox.confirm(`${selected.value.size} 项：${trash ? '文件会移到回收站，可以还原。' : '文件会被永久删除。'}只想去掉记录而保留文件请选“只删除记录”。`, '删除所选', {
+      confirmButtonText: trash ? '移到回收站' : '删除记录和文件',
+      cancelButtonText: '只删除记录',
+      distinguishCancelAndClose: true,
+      type: 'warning',
+    })
+    await removeMany(true)
+  } catch (action) {
+    if (action === 'cancel') await removeMany(false)
+  }
+}
+
+async function bulkSafebox() {
+  const st = await api.safeboxStatus().catch(() => null)
+  if (!st?.unlocked) {
+    ElMessage.info(st?.exists ? '请先到“保险箱”页面输入密码解锁。' : '还没有创建保险箱，请先到“保险箱”页面创建。')
+    app.view = 'safebox'
+    return
+  }
+  try {
+    await ElMessageBox.confirm(`把所选 ${selected.value.size} 项加密放进保险箱？加密完成后，它们会从媒体库里消失，原文件和封面缓存会被覆盖删除。`, '移入保险箱', {
+      confirmButtonText: '移入',
+      cancelButtonText: '取消',
+      type: 'warning',
+    })
+  } catch {
+    return
+  }
+  try {
+    await api.safeboxAddLibrary(selectedIds.value)
+    ElMessage.success('已开始加密，进度在“保险箱”页面查看')
+    stopSelecting()
+  } catch (e) {
+    ElMessage.error(errorText(e))
+  }
+}
+
+async function removeMany(deleteFiles: boolean) {
+  try {
+    const r = await api.libraryDelete(selectedIds.value, deleteFiles)
+    if (r.failed.length) ElMessage.warning(`${r.failed.length} 项失败：${r.failed[0]}`)
+    else ElMessage.success(r.trashed ? `已把 ${r.trashed} 个文件移到回收站` : `已删除 ${r.removed} 项`)
+  } catch (e) {
+    ElMessage.error(errorText(e))
+  }
+  stopSelecting()
+  await load()
+}
+
+function setFavorite(f: LibraryItem) {
+  const next = !f.favorite
+  f.favorite = next
+  api.librarySetMeta(f.id, { favorite: next }).catch((e) => {
+    f.favorite = !next
+    ElMessage.error(errorText(e))
+  })
+}
 
 const gridRows = computed(() => {
   const rows: { key: number; items: LibraryItem[] }[] = []
@@ -75,8 +202,19 @@ async function load() {
   try {
     if (tab.value === 'inbox') return
     if (tab.value === 'files') {
-      files.value = await api.listLibrary({ query: query.value, platform: fPlatform.value || null, kind: fKind.value || null, since: sinceValue(), missingOnly: fMissing.value })
-      platforms.value = await api.libraryPlatforms()
+      files.value = await api.listLibrary({
+        query: query.value,
+        platform: fPlatform.value || null,
+        kind: fKind.value || null,
+        since: sinceValue(),
+        missingOnly: fMissing.value,
+        tag: fTag.value || null,
+        favoriteOnly: fFavorite.value,
+        minRating: fRating.value,
+        sort: fSort.value,
+      })
+      ;[platforms.value, tags.value] = await Promise.all([api.libraryPlatforms(), api.libraryTags()])
+      if (fTag.value && !tags.value.some((t) => t.name.toLowerCase() === fTag.value.toLowerCase())) fTag.value = ''
     }
     else history.value = await api.listHistory(query.value)
   } catch (e) {
@@ -91,13 +229,25 @@ watch(query, () => {
   window.clearTimeout(timer)
   timer = window.setTimeout(load, 250)
 })
-watch([tab, fPlatform, fKind, fSince, fMissing], load)
+watch([tab, fPlatform, fKind, fSince, fMissing, fTag, fFavorite, fRating, fSort], load)
 // 有任务完成时刷新媒体库
 watch(
   () => queue.counts.done,
   () => tab.value === 'files' && load(),
 )
-onMounted(load)
+function consumeQuery() {
+  if (app.libraryQuery !== null) {
+    query.value = app.libraryQuery
+    app.libraryQuery = null
+  }
+}
+watch(() => app.libraryQuery, consumeQuery)
+
+onMounted(async () => {
+  consumeQuery()
+  await load()
+  await events.onLibraryChanged(() => tab.value === 'files' && load())
+})
 
 async function run<A extends unknown[]>(fn: (...args: A) => Promise<unknown>, ...args: A) {
   try {
@@ -109,8 +259,9 @@ async function run<A extends unknown[]>(fn: (...args: A) => Promise<unknown>, ..
 
 async function removeFile(item: LibraryItem) {
   try {
-    await ElMessageBox.confirm(`删除“${item.title}”的记录。是否同时删除磁盘上的文件？`, '删除记录', {
-      confirmButtonText: '删除记录和文件',
+    const trash = app.settings?.library.useTrash ?? true
+    await ElMessageBox.confirm(`删除“${item.title}”的记录。是否同时处理磁盘上的文件？${trash ? '（文件会先移到回收站，可以还原）' : ''}`, '删除记录', {
+      confirmButtonText: trash ? '移到回收站' : '删除记录和文件',
       cancelButtonText: '只删除记录',
       distinguishCancelAndClose: true,
       type: 'warning',
@@ -157,6 +308,20 @@ async function clearHistory() {
       </el-radio-group>
       <el-input v-model="query" size="small" clearable :placeholder="tab === 'inbox' ? '搜索链接、标题或设备' : '搜索标题或作者'" class="search" />
       <el-button v-if="tab === 'files' && app.settings" size="small" @click="run(api.revealFile, app.settings!.downloadDir)">打开下载目录</el-button>
+      <el-button v-if="tab === 'files'" size="small" :type="selecting ? 'primary' : 'default'" @click="selecting ? stopSelecting() : (selecting = true)">{{ selecting ? '退出多选' : '多选' }}</el-button>
+      <el-dropdown v-if="tab === 'files'" trigger="click" @command="(c: ToolTab) => openTools(c)">
+        <el-button size="small">工具 ▾</el-button>
+        <template #dropdown>
+          <el-dropdown-menu>
+            <el-dropdown-item command="stats">统计与清理</el-dropdown-item>
+            <el-dropdown-item command="dupes">重复文件</el-dropdown-item>
+            <el-dropdown-item command="cues">字幕搜索</el-dropdown-item>
+            <el-dropdown-item command="reorg">整理文件夹</el-dropdown-item>
+            <el-dropdown-item command="trash">回收站</el-dropdown-item>
+            <el-dropdown-item command="backup">导入与备份</el-dropdown-item>
+          </el-dropdown-menu>
+        </template>
+      </el-dropdown>
       <el-radio-group v-if="tab === 'files'" v-model="mode" size="small">
         <el-radio-button value="list">列表</el-radio-button>
         <el-radio-button value="grid">网格</el-radio-button>
@@ -180,8 +345,35 @@ async function clearHistory() {
         <el-option value="7d" label="最近 7 天" />
         <el-option value="30d" label="最近 30 天" />
       </el-select>
+      <el-select v-if="tags.length" v-model="fTag" size="small" clearable placeholder="全部标签" class="fsel">
+        <el-option v-for="t in tags" :key="t.name" :value="t.name" :label="`${t.name}（${t.count}）`" />
+      </el-select>
+      <el-select v-model="fRating" size="small" class="fsel narrow">
+        <el-option :value="0" label="不限评分" />
+        <el-option v-for="n in 5" :key="n" :value="n" :label="`${n} 星以上`" />
+      </el-select>
+      <el-select v-model="fSort" size="small" class="fsel narrow">
+        <el-option value="finished" label="最近下载" />
+        <el-option value="size" label="文件大小" />
+        <el-option value="title" label="标题" />
+        <el-option value="rating" label="评分" />
+      </el-select>
+      <el-checkbox v-model="fFavorite" size="small">只看收藏</el-checkbox>
       <el-checkbox v-model="fMissing" size="small">只看文件已丢失的</el-checkbox>
       <span class="mute count">{{ files.length }} 项</span>
+    </div>
+
+    <div v-if="tab === 'files' && selecting" class="bulk card">
+      <span>已选 <b>{{ selected.size }}</b> 项</span>
+      <el-button link size="small" type="primary" @click="selectAll">全选当前列表</el-button>
+      <el-button link size="small" @click="selected = new Set()">清除选择</el-button>
+      <span class="sp" />
+      <el-button size="small" :disabled="!selected.size" @click="bulkTag(false)">加标签</el-button>
+      <el-button size="small" :disabled="!selected.size" @click="bulkTag(true)">去标签</el-button>
+      <el-button size="small" :disabled="!selected.size" @click="bulkFavorite(true)">收藏</el-button>
+      <el-button size="small" :disabled="!selected.size" @click="bulkFavorite(false)">取消收藏</el-button>
+      <el-button size="small" :disabled="!selected.size" @click="bulkSafebox">移入保险箱</el-button>
+      <el-button size="small" type="danger" plain :disabled="!selected.size" @click="bulkDelete">删除</el-button>
     </div>
 
     <InboxPanel v-if="tab === 'inbox'" :query="query" />
@@ -191,29 +383,53 @@ async function clearHistory() {
         <VirtualList v-else-if="mode === 'grid'" :items="gridRows" :item-height="190" :gap="10" :item-key="(r) => r.key" class="vl">
           <template #default="{ item: r }">
             <div class="grid-row">
-              <div v-for="f in r.items" :key="f.id" class="tile card" :class="{ missing: !f.exists }" :title="f.title" @dblclick="f.exists && run(api.openFile, f.path)">
-                <img v-if="coverOf(f)" :src="coverOf(f)!" referrerpolicy="no-referrer" loading="lazy" alt="" />
-                <div v-else class="noimg" />
+              <div
+                v-for="f in r.items"
+                :key="f.id"
+                class="tile card"
+                :class="{ missing: !f.exists, picked: selected.has(f.id) }"
+                :title="f.title"
+                @click="selecting ? toggleSelect(f.id) : openDetail(f)"
+                @dblclick="!selecting && f.exists && ((f.kind === 'video' || f.kind === 'audio') ? app.openPlayer(f.path) : run(api.openFile, f.path))"
+              >
+                <div class="imgbox">
+                  <img v-if="coverOf(f)" :src="coverOf(f)!" referrerpolicy="no-referrer" loading="lazy" alt="" />
+                  <div v-else class="noimg" />
+                  <span v-if="f.favorite" class="fav">★</span>
+                  <el-checkbox v-if="selecting" class="pick" :model-value="selected.has(f.id)" @click.stop @change="toggleSelect(f.id)" />
+                  <span v-if="f.durationMs" class="dur mono">{{ formatDuration(f.durationMs) }}</span>
+                </div>
                 <div class="tname ellipsis">{{ f.title }}</div>
                 <small class="mute ellipsis">{{ platformName[f.platform] ?? f.platformName ?? f.platform }}<template v-if="!f.exists"> · 已丢失</template></small>
               </div>
             </div>
           </template>
         </VirtualList>
-        <VirtualList v-else :items="files" :item-height="58" :gap="8" :item-key="(f) => f.id" class="vl">
+        <VirtualList v-else :items="files" :item-height="selecting || files.some((f) => f.tags.length) ? 74 : 58" :gap="8" :item-key="(f) => f.id" class="vl">
           <template #default="{ item: f }">
-        <div class="item card" :class="{ missing: !f.exists }">
+        <div class="item card" :class="{ missing: !f.exists, picked: selected.has(f.id), selecting }">
+          <el-checkbox v-if="selecting" :model-value="selected.has(f.id)" @change="toggleSelect(f.id)" />
           <img v-if="coverOf(f)" :src="coverOf(f)!" class="thumb" referrerpolicy="no-referrer" loading="lazy" alt="" />
           <div v-else class="thumb" />
           <div class="info">
-            <div class="ellipsis" :title="f.title">{{ f.title }}</div>
+            <div class="titleline">
+              <button type="button" class="star" :class="{ on: f.favorite }" :aria-label="f.favorite ? '取消收藏' : '收藏'" @click="setFavorite(f)">{{ f.favorite ? '★' : '☆' }}</button>
+              <span class="ellipsis ttl" :title="f.title" @click="selecting ? toggleSelect(f.id) : openDetail(f)">{{ f.title }}</span>
+              <span v-if="f.rating" class="rate" :aria-label="`${f.rating} 星`">{{ '★'.repeat(f.rating) }}</span>
+            </div>
             <small class="mono mute ellipsis selectable" :title="f.path">
-              {{ platformName[f.platform] ?? (f.platformName || f.platform) }} · {{ assetName(f) }} · {{ formatBytes(f.size) }} · {{ formatDateTime(f.finishedAt) }}
+              {{ platformName[f.platform] ?? (f.platformName || f.platform) }} · {{ assetName(f) }} · {{ formatBytes(f.size) }}<template v-if="f.durationMs"> · {{ formatDuration(f.durationMs) }}</template> · {{ formatDateTime(f.finishedAt) }}
               <template v-if="!f.exists"> · 文件已不存在</template>
             </small>
+            <div v-if="f.tags.length" class="tagline">
+              <button v-for="t in f.tags.slice(0, 5)" :key="t" type="button" class="tg" @click="fTag = t">{{ t }}</button>
+              <span v-if="f.tags.length > 5" class="mute">+{{ f.tags.length - 5 }}</span>
+            </div>
           </div>
           <div class="actions">
-            <el-button link size="small" type="primary" :disabled="!f.exists" @click="run(api.openFile, f.path)">打开</el-button>
+            <el-button link size="small" @click="openDetail(f)">详情</el-button>
+            <el-button v-if="f.kind === 'video' || f.kind === 'audio'" link size="small" type="primary" :disabled="!f.exists" @click="app.openPlayer(f.path)">播放</el-button>
+            <el-button link size="small" :type="f.kind === 'video' || f.kind === 'audio' ? undefined : 'primary'" :disabled="!f.exists" @click="run(api.openFile, f.path)">打开</el-button>
             <el-button link size="small" :disabled="!f.exists" @click="run(api.revealFile, f.path)">文件夹</el-button>
             <el-button v-if="!f.exists && f.sourceUrl" link size="small" type="primary" @click="redownload(f)">重新下载</el-button>
             <el-button link size="small" @click="removeFile(f)">删除</el-button>
@@ -242,6 +458,8 @@ async function clearHistory() {
         </div>
       </template>
     </div>
+    <ItemDrawer v-model="detailOpen" :item="detail" :tags="tags" @changed="load" />
+    <LibraryTools v-model="toolsOpen" v-model:tab="toolTab" @changed="load" />
   </div>
 </template>
 
@@ -264,9 +482,29 @@ async function clearHistory() {
 .fsel {
   width: 150px;
 }
+.fsel.narrow {
+  width: 110px;
+}
 .count {
   font-size: 12px;
   margin-left: auto;
+}
+.bulk {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  font-size: 12px;
+}
+.bulk .sp {
+  flex: 1;
+}
+.bulk :deep(.el-button) {
+  margin-left: 0;
+}
+.picked {
+  border-color: var(--cc-acc);
+  background: var(--cc-acc-soft);
 }
 .vl {
   flex: 1;
@@ -287,6 +525,9 @@ async function clearHistory() {
   min-width: 0;
   cursor: default;
 }
+.tile .imgbox {
+  position: relative;
+}
 .tile img,
 .tile .noimg {
   width: 100%;
@@ -294,6 +535,29 @@ async function clearHistory() {
   object-fit: cover;
   border-radius: 5px;
   background: var(--cc-line);
+  display: block;
+}
+.tile .fav {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  color: #f5b73b;
+  text-shadow: 0 0 3px #000a;
+}
+.tile .pick {
+  position: absolute;
+  top: 2px;
+  left: 4px;
+}
+.tile .dur {
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  font-size: 10px;
+  background: #000a;
+  color: #fff;
+  padding: 0 4px;
+  border-radius: 3px;
 }
 .tile .tname {
   font-size: 12px;
@@ -336,9 +600,61 @@ async function clearHistory() {
   align-items: center;
   padding: 8px 12px;
 }
+.item.selecting {
+  grid-template-columns: 24px 32px 1fr auto;
+}
 .item .thumb {
   width: 32px;
   height: 42px;
+}
+.titleline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.ttl {
+  cursor: pointer;
+}
+.ttl:hover {
+  color: var(--cc-acc);
+}
+.star {
+  all: unset;
+  cursor: pointer;
+  color: var(--cc-mute);
+  font-size: 14px;
+  line-height: 1;
+}
+.star.on {
+  color: #e6a23c;
+}
+.star:focus-visible {
+  outline: 2px solid var(--cc-acc);
+  border-radius: 3px;
+}
+.rate {
+  color: #e6a23c;
+  font-size: 10px;
+  letter-spacing: -1px;
+  flex: none;
+}
+.tagline {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  font-size: 10.5px;
+  margin-top: 1px;
+}
+.tg {
+  all: unset;
+  cursor: pointer;
+  font-size: 10.5px;
+  padding: 0 6px;
+  line-height: 16px;
+  border-radius: 999px;
+  background: var(--cc-acc-soft);
+  color: var(--cc-acc);
 }
 .item.missing {
   opacity: 0.6;

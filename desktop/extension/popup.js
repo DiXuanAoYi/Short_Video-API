@@ -47,6 +47,47 @@ async function renderSync() {
   }
 }
 
+function sizeText(n) {
+  if (!n) return ''
+  return n >= 1048576 ? ` · ${(n / 1048576).toFixed(1)} MB` : ` · ${Math.round(n / 1024)} KB`
+}
+
+async function renderSniffed() {
+  const tab = await currentTab()
+  const list = tab?.id != null ? await getSniffed(tab.id) : []
+  $('sniffBox').classList.toggle('hidden', !list.length)
+  $('sniffCount').textContent = list.length
+  $('sniffList').innerHTML = ''
+  for (const item of list) {
+    const row = document.createElement('div')
+    row.className = 'it'
+    const name = document.createElement('span')
+    let path = item.url
+    try {
+      path = new URL(item.url).pathname.split('/').filter(Boolean).pop() || new URL(item.url).hostname
+    } catch {
+      // keep the raw url
+    }
+    name.textContent = `${KIND_NAME[item.kind] || item.kind}${sizeText(item.size)} · ${path}`
+    name.title = item.url
+    const btn = document.createElement('button')
+    btn.textContent = '发送'
+    btn.onclick = async () => {
+      btn.disabled = true
+      try {
+        const r = await call('/api/send', { text: sniffedPayload(item, tab.url, tab.title), device: (await getConfig()).device, name: browserName() })
+        msg(r.state === 'pending_pair' ? '第一次使用：请在电脑上点“允许”完成配对' : '已发送，清影会开始下载', 'ok')
+      } catch (e) {
+        msg(e.message, 'err')
+      } finally {
+        btn.disabled = false
+      }
+    }
+    row.append(name, btn)
+    $('sniffList').append(row)
+  }
+}
+
 async function init() {
   const c = await getConfig()
   $('port').value = c.port || ''
@@ -55,6 +96,7 @@ async function init() {
   $('page').textContent = tab?.title || tab?.url || ''
   show(location.hash === '#settings' || !c.port || !c.token)
   renderSync()
+  renderSniffed()
   refreshConn()
 }
 

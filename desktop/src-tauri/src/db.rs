@@ -47,6 +47,12 @@ pub struct LibraryItem {
     pub platform_name: String,
     /// 本地缓存的封面
     pub cover_path: Option<String>,
+    pub favorite: bool,
+    /// 评分 0–5，0 表示未评分
+    pub rating: i64,
+    pub note: String,
+    pub tags: Vec<String>,
+    pub duration_ms: Option<i64>,
 }
 
 /// 媒体库筛选条件。
@@ -61,6 +67,11 @@ pub struct LibraryFilter {
     pub since: Option<i64>,
     /// 只看文件已丢失的
     pub missing_only: bool,
+    pub tag: Option<String>,
+    pub favorite_only: bool,
+    pub min_rating: i64,
+    /// finished（默认）/ size / title / rating
+    pub sort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -69,6 +80,16 @@ pub struct PlatformCount {
     pub platform: String,
     pub name: String,
     pub count: i64,
+}
+
+/// 一键清除要清哪些记录。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DbWipe {
+    pub tasks: bool,
+    pub history: bool,
+    pub library: bool,
+    pub inbox: bool,
+    pub subscriptions: bool,
 }
 
 pub struct NewDownload<'a> {
@@ -151,6 +172,12 @@ impl Db {
             ("source_url", "TEXT NOT NULL DEFAULT ''"),
             ("platform_name", "TEXT NOT NULL DEFAULT ''"),
             ("cover_path", "TEXT"),
+            ("favorite", "INTEGER NOT NULL DEFAULT 0"),
+            ("rating", "INTEGER NOT NULL DEFAULT 0"),
+            ("note", "TEXT NOT NULL DEFAULT ''"),
+            ("duration_ms", "INTEGER"),
+            ("phash", "TEXT"),
+            ("quick_hash", "TEXT"),
         ] {
             if !cols.iter().any(|c| c == name) {
                 conn.execute_batch(&format!("ALTER TABLE downloads ADD COLUMN {name} {def}"))?;
@@ -159,6 +186,7 @@ impl Db {
         conn.execute_batch(crate::subs::SCHEMA)?;
         conn.execute_batch(crate::live::SCHEMA)?;
         conn.execute_batch(crate::inbox::SCHEMA)?;
+        conn.execute_batch(crate::library::SCHEMA)?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_downloads_platform ON downloads(platform);
              CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);",
@@ -243,6 +271,66 @@ impl Db {
         Ok(())
     }
 
+    /// 这个路径是不是媒体库里的文件。
+    pub fn path_known(&self, path: &str) -> bool {
+        self.conn().query_row("SELECT 1 FROM downloads WHERE path = ?1 LIMIT 1", params![path], |_| Ok(())).optional().ok().flatten().is_some()
+    }
+
+    /// 一键清除：按选项删除各类记录，并把数据库文件压缩（旧内容不再留在文件里）。
+    /// 返回被跳过的项目说明。回收站记录不动，免得里面的文件变成找不回来的孤儿。
+    pub fn wipe(&self, w: &DbWipe) -> AppResult<Vec<String>> {
+        let mut skipped = vec![];
+        {
+            let conn = self.conn();
+            if w.tasks {
+                conn.execute("DELETE FROM jobs", [])?;
+            }
+            if w.history {
+                conn.execute("DELETE FROM history", [])?;
+            }
+            if w.library {
+                for t in ["downloads", "item_tags", "tags", "cues"] {
+                    conn.execute(&format!("DELETE FROM {t}"), [])?;
+                }
+            }
+            if w.inbox {
+                conn.execute("DELETE FROM inbox", [])?;
+            }
+            if w.subscriptions {
+                conn.execute("DELETE FROM subscription_items", [])?;
+                conn.execute("DELETE FROM subscriptions", [])?;
+                conn.execute("DELETE FROM live_recordings WHERE status <> 'recording'", [])?;
+                let active: i64 = conn.query_row("SELECT COUNT(*) FROM live_recordings WHERE status = 'recording'", [], |r| r.get(0))?;
+                if active > 0 {
+                    skipped.push("有正在录制的直播，直播间列表已保留".to_string());
+                } else {
+                    conn.execute("DELETE FROM live_rooms", [])?;
+                }
+            }
+        }
+        self.checkpoint()?;
+        Ok(skipped)
+    }
+
+    /// 隐私模式退出时清理：解析历史、收件箱、已结束的任务记录。
+    pub fn purge_private(&self) -> AppResult<()> {
+        {
+            let conn = self.conn();
+            conn.execute("DELETE FROM history", [])?;
+            conn.execute("DELETE FROM inbox", [])?;
+            conn.execute("DELETE FROM jobs WHERE status IN ('done', 'failed', 'canceled')", [])?;
+        }
+        self.checkpoint()
+    }
+
+    /// 合并 WAL 并压缩数据库文件。
+    pub fn checkpoint(&self) -> AppResult<()> {
+        let conn = self.conn();
+        let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        conn.execute_batch("VACUUM")?;
+        Ok(())
+    }
+
     pub fn record_download(&self, d: &NewDownload<'_>) -> AppResult<()> {
         self.conn().execute(
             "INSERT INTO downloads (platform, media_id, asset_id, title, author, cover, path, size, finished_at, kind, source, source_url, platform_name)
@@ -280,26 +368,48 @@ impl Db {
     }
 
     pub fn search_library(&self, f: &LibraryFilter, limit: i64) -> AppResult<Vec<LibraryItem>> {
-        let mut sql = format!("SELECT {LIB_COLS} FROM downloads WHERE (title LIKE ?1 OR author LIKE ?1)");
+        let mut sql = format!(
+            "SELECT {LIB_COLS} FROM downloads WHERE (title LIKE ?1 OR author LIKE ?1 OR note LIKE ?1 \
+             OR EXISTS (SELECT 1 FROM item_tags it JOIN tags t ON t.id = it.tag_id WHERE it.item_id = downloads.id AND t.name LIKE ?1))"
+        );
         let mut args: Vec<rusqlite::types::Value> = vec![format!("%{}%", f.query.trim()).into()];
-        let mut push = |cond: &str, v: rusqlite::types::Value, sql: &mut String| {
+        fn push(args: &mut Vec<rusqlite::types::Value>, sql: &mut String, cond: &str, v: rusqlite::types::Value) {
             args.push(v);
             sql.push_str(&format!(" AND {cond}?{}", args.len()));
-        };
+        }
         if let Some(p) = f.platform.as_ref().filter(|p| !p.is_empty()) {
-            push("platform=", p.clone().into(), &mut sql);
+            push(&mut args, &mut sql, "platform=", p.clone().into());
         }
         if let Some(k) = f.kind.as_ref().filter(|k| !k.is_empty()) {
-            push("kind=", k.clone().into(), &mut sql);
+            push(&mut args, &mut sql, "kind=", k.clone().into());
         }
         if let Some(s) = f.source.as_ref().filter(|s| !s.is_empty()) {
-            push("source=", s.clone().into(), &mut sql);
+            push(&mut args, &mut sql, "source=", s.clone().into());
         }
         if let Some(t) = f.since {
-            push("finished_at>=", t.into(), &mut sql);
+            push(&mut args, &mut sql, "finished_at>=", t.into());
         }
+        if let Some(tag) = f.tag.as_ref().filter(|t| !t.is_empty()) {
+            args.push(tag.clone().into());
+            sql.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM item_tags it JOIN tags t ON t.id = it.tag_id WHERE it.item_id = downloads.id AND t.name = ?{} COLLATE NOCASE)",
+                args.len()
+            ));
+        }
+        if f.favorite_only {
+            sql.push_str(" AND favorite = 1");
+        }
+        if f.min_rating > 0 {
+            push(&mut args, &mut sql, "rating>=", f.min_rating.into());
+        }
+        let order = match f.sort.as_deref() {
+            Some("size") => "size DESC, id DESC",
+            Some("title") => "title COLLATE NOCASE ASC, id DESC",
+            Some("rating") => "rating DESC, finished_at DESC, id DESC",
+            _ => "finished_at DESC, id DESC",
+        };
         args.push(if f.missing_only { 20_000i64 } else { limit }.into());
-        sql.push_str(&format!(" ORDER BY finished_at DESC, id DESC LIMIT ?{}", args.len()));
+        sql.push_str(&format!(" ORDER BY {order} LIMIT ?{}", args.len()));
         let conn = self.conn();
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), lib_row)?;
@@ -351,11 +461,14 @@ impl Db {
         let conn = self.conn();
         let path: Option<String> = conn.query_row("SELECT path FROM downloads WHERE id=?1", params![id], |r| r.get(0)).optional()?;
         conn.execute("DELETE FROM downloads WHERE id=?1", params![id])?;
+        conn.execute("DELETE FROM item_tags WHERE item_id=?1", params![id])?;
+        conn.execute("DELETE FROM cues WHERE sub_item=?1", params![id])?;
         Ok(path)
     }
 }
 
-const LIB_COLS: &str = "id, platform, media_id, asset_id, title, author, cover, path, size, finished_at, kind, source, source_url, platform_name, cover_path";
+const LIB_COLS: &str = "id, platform, media_id, asset_id, title, author, cover, path, size, finished_at, kind, source, source_url, platform_name, cover_path, favorite, rating, note, duration_ms, \
+    (SELECT GROUP_CONCAT(t.name, char(31)) FROM item_tags it JOIN tags t ON t.id = it.tag_id WHERE it.item_id = downloads.id)";
 
 fn lib_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryItem> {
     let path: String = r.get(7)?;
@@ -376,6 +489,11 @@ fn lib_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryItem> {
         source_url: r.get(12)?,
         platform_name: r.get(13)?,
         cover_path: r.get::<_, Option<String>>(14)?.filter(|p| Path::new(p).exists()),
+        favorite: r.get::<_, i64>(15)? != 0,
+        rating: r.get(16)?,
+        note: r.get(17)?,
+        duration_ms: r.get(18)?,
+        tags: r.get::<_, Option<String>>(19)?.map(|t| t.split('\u{1f}').map(String::from).collect()).unwrap_or_default(),
     })
 }
 
@@ -614,5 +732,67 @@ mod tests {
         assert_eq!(db.list_library("", 10).unwrap().len(), 1);
         assert!(!db.list_library("", 10).unwrap()[0].exists);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn seed_everything(db: &Db) {
+        db.upsert_history(&sample("1", "私密作品")).unwrap();
+        db.record_download(&NewDownload {
+            platform: "douyin",
+            media_id: "1",
+            asset_id: "a",
+            title: "私密作品",
+            author: "",
+            cover: None,
+            path: "/x.mp4",
+            size: 1,
+            kind: "video",
+            source: "manual",
+            source_url: "https://v.douyin.com/abc",
+            platform_name: "抖音",
+        })
+        .unwrap();
+        db.inbox_add("phone", "d1", "手机", "https://v.douyin.com/abc", "done").unwrap();
+        for status in ["done", "failed", "canceled", "paused", "running"] {
+            db.insert_job(&JobRow {
+                id: 0,
+                media_json: "{}".into(),
+                asset_json: "{}".into(),
+                file_path: "/x.mp4".into(),
+                status: status.into(),
+                received: 0,
+                total: None,
+                error: None,
+                meta_json: "{}".into(),
+                created_at: 1,
+                finished_at: None,
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn purge_private_clears_history_inbox_and_finished_jobs_only() {
+        let db = Db::open_in_memory().unwrap();
+        seed_everything(&db);
+        db.purge_private().unwrap();
+        assert!(db.list_history("", 10).unwrap().is_empty());
+        assert!(db.inbox_list(&crate::inbox::InboxFilter::default()).unwrap().is_empty());
+        let left: Vec<String> = db.load_jobs().unwrap().into_iter().map(|j| j.status).collect();
+        assert_eq!(left, vec!["paused", "running"], "unfinished tasks are kept so they can resume");
+        assert_eq!(db.list_library("", 10).unwrap().len(), 1, "the library is not touched");
+    }
+
+    #[test]
+    fn wipe_only_removes_what_was_selected() {
+        let db = Db::open_in_memory().unwrap();
+        seed_everything(&db);
+        db.wipe(&DbWipe { history: true, ..Default::default() }).unwrap();
+        assert!(db.list_history("", 10).unwrap().is_empty());
+        assert_eq!(db.list_library("", 10).unwrap().len(), 1);
+        assert_eq!(db.load_jobs().unwrap().len(), 5);
+        db.wipe(&DbWipe { library: true, tasks: true, inbox: true, subscriptions: true, ..Default::default() }).unwrap();
+        assert!(db.list_library("", 10).unwrap().is_empty());
+        assert!(db.load_jobs().unwrap().is_empty());
+        assert!(db.inbox_list(&crate::inbox::InboxFilter::default()).unwrap().is_empty());
     }
 }

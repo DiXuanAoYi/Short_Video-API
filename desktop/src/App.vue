@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { api, errorText, events } from './api'
@@ -7,14 +7,25 @@ import { useAppStore, useParseStore, useQueueStore, type ViewName } from './stor
 import ParseView from './views/ParseView.vue'
 import QueueView from './views/QueueView.vue'
 import LibraryView from './views/LibraryView.vue'
+import ToolboxView from './views/ToolboxView.vue'
 import SubsView from './views/SubsView.vue'
 import LiveView from './views/LiveView.vue'
+import SafeboxView from './views/SafeboxView.vue'
 import SettingsView from './views/SettingsView.vue'
+import LockScreen from './components/LockScreen.vue'
 import DisclaimerDialog from './components/DisclaimerDialog.vue'
+import OnboardingDialog from './components/OnboardingDialog.vue'
+import CommandPalette from './components/CommandPalette.vue'
+import PlayerDialog from './components/PlayerDialog.vue'
+import elEn from 'element-plus/es/locale/lang/en'
+import elZh from 'element-plus/es/locale/lang/zh-cn'
+import { useLanguage } from './i18n/useLanguage'
 import type { PairRequest } from './types'
 
 const app = useAppStore()
 const queue = useQueueStore()
+useLanguage()
+const elLocale = computed(() => (app.settings?.language === 'en' ? elEn : elZh))
 const parse = useParseStore()
 const ready = ref(false)
 const dragging = ref(false)
@@ -30,6 +41,24 @@ async function importText(text: string) {
   if (urls.length === 1) parse.parse(text)
   else ElMessage.success(`已导入 ${urls.length} 条链接`)
 }
+
+// 锁定时关闭播放器，免得声音继续、画面露出来
+watch(
+  () => app.lock.locked,
+  (v) => {
+    if (v) app.player = null
+  },
+)
+
+watch(
+  () => app.pendingParse,
+  (t) => {
+    if (t) {
+      app.pendingParse = null
+      importText(t)
+    }
+  },
+)
 
 function onHtmlDrop(e: DragEvent) {
   dragging.value = false
@@ -51,6 +80,8 @@ const navs: { id: ViewName; label: string }[] = [
   { id: 'subs', label: '订阅' },
   { id: 'live', label: '直播' },
   { id: 'library', label: '媒体库' },
+  { id: 'tools', label: '工具箱' },
+  { id: 'safebox', label: '保险箱' },
   { id: 'settings', label: '设置' },
 ]
 
@@ -59,7 +90,35 @@ const footer = computed(() => {
   return app.info ? `v${app.info.version}` : ''
 })
 
+// 空闲自动锁定：记录最近一次键盘 / 鼠标操作
+let lastActive = Date.now()
+const touch = () => (lastActive = Date.now())
+const ACTIVITY = ['pointerdown', 'pointermove', 'keydown', 'wheel'] as const
+let idleTimer: number | undefined
+
+function checkIdle() {
+  const mins = app.settings?.security.autoLockMinutes ?? 0
+  if (!app.lock.enabled || app.lock.locked || mins <= 0) return
+  if (Date.now() - lastActive > mins * 60_000) api.lockNow().catch(() => {})
+}
+
+async function togglePrivacy() {
+  if (!app.settings) return
+  await app.patch({ security: { ...app.settings.security, privacyMode: false } })
+  ElMessage.success('隐私模式已关闭')
+}
+
+onBeforeUnmount(() => {
+  window.clearInterval(idleTimer)
+  ACTIVITY.forEach((t) => window.removeEventListener(t, touch))
+})
+
 onMounted(async () => {
+  // 先确定有没有锁住，再显示任何内容
+  await app.refreshLock()
+  await events.onLock(() => app.refreshLock())
+  ACTIVITY.forEach((t) => window.addEventListener(t, touch, { passive: true }))
+  idleTimer = window.setInterval(checkIdle, 10_000)
   try {
     await app.load()
     await queue.start()
@@ -167,11 +226,12 @@ onMounted(async () => {
 </script>
 
 <template>
+  <el-config-provider :locale="elLocale">
   <div v-if="loadError" class="fatal">
     <h2>启动失败</h2>
     <p class="selectable">{{ loadError }}</p>
   </div>
-  <div v-else-if="ready && app.settings" class="shell" @dragover.prevent="dragging = true" @dragleave.self="dragging = false" @drop.prevent="onHtmlDrop">
+  <div v-else-if="ready && app.settings" class="shell" :inert="app.lock.locked" @dragover.prevent="dragging = true" @dragleave.self="dragging = false" @drop.prevent="onHtmlDrop">
     <aside class="side">
       <div class="brand">清<i>影</i></div>
       <button
@@ -187,6 +247,7 @@ onMounted(async () => {
         <em v-if="n.id === 'library' && app.inboxUnhandled > 0" class="warn" :title="`收到的链接里有 ${app.inboxUnhandled} 条需要处理`">{{ app.inboxUnhandled }}</em>
       </button>
       <div class="foot">
+        <button v-if="app.settings.security.privacyMode" class="priv" type="button" title="点击关闭隐私模式" @click="togglePrivacy">● 隐私模式</button>
         <div>{{ footer }}</div>
         <div v-if="app.settings.watchClipboard" class="watch">● 剪贴板监听中</div>
       </div>
@@ -197,9 +258,14 @@ onMounted(async () => {
       <SubsView v-if="app.view === 'subs'" />
       <LiveView v-if="app.view === 'live'" />
       <LibraryView v-if="app.view === 'library'" />
+      <ToolboxView v-if="app.view === 'tools'" />
+      <SafeboxView v-if="app.view === 'safebox'" />
       <SettingsView v-if="app.view === 'settings'" />
     </main>
     <DisclaimerDialog />
+    <OnboardingDialog />
+    <CommandPalette />
+    <PlayerDialog />
     <div v-if="dragging" class="dropzone">松开以导入链接（支持链接文本和 .txt 文件）</div>
     <el-dialog :model-value="!!countdown" :title="countdown?.action === 'shutdown' ? '即将关机' : '即将睡眠'" width="360px" :close-on-click-modal="false" :show-close="false">
       <p>全部下载已完成，将在 <b class="mono">{{ countdown?.left }}</b> 秒后{{ countdown?.action === 'shutdown' ? '关机' : '睡眠' }}。</p>
@@ -208,9 +274,16 @@ onMounted(async () => {
       </template>
     </el-dialog>
   </div>
+  <LockScreen />
+  </el-config-provider>
 </template>
 
 <style scoped>
+.priv {
+  all: unset;
+  cursor: pointer;
+  color: var(--cc-acc);
+}
 .shell {
   display: grid;
   grid-template-columns: 184px 1fr;

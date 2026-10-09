@@ -45,6 +45,55 @@ pub struct LiveSettings {
     /// 保存目录；为空时为“下载目录 / 直播 / 主播名”
     pub dir: String,
     pub notify: bool,
+    /// 预约时段：不为空时只在这些时段检测开播和录制，时段结束时自动开始的录制随之停止
+    pub schedule: Vec<TimeWindow>,
+}
+
+/// 每周重复的时间段。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TimeWindow {
+    /// 星期几：1 = 周一 … 7 = 周日；为空表示每天
+    pub days: Vec<u8>,
+    /// `HH:MM`
+    pub start: String,
+    pub end: String,
+}
+
+impl Default for TimeWindow {
+    fn default() -> Self {
+        TimeWindow { days: vec![], start: "20:00".into(), end: "23:00".into() }
+    }
+}
+
+/// `HH:MM` → 当天的第几分钟。
+pub fn parse_hhmm(s: &str) -> Option<u32> {
+    let (h, m) = s.trim().split_once(':')?;
+    let (h, m): (u32, u32) = (h.parse().ok()?, m.parse().ok()?);
+    (h < 24 && m < 60).then_some(h * 60 + m)
+}
+
+/// 现在（星期几 1–7、当天第几分钟）是否在预约时段里。没有设置时段表示一直允许。结束时间早于开始时间表示跨过午夜。
+pub fn in_schedule(windows: &[TimeWindow], weekday: u8, minute: u32) -> bool {
+    if windows.is_empty() {
+        return true;
+    }
+    let yesterday = if weekday == 1 { 7 } else { weekday - 1 };
+    windows.iter().any(|w| {
+        let (Some(s), Some(e)) = (parse_hhmm(&w.start), parse_hhmm(&w.end)) else { return false };
+        let on = |d: u8| w.days.is_empty() || w.days.contains(&d);
+        match s.cmp(&e) {
+            std::cmp::Ordering::Less => on(weekday) && (s..e).contains(&minute),
+            std::cmp::Ordering::Greater => (on(weekday) && minute >= s) || (on(yesterday) && minute < e),
+            std::cmp::Ordering::Equal => false,
+        }
+    })
+}
+
+fn schedule_allows(settings: &LiveSettings) -> bool {
+    use chrono::{Datelike, Timelike};
+    let now = chrono::Local::now();
+    in_schedule(&settings.schedule, now.weekday().number_from_monday() as u8, now.hour() * 60 + now.minute())
 }
 
 impl Default for LiveSettings {
@@ -59,6 +108,7 @@ impl Default for LiveSettings {
             merge_segments: false,
             dir: String::new(),
             notify: true,
+            schedule: vec![],
         }
     }
 }
@@ -71,6 +121,15 @@ impl LiveSettings {
         self.dir = self.dir.trim().to_string();
         if !self.convert_mp4 {
             self.merge_segments = false;
+        }
+        self.schedule.retain(|w| parse_hhmm(&w.start).is_some() && parse_hhmm(&w.end).is_some() && w.start.trim() != w.end.trim());
+        self.schedule.truncate(14);
+        for w in &mut self.schedule {
+            w.days.retain(|d| (1..=7).contains(d));
+            w.days.sort_unstable();
+            w.days.dedup();
+            w.start = w.start.trim().to_string();
+            w.end = w.end.trim().to_string();
         }
     }
 }
@@ -131,6 +190,8 @@ struct Runtime {
     stop: Option<watch::Sender<bool>>,
     /// 用户手动停止：本场直播不再自动录制，下播后恢复
     manual_stop: bool,
+    /// 当前这场录制是监控到开播后自动开始的（预约时段结束时只停止这样的录制）
+    auto_started: bool,
 }
 
 #[derive(Default)]
@@ -417,6 +478,7 @@ pub fn start_recording(app: &AppHandle, id: i64, status: Option<LiveStatus>) {
     let (tx, rx) = watch::channel(false);
     state.live.with(id, |r| {
         r.manual_stop = false;
+        r.auto_started = false;
         r.stop = Some(tx);
         r.state = "recording".into();
         r.error = None;
@@ -876,8 +938,8 @@ async fn post_process(state: &AppState, files: &[String], merge: bool) -> AppRes
 }
 
 fn notify(app: &AppHandle, title: &str, body: &str) {
-    use tauri_plugin_notification::NotificationExt;
-    let _ = app.notification().builder().title(title).body(body).show();
+    crate::security::system_notification(app, title, body, false);
+    crate::notify::emit(app, crate::notify::Event::Live, title, body);
 }
 
 // ---------- 监控 ----------
@@ -907,6 +969,20 @@ pub fn spawn_monitor(app: &AppHandle) {
             let rooms = state.db.live_rooms().unwrap_or_default();
             let t = now();
             for room in rooms.into_iter().filter(|r| r.monitoring) {
+                if !schedule_allows(&room.settings) {
+                    // 不在预约时段：不检测；时段结束时停止自动开始的录制
+                    let stop = state.live.with(room.id, |r| {
+                        if r.stop.is_none() {
+                            r.state = "scheduled".into();
+                        }
+                        (r.auto_started && r.stop.is_some()).then(|| r.stop.clone()).flatten()
+                    });
+                    if let Some(tx) = stop {
+                        log::info!("live room {}: schedule window ended, stopping the recording", room.id);
+                        let _ = tx.send(true);
+                    }
+                    continue;
+                }
                 let (busy, due) = state.live.with(room.id, |r| (r.stop.is_some() || r.state == "checking", r.next_check <= t));
                 if busy || !due {
                     continue;
@@ -945,6 +1021,7 @@ async fn monitor_once(app: &AppHandle, room: LiveRoom) {
             if s.live && room.settings.auto_record && !manual_stop {
                 if state.live.recording_count() < max {
                     start_recording(app, room.id, Some(s));
+                    state.live.with(room.id, |r| r.auto_started = true);
                 } else {
                     state.live.with(room.id, |r| r.error = Some(format!("同时录制数已达上限（{max}）")));
                 }
@@ -964,6 +1041,35 @@ async fn monitor_once(app: &AppHandle, room: LiveRoom) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schedule_windows() {
+        let w = |days: &[u8], s: &str, e: &str| TimeWindow { days: days.to_vec(), start: s.into(), end: e.into() };
+        assert!(in_schedule(&[], 3, 0), "no schedule: always allowed");
+        let evening = [w(&[6, 7], "20:00", "23:00")];
+        assert!(in_schedule(&evening, 6, 20 * 60) && in_schedule(&evening, 7, 22 * 60 + 59));
+        assert!(!in_schedule(&evening, 6, 23 * 60), "end is exclusive");
+        assert!(!in_schedule(&evening, 5, 21 * 60), "wrong weekday");
+        assert!(!in_schedule(&evening, 6, 19 * 60 + 59));
+        // 每天（days 为空）
+        assert!(in_schedule(&[w(&[], "08:00", "09:00")], 2, 8 * 60 + 30));
+        // 跨午夜：周五 22:00 – 周六 02:00
+        let night = [w(&[5], "22:00", "02:00")];
+        assert!(in_schedule(&night, 5, 23 * 60), "Friday late");
+        assert!(in_schedule(&night, 6, 60), "Saturday early morning belongs to Friday's window");
+        assert!(!in_schedule(&night, 6, 3 * 60));
+        assert!(!in_schedule(&night, 5, 60), "Friday early morning is Thursday's window");
+        let sun_night = [w(&[7], "23:00", "01:00")];
+        assert!(in_schedule(&sun_night, 1, 30), "Monday 00:30 follows Sunday's window");
+        // 多个时段、非法时段
+        assert!(in_schedule(&[w(&[1], "08:00", "09:00"), w(&[2], "10:00", "11:00")], 2, 10 * 60 + 5));
+        assert!(!in_schedule(&[w(&[], "bad", "09:00")], 1, 8 * 60));
+        assert_eq!(parse_hhmm("7:05"), Some(425));
+        assert_eq!(parse_hhmm("24:00"), None);
+        let mut s = LiveSettings { schedule: vec![w(&[9, 3, 3, 0], " 20:00 ", "21:00"), w(&[], "x", "y"), w(&[], "10:00", "10:00")], ..Default::default() };
+        s.normalize("bilibili");
+        assert_eq!(s.schedule, vec![w(&[3], "20:00", "21:00")], "invalid and empty windows are dropped, days cleaned");
+    }
 
     #[test]
     fn segment_names() {

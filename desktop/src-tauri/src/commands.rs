@@ -55,7 +55,7 @@ pub fn get_app_info(app: AppHandle, state: St<'_>) -> AppInfo {
 
 #[tauri::command]
 pub fn get_settings(state: St<'_>) -> Settings {
-    state.settings()
+    state.settings_raw()
 }
 
 #[derive(Serialize)]
@@ -70,7 +70,7 @@ pub struct SaveSettingsResult {
 pub async fn save_settings(app: AppHandle, state: St<'_>, settings: Settings) -> AppResult<SaveSettingsResult> {
     let mut s = settings;
     s.normalize();
-    let old = state.settings();
+    let old = state.settings_raw();
     // 旧版明文 Cookie 字段不再写回
     s.cookies.clear();
     s.cookie_updated_at.clear();
@@ -78,12 +78,22 @@ pub async fn save_settings(app: AppHandle, state: St<'_>, settings: Settings) ->
     s.phone = old.phone.clone();
     s.save(&state.settings_path)?;
     *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
-    if old.shortcut != s.shortcut {
+    if old.shortcut != s.shortcut || old.security.panic_shortcut != s.security.panic_shortcut {
         apply_shortcut(&app, &s.shortcut);
+    }
+    if old.language != s.language {
+        tray::apply_language(&app, crate::i18n::is_en(&s.language));
+    }
+    if old.float_ball != s.float_ball {
+        tray::apply_float(&app, s.float_ball);
+    }
+    if old.security.content_protection != s.security.content_protection {
+        crate::security::apply_window_protection(&app, s.security.content_protection);
     }
     if old.network != s.network {
         state.net.invalidate();
     }
+    state.net.refresh_limit(&s.speed_schedule);
     tray::sync_watch_item(&app);
     if !s.prevent_sleep {
         crate::power::keep_awake(false);
@@ -95,7 +105,7 @@ pub async fn save_settings(app: AppHandle, state: St<'_>, settings: Settings) ->
             log::warn!("autostart change failed: {e}");
         }
     }
-    if old.concurrency != s.concurrency || old.per_site_concurrency != s.per_site_concurrency {
+    if old.concurrency != s.concurrency || old.per_site_concurrency != s.per_site_concurrency || old.metered_mode != s.metered_mode {
         download::schedule(&app);
     }
     let shortcut_error = state.shortcut_error.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -106,17 +116,19 @@ pub async fn save_settings(app: AppHandle, state: St<'_>, settings: Settings) ->
 pub fn apply_shortcut(app: &AppHandle, shortcut: &str) {
     let gs = app.global_shortcut();
     let _ = gs.unregister_all();
-    let shortcut = shortcut.trim();
-    let error = if shortcut.is_empty() {
-        None
-    } else {
-        gs.register(shortcut).err().map(|e| {
-            log::warn!("register shortcut {shortcut} failed: {e}");
-            format!("快捷键 {shortcut} 注册失败，可能格式不对或已被其他软件占用：{e}")
-        })
-    };
+    let panic = app.try_state::<Arc<AppState>>().map(|st| st.settings_raw().security.panic_shortcut).unwrap_or_default();
+    let mut errors = vec![];
+    for (what, sc) in [("快捷键", shortcut.trim()), ("老板键", panic.trim())] {
+        if sc.is_empty() {
+            continue;
+        }
+        if let Err(e) = gs.register(sc) {
+            log::warn!("register shortcut {sc} failed: {e}");
+            errors.push(format!("{what} {sc} 注册失败，可能格式不对或已被其他软件占用：{e}"));
+        }
+    }
     if let Some(st) = app.try_state::<Arc<AppState>>() {
-        *st.shortcut_error.lock().unwrap_or_else(|e| e.into_inner()) = error;
+        *st.shortcut_error.lock().unwrap_or_else(|e| e.into_inner()) = if errors.is_empty() { None } else { Some(errors.join("\n")) };
     }
 }
 
@@ -136,7 +148,9 @@ pub async fn resolve_link(app: AppHandle, state: St<'_>, text: String) -> AppRes
             return Err(e);
         }
     };
-    let _ = state.db.upsert_history(&info);
+    if !settings.security.privacy_mode {
+        let _ = state.db.upsert_history(&info);
+    }
     let _ = state.db.inbox_mark_parsed(&text, &info);
     Ok(info)
 }
@@ -499,6 +513,11 @@ pub fn list_tasks(state: St<'_>) -> Vec<TaskSnapshot> {
 }
 
 #[tauri::command]
+pub fn task_detail(app: AppHandle, id: i64) -> AppResult<download::TaskDetail> {
+    download::task_detail(&app, id).ok_or_else(|| AppError::not_found("任务不存在或已被移除"))
+}
+
+#[tauri::command]
 pub fn pause_task(app: AppHandle, id: i64) {
     download::pause(&app, id)
 }
@@ -606,6 +625,19 @@ const HEALTH_SAMPLES: &[(&str, &str)] =
     &[("bilibili", "https://www.bilibili.com/video/BV1GJ411x7h7"), ("yt-dlp", "https://www.youtube.com/watch?v=jNQXAC9IVRw")];
 
 /// 平台健康检查：用示例链接测试各平台解析是否正常。
+/// 试用一条自定义站点规则：用它解析给定网址，返回解析结果（不下载）。
+#[tauri::command]
+pub async fn site_rule_test(state: St<'_>, rule: crate::settings::SiteRule, url: String) -> AppResult<MediaInfo> {
+    let settings = state.settings();
+    let ctx = state.parse_ctx(&settings);
+    let mut rule = rule;
+    rule.enabled = true;
+    if rule.video_regex.trim().is_empty() {
+        return Err(AppError::invalid("请先填写“视频地址”的正则。"));
+    }
+    providers::custom::resolve(&ctx, &rule, url.trim()).await
+}
+
 #[tauri::command]
 pub async fn health_check(state: St<'_>) -> AppResult<Vec<HealthResult>> {
     let settings = state.settings();
@@ -710,16 +742,11 @@ pub fn is_portable() -> bool {
 
 #[tauri::command]
 pub async fn delete_library(state: St<'_>, id: i64, delete_file: bool) -> AppResult<()> {
-    if let Some(path) = state.db.delete_library(id)? {
-        if delete_file {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(AppError::new(crate::error::ErrorKind::Disk, format!("记录已删除，但文件删除失败：{e}"))),
-            }
-        }
+    let rep = crate::library_cmds::delete_items(&state, &[id], delete_file);
+    match rep.failed.into_iter().next() {
+        Some(msg) => Err(AppError::new(crate::error::ErrorKind::Disk, msg)),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// 写入剪贴板，并让监听忽略这次变化。
@@ -794,7 +821,11 @@ pub fn open_login(app: AppHandle, site: String, url: Option<String>, label: Opti
     let (name, target) = login_target(&site, url.as_deref())?;
     let auto = cookies::login_cookie_names(&site).is_some();
     let hint = if auto { "登录完成后会自动保存并关闭窗口" } else { "登录完成后回到清影点击“保存登录状态”" };
-    WebviewWindowBuilder::new(&app, label_win, WebviewUrl::External(target)).title(format!("登录{name}：{hint}")).inner_size(1100.0, 780.0).build()?;
+    let win =
+        WebviewWindowBuilder::new(&app, label_win, WebviewUrl::External(target)).title(format!("登录{name}：{hint}")).inner_size(1100.0, 780.0).build()?;
+    if app.state::<Arc<AppState>>().settings_raw().security.content_protection {
+        let _ = win.set_content_protected(true);
+    }
     if auto {
         let app = app.clone();
         tauri::async_runtime::spawn(async move { watch_login(app, site, label).await });
@@ -1046,6 +1077,17 @@ pub async fn verify_account(state: &AppState, id: &str) -> AppResult<providers::
 }
 
 /// 测试某个地址在当前网络规则下能否访问。
+/// 对所有出口（直连、系统代理、自定义代理）测速。
+#[tauri::command]
+pub async fn route_speedtest(state: St<'_>, url: String) -> AppResult<Vec<crate::net::RouteSpeed>> {
+    let url = url.trim().to_string();
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(AppError::invalid("请填写以 https:// 开头的地址，最好是一个视频文件或大一点的资源。"));
+    }
+    let net = state.settings_raw().network;
+    Ok(state.net.speed_test(&net, &url).await)
+}
+
 #[tauri::command]
 pub async fn test_route(state: St<'_>, url: String) -> AppResult<crate::net::RouteTest> {
     let url = if url.starts_with("http") { url } else { format!("https://{url}/") };

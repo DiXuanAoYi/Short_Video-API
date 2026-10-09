@@ -28,7 +28,7 @@ pub fn ffmpeg_missing() -> AppError {
     AppError::new(ErrorKind::NeedUpdate, "需要 ffmpeg 才能合并音视频。请在“设置 → 组件”中安装 ffmpeg 后重试。")
 }
 
-fn base_args() -> Vec<String> {
+pub(crate) fn base_args() -> Vec<String> {
     vec!["-hide_banner".into(), "-loglevel".into(), "error".into(), "-y".into()]
 }
 
@@ -241,7 +241,7 @@ async fn run_with_encoders(ffmpeg: &Path, make: impl Fn(&[&str]) -> Vec<String>,
 
 /// 复制模式下起点的容差：关键帧的时间戳常比整数秒晚几毫秒（容器的起始偏移），
 /// 不留容差的话 ffmpeg 会退到再前一个关键帧，多出整整一个 GOP（通常 1–2 秒）。
-const COPY_SEEK_SLACK_MS: u64 = 40;
+pub const COPY_SEEK_SLACK_MS: u64 = 40;
 
 /// 只保留 `start_ms..end_ms` 这一段。默认不重新编码（速度快，起点落在前一个关键帧上，可能提前几秒）；
 /// `precise` 时重新编码，起点精确到帧。
@@ -398,6 +398,11 @@ pub struct Probe {
     pub duration_ms: Option<u64>,
     pub has_video: bool,
     pub has_audio: bool,
+    /// 第一条视频轨的宽高
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    /// 文件自带的标题、艺术家等信息（键为小写）
+    pub tags: std::collections::BTreeMap<String, String>,
     /// 无法读取时 ffmpeg 给出的原因
     pub error: Option<String>,
 }
@@ -411,9 +416,30 @@ impl Probe {
 
 /// 解析 `ffmpeg -i file` 的输出（不指定输出文件时 ffmpeg 会打印信息并以错误退出，这是正常的）。
 pub fn parse_probe(stderr: &str) -> Probe {
+    static DIMS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"[ ,](\d{2,5})x(\d{2,5})[ ,\[]").unwrap());
     let mut p = Probe::default();
+    // 全局元数据：第一个“Metadata:”到第一个“Duration:”之间缩进 4 格的 `键 : 值`
+    let (mut in_meta, mut meta_done) = (false, false);
     for line in stderr.lines() {
         let l = line.trim();
+        if !meta_done {
+            if l == "Metadata:" && line.starts_with("  Metadata:") {
+                in_meta = true;
+                continue;
+            }
+            if l.starts_with("Duration:") || l.starts_with("Stream #") {
+                in_meta = false;
+                meta_done = true;
+            } else if in_meta {
+                if let Some((k, v)) = l.split_once(':') {
+                    let (k, v) = (k.trim().to_ascii_lowercase(), v.trim().to_string());
+                    if !k.is_empty() && !v.is_empty() {
+                        p.tags.insert(k, v);
+                    }
+                }
+                continue;
+            }
+        }
         if let Some(rest) = l.strip_prefix("Duration:") {
             let t = rest.split(',').next().unwrap_or("").trim();
             if t != "N/A" {
@@ -426,6 +452,12 @@ pub fn parse_probe(stderr: &str) -> Probe {
             }
         } else if l.starts_with("Stream #") {
             if l.contains(": Video:") && !l.contains("attached pic") {
+                if !p.has_video {
+                    if let Some(c) = DIMS.captures(l) {
+                        p.width = c[1].parse().ok();
+                        p.height = c[2].parse().ok();
+                    }
+                }
                 p.has_video = true;
             } else if l.contains(": Audio:") {
                 p.has_audio = true;
@@ -452,7 +484,7 @@ pub async fn probe(ffmpeg: &Path, file: &Path) -> Probe {
     match tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output()).await {
         Ok(Ok(out)) => parse_probe(&String::from_utf8_lossy(&out.stderr)),
         // 无法运行 ffmpeg 或超时：不能判断文件是否损坏，当作可读
-        _ => Probe { duration_ms: None, has_video: true, has_audio: true, error: None },
+        _ => Probe { has_video: true, has_audio: true, ..Default::default() },
     }
 }
 
@@ -515,6 +547,26 @@ pub async fn run_ffmpeg_in(ffmpeg: &Path, args: &[String], cwd: Option<&Path>) -
         Ok(())
     } else {
         let err = String::from_utf8_lossy(&out.stderr);
+        let tail: String = err.lines().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" ");
+        Err(AppError::msg(format!("ffmpeg 处理失败：{tail}")))
+    }
+}
+
+/// 运行 ffmpeg 并取回标准输出和标准错误（用于读取帧数据、分析结果）。超时后强制结束。
+pub async fn run_ffmpeg_capture(ffmpeg: &Path, args: &[String], timeout: std::time::Duration) -> AppResult<(Vec<u8>, String)> {
+    let mut cmd = tokio::process::Command::new(ffmpeg);
+    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    let child = cmd.spawn().map_err(|e| AppError::new(ErrorKind::NeedUpdate, format!("无法运行 ffmpeg：{e}")))?;
+    let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(r) => r.map_err(|e| AppError::msg(format!("ffmpeg 运行失败：{e}")))?,
+        Err(_) => return Err(AppError::msg("ffmpeg 处理超时。")),
+    };
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    if out.status.success() {
+        Ok((out.stdout, err))
+    } else {
         let tail: String = err.lines().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" ");
         Err(AppError::msg(format!("ffmpeg 处理失败：{tail}")))
     }
@@ -586,6 +638,11 @@ mod tests {
         assert!(!bad.readable());
         let bad = parse_probe("[mov,mp4,m4a,3gp,3g2,mj2 @ 0x557340f16f80] moov atom not found\n");
         assert_eq!(bad.error.as_deref(), Some("moov atom not found"));
+        let sized = parse_probe("  Metadata:\n    major_brand     : isom\n    Title           : 我的歌\n    artist          : 某人\n  Duration: 00:00:05.00, start: 0.0\n  Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(progressive), 1080x1920 [SAR 1:1 DAR 9:16], 2000 kb/s\n    Metadata:\n      handler_name    : VideoHandler\n");
+        assert_eq!((sized.width, sized.height), (Some(1080), Some(1920)));
+        assert_eq!(sized.tags.get("title").map(String::as_str), Some("我的歌"));
+        assert_eq!(sized.tags.get("artist").map(String::as_str), Some("某人"));
+        assert!(!sized.tags.contains_key("handler_name"), "stream metadata is not file metadata");
         let cover_only = parse_probe("  Duration: N/A, bitrate: N/A\n  Stream #0:0: Video: mjpeg, 100x100 (attached pic)\n");
         assert!(!cover_only.has_video, "attached pictures are not video");
         assert_eq!(cover_only.duration_ms, None);

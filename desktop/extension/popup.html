@@ -16,6 +16,9 @@
   label.row input { width: auto; }
   #conn { margin-bottom: 8px; } #conn.ok::before { content: "● "; color: #2f8a57; } #conn.err::before { content: "● "; color: #c4423a; }
   #sites div { display: flex; justify-content: space-between; padding: 2px 0; } #sites a { color: #d9772f; cursor: pointer; }
+  #sniffList .it { display: flex; gap: 6px; align-items: center; padding: 4px 0; border-bottom: 1px solid #d6d0c8; }
+  #sniffList .it span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+  #sniffList .it button { width: auto; margin: 0; padding: 3px 10px; font-size: 12px; }
   .err { color: #c4423a; } .ok { color: #2f8a57; } .hidden { display: none; } .mute { color: #7b756d; font-size: 12px; }
 </style>
 </head>
@@ -27,6 +30,10 @@
     <button id="send">发送当前页面</button>
     <button id="cookies" class="sec">同步此网站的登录 Cookie</button>
     <div id="syncInfo" class="mute"></div>
+    <div id="sniffBox" class="hidden">
+      <label>检测到的视频（<span id="sniffCount">0</span>）</label>
+      <div id="sniffList"></div>
+    </div>
     <label class="row"><input id="autoSite" type="checkbox" /> 登录状态变化时自动同步此网站</label>
     <button id="openSettings" class="sec">设置</button>
   </div>

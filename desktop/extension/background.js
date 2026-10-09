@@ -49,3 +49,37 @@ api.cookies.onChanged.addListener(async ({ cookie }) => {
     }, 10000),
   )
 })
+
+// ---------- 视频嗅探 ----------
+
+api.webRequest.onResponseStarted.addListener(
+  async (d) => {
+    if (d.tabId < 0 || d.statusCode >= 400) return
+    const h = {}
+    for (const x of d.responseHeaders || []) h[x.name.toLowerCase()] = x.value || ''
+    const media = classifyMedia(d.url, h['content-type'], h['content-length'], h['content-range'])
+    if (!media) return
+    const n = await addSniffed(d.tabId, { url: d.url, kind: media.kind, size: media.size, at: Date.now() })
+    try {
+      await (api.action || api.browserAction).setBadgeText({ tabId: d.tabId, text: String(n) })
+      await (api.action || api.browserAction).setBadgeBackgroundColor({ tabId: d.tabId, color: '#d9772f' })
+    } catch {
+      // 标签页可能已关闭
+    }
+  },
+  { urls: ['<all_urls>'] },
+  ['responseHeaders'],
+)
+
+// 换了页面：清空这个标签页之前的记录
+api.tabs.onUpdated.addListener(async (tabId, change) => {
+  if (change.status === 'loading' && change.url) {
+    await sniffStore.remove(sniffKey(tabId))
+    try {
+      await (api.action || api.browserAction).setBadgeText({ tabId, text: '' })
+    } catch {
+      // ignore
+    }
+  }
+})
+api.tabs.onRemoved.addListener((tabId) => sniffStore.remove(sniffKey(tabId)))

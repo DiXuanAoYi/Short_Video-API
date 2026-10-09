@@ -1,6 +1,7 @@
 //! 各平台解析器。每个平台实现 [`Provider`]，新增平台时只需加一个文件并在 [`all`] 里注册。
 
 pub mod bilibili;
+pub mod custom;
 pub mod douyin;
 pub mod generic;
 pub mod kuaishou;
@@ -8,6 +9,7 @@ pub mod listing;
 pub mod live;
 pub mod pixiv;
 pub mod remote;
+pub mod rss;
 pub mod weibo;
 pub mod xiaohongshu;
 pub mod ytdlp;
@@ -237,6 +239,21 @@ pub async fn resolve_url(ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo> {
 
 /// 没有内置解析器的网站：先交给 yt-dlp，再尝试网页嗅探。
 async fn resolve_generic(ctx: &Ctx<'_>, url: &str) -> AppResult<MediaInfo> {
+    // 用户自己写的站点规则优先
+    if let Some(rule) = custom::find(&ctx.settings.custom_sites, url) {
+        return custom::resolve(ctx, rule, url).await;
+    }
+    // 直接的音视频文件：不用问 yt-dlp
+    if generic::is_direct_media(url) {
+        return generic::resolve(ctx, url).await;
+    }
+    // 看起来像播客 / RSS 订阅源：先按订阅源解析，不是的话再走后面的流程
+    if rss::looks_like_feed_url(url) {
+        match rss::resolve(ctx, url).await {
+            Ok(info) => return Ok(info),
+            Err(e) => log::info!("not a usable feed ({e}), trying other resolvers"),
+        }
+    }
     let mut first_err: Option<AppError> = None;
     if ctx.ytdlp.is_some() {
         if let Some(net) = ctx.net {

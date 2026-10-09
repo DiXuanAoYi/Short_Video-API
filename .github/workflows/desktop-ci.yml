@@ -39,6 +39,10 @@ jobs:
       - name: Frontend typecheck and build
         run: npm run build
 
+      # 列出源码里还没有英文译文的中文（只提示，不会让检查失败；要强制可加 -- --strict）
+      - name: Translation coverage
+        run: npm run i18n
+
       - name: Rust fmt
         working-directory: desktop/src-tauri
         run: cargo fmt --check
@@ -50,3 +54,48 @@ jobs:
       - name: Rust tests
         working-directory: desktop/src-tauri
         run: cargo test
+
+  # 另外两个发布目标：macOS 通用二进制（两个架构）和 Windows ARM64。只做编译检查（不链接、不打包），
+  # 提前发现这两个目标上才会出现的编译问题，免得打标签发布时才失败。
+  cross-check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+          key: ${{ matrix.target }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - run: npm ci
+
+      # tauri::generate_context! 需要前端产物存在
+      - run: npm run build
+
+      - name: Cargo check (${{ matrix.target }})
+        working-directory: desktop/src-tauri
+        run: cargo check --locked --target ${{ matrix.target }}
+
