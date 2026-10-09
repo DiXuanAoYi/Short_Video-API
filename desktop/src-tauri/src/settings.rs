@@ -245,6 +245,8 @@ pub struct Settings {
     pub generic_sniffer: bool,
     /// 下载组件时使用的 GitHub 镜像前缀，如 `https://ghfast.top/`
     pub component_mirrors: Vec<String>,
+    /// 下载 ffmpeg 时用的版本：lite 精简版（默认）/ full 完整版（带 x264、x265、vidstab、zimg）
+    pub ffmpeg_edition: String,
     /// 剪贴板监听是否识别所有网址；关闭时只识别内置平台和 `clipboard_domains`
     pub clipboard_all_sites: bool,
     /// 剪贴板监听额外识别的网站（域名后缀）
@@ -386,6 +388,8 @@ pub struct RuleThen {
     pub upload: bool,
     /// 命中时推送一条通知
     pub notify: bool,
+    /// 按这个视频规整预设处理（“工具箱 → 视频规整”里的预设编号，例如 platform）；留空不处理。会在文件旁边生成新文件，原文件保留
+    pub normalize: String,
 }
 
 /// 下载完成后自动上传到 WebDAV（Nextcloud、坚果云、Alist 等），或复制到另一个文件夹（NAS 挂载盘等）。
@@ -748,6 +752,7 @@ impl Default for Settings {
             use_ytdlp: true,
             generic_sniffer: true,
             component_mirrors: vec![],
+            ffmpeg_edition: "lite".into(),
             clipboard_all_sites: false,
             clipboard_domains: DEFAULT_CLIPBOARD_DOMAINS.iter().map(|d| d.to_string()).collect(),
             phone: PhoneSettings::default(),
@@ -856,6 +861,9 @@ impl Settings {
             self.filename_template = Settings::default().filename_template;
         }
         self.remote_endpoint = self.remote_endpoint.trim().to_string();
+        if self.ffmpeg_edition != "full" {
+            self.ffmpeg_edition = "lite".into();
+        }
         self.danmaku.normalize();
         self.ai.normalize();
         self.speed_schedule
@@ -875,6 +883,9 @@ impl Settings {
             r.name = r.name.trim().to_string();
             r.then.add_tags = r.then.add_tags.iter().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
             r.then.move_to = r.then.move_to.trim().to_string();
+            if crate::vidnorm::spec::preset(&r.then.normalize).is_none() {
+                r.then.normalize.clear();
+            }
             if !matches!(r.then.extract_audio.as_str(), "" | "mp3" | "m4a" | "flac" | "opus") {
                 r.then.extract_audio.clear();
             }

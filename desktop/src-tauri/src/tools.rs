@@ -81,6 +81,8 @@ pub struct ToolStatus {
     pub auto_install: bool,
     pub note: Option<String>,
     pub busy: bool,
+    /// ffmpeg 的版本：full（完整版，GPL）/ lite（精简版，LGPL）。其他组件为 None
+    pub edition: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -103,8 +105,29 @@ pub fn resolve(st: &AppState, tool: Tool) -> Option<PathBuf> {
 }
 
 pub fn find_in_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|d| d.join(name)).find(|p| is_executable(p))
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path).chain(extra_dirs()).map(|d| d.join(name)).find(|p| is_executable(p))
+}
+
+/// 从桌面启动的程序拿到的 PATH 往往很短（macOS 的 Finder 启动时没有 Homebrew 的目录），这里补上常见的安装位置。
+fn extra_dirs() -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from);
+    let mut v: Vec<PathBuf> = vec![];
+    match std::env::consts::OS {
+        "macos" => v.extend(["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"].map(PathBuf::from)),
+        "linux" => v.extend(["/usr/local/bin", "/snap/bin"].map(PathBuf::from)),
+        "windows" => {
+            if let Some(h) = &home {
+                v.push(h.join("scoop").join("shims"));
+            }
+            if let Some(l) = std::env::var_os("LOCALAPPDATA") {
+                v.push(PathBuf::from(l).join("Microsoft").join("WinGet").join("Links"));
+            }
+            v.push(PathBuf::from(r"C:\ProgramData\chocolatey\bin"));
+        }
+        _ => {}
+    }
+    v
 }
 
 fn is_executable(p: &Path) -> bool {
@@ -148,21 +171,23 @@ pub struct Source {
 const YTDLP_BASE: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/";
 const FFMPEG_BASE: &str = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/";
 
-/// 各平台的官方下载源。macOS 没有 LGPL 版 ffmpeg 的官方构建，请用 Homebrew 安装或手动导入。
-pub fn source_for(tool: Tool, platform: &str) -> Option<Source> {
-    let (base, sums, asset, archive) = match (tool, platform) {
-        (Tool::YtDlp, "windows-x86_64") => (YTDLP_BASE, "SHA2-256SUMS", "yt-dlp.exe", Archive::None),
-        (Tool::YtDlp, "windows-aarch64") => (YTDLP_BASE, "SHA2-256SUMS", "yt-dlp_arm64.exe", Archive::None),
-        (Tool::YtDlp, p) if p.starts_with("macos") => (YTDLP_BASE, "SHA2-256SUMS", "yt-dlp_macos", Archive::None),
-        (Tool::YtDlp, "linux-x86_64") => (YTDLP_BASE, "SHA2-256SUMS", "yt-dlp_linux", Archive::None),
-        (Tool::YtDlp, "linux-aarch64") => (YTDLP_BASE, "SHA2-256SUMS", "yt-dlp_linux_aarch64", Archive::None),
-        (Tool::Ffmpeg, "windows-x86_64") => (FFMPEG_BASE, "checksums.sha256", "ffmpeg-master-latest-win64-lgpl.zip", Archive::Zip),
-        (Tool::Ffmpeg, "windows-aarch64") => (FFMPEG_BASE, "checksums.sha256", "ffmpeg-master-latest-winarm64-lgpl.zip", Archive::Zip),
-        (Tool::Ffmpeg, "linux-x86_64") => (FFMPEG_BASE, "checksums.sha256", "ffmpeg-master-latest-linux64-lgpl.tar.xz", Archive::TarXz),
-        (Tool::Ffmpeg, "linux-aarch64") => (FFMPEG_BASE, "checksums.sha256", "ffmpeg-master-latest-linuxarm64-lgpl.tar.xz", Archive::TarXz),
+/// 各平台的官方下载源。`edition`：ffmpeg 的版本，`lite` 精简版（LGPL，体积小，没有 x264）/ `full` 完整版（GPL，带 x264、x265、vidstab、zimg 等）。
+/// 完整版只在用户主动选择后下载，不随程序分发。macOS 没有官方构建，请用 Homebrew 安装（brew install ffmpeg 就是完整版）或手动导入。
+pub fn source_for(tool: Tool, platform: &str, edition: &str) -> Option<Source> {
+    let flavor = if edition == "full" { "gpl" } else { "lgpl" };
+    let (base, sums, asset, archive): (&str, &str, String, Archive) = match (tool, platform) {
+        (Tool::YtDlp, "windows-x86_64") => (YTDLP_BASE, "SHA2-256SUMS", "yt-dlp.exe".into(), Archive::None),
+        (Tool::YtDlp, "windows-aarch64") => (YTDLP_BASE, "SHA2-256SUMS", "yt-dlp_arm64.exe".into(), Archive::None),
+        (Tool::YtDlp, p) if p.starts_with("macos") => (YTDLP_BASE, "SHA2-256SUMS", "yt-dlp_macos".into(), Archive::None),
+        (Tool::YtDlp, "linux-x86_64") => (YTDLP_BASE, "SHA2-256SUMS", "yt-dlp_linux".into(), Archive::None),
+        (Tool::YtDlp, "linux-aarch64") => (YTDLP_BASE, "SHA2-256SUMS", "yt-dlp_linux_aarch64".into(), Archive::None),
+        (Tool::Ffmpeg, "windows-x86_64") => (FFMPEG_BASE, "checksums.sha256", format!("ffmpeg-master-latest-win64-{flavor}.zip"), Archive::Zip),
+        (Tool::Ffmpeg, "windows-aarch64") => (FFMPEG_BASE, "checksums.sha256", format!("ffmpeg-master-latest-winarm64-{flavor}.zip"), Archive::Zip),
+        (Tool::Ffmpeg, "linux-x86_64") => (FFMPEG_BASE, "checksums.sha256", format!("ffmpeg-master-latest-linux64-{flavor}.tar.xz"), Archive::TarXz),
+        (Tool::Ffmpeg, "linux-aarch64") => (FFMPEG_BASE, "checksums.sha256", format!("ffmpeg-master-latest-linuxarm64-{flavor}.tar.xz"), Archive::TarXz),
         _ => return None,
     };
-    Some(Source { file_url: format!("{base}{asset}"), sums_url: format!("{base}{sums}"), asset: asset.to_string(), archive })
+    Some(Source { file_url: format!("{base}{asset}"), sums_url: format!("{base}{sums}"), asset, archive })
 }
 
 /// 镜像前缀 + 原地址，镜像在前、官方地址在最后。
@@ -264,6 +289,20 @@ pub async fn version_of(tool: Tool, path: &Path) -> Option<String> {
     Some(parse_version(tool, &first)).filter(|v| !v.is_empty())
 }
 
+/// ffmpeg 是不是完整版（编译时启用了 GPL，带 x264 等）。
+pub async fn ffmpeg_is_gpl(path: &Path) -> bool {
+    let mut cmd = tokio::process::Command::new(path);
+    cmd.arg("-version").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    match tokio::time::timeout(Duration::from_secs(20), cmd.output()).await {
+        Ok(Ok(out)) => {
+            String::from_utf8_lossy(&out.stdout).lines().any(|l| l.starts_with("configuration:") && l.split_whitespace().any(|w| w == "--enable-gpl"))
+        }
+        _ => false,
+    }
+}
+
 pub fn parse_version(tool: Tool, first_line: &str) -> String {
     match tool {
         Tool::YtDlp => first_line.to_string(),
@@ -278,14 +317,21 @@ pub async fn status(st: &AppState, tool: Tool) -> ToolStatus {
         Some(p) => version_of(tool, p).await,
         None => None,
     };
-    let auto = source_for(tool, &platform_key()).is_some();
+    let auto = source_for(tool, &platform_key(), "lite").is_some();
     let note = match (tool, auto, path.is_some()) {
-        (Tool::Ffmpeg, false, false) => Some("macOS 请用 Homebrew 安装（brew install ffmpeg），或下载后手动导入。".into()),
+        (Tool::Ffmpeg, false, false) => {
+            Some("macOS 请用 Homebrew 安装（brew install ffmpeg，是带 x264 的完整版），装好后重新打开清影；也可以下载后手动导入。".into())
+        }
         (_, _, true) if version.is_none() => Some("找到了程序但无法运行，请重新安装或导入。".into()),
+        _ => None,
+    };
+    let edition = match (&path, tool) {
+        (Some(p), Tool::Ffmpeg) if version.is_some() => Some(if ffmpeg_is_gpl(p).await { "full" } else { "lite" }),
         _ => None,
     };
     ToolStatus {
         id: tool.id(),
+        edition,
         installed: path.is_some() && version.is_some(),
         managed: managed_path.is_file(),
         path: path.map(|p| p.to_string_lossy().into_owned()),
@@ -379,8 +425,9 @@ async fn fastest(st: &AppState, urls: &[String]) -> Option<String> {
 pub async fn install(app: &AppHandle, tool: Tool) -> AppResult<ToolStatus> {
     let st = app.state::<std::sync::Arc<AppState>>().inner().clone();
     let _guard = mark_busy(&st, tool)?;
-    let src = source_for(tool, &platform_key()).ok_or_else(|| AppError::unsupported(format!("当前系统不支持自动下载 {}，请手动安装后导入。", tool.id())))?;
     let settings = st.settings();
+    let src = source_for(tool, &platform_key(), &settings.ffmpeg_edition)
+        .ok_or_else(|| AppError::unsupported(format!("当前系统不支持自动下载 {}，请手动安装后导入。", tool.id())))?;
     let emit = |stage: &'static str, received: u64, total: Option<u64>| {
         let _ = app.emit(EVT_PROGRESS, ToolProgress { tool: tool.id(), stage, received, total });
     };
@@ -485,15 +532,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ffmpeg_edition_picks_the_gpl_or_lgpl_build() {
+        let lite = source_for(Tool::Ffmpeg, "windows-x86_64", "lite").unwrap();
+        let full = source_for(Tool::Ffmpeg, "windows-x86_64", "full").unwrap();
+        assert!(lite.asset.ends_with("win64-lgpl.zip") && full.asset.ends_with("win64-gpl.zip"));
+        assert!(full.file_url.ends_with("ffmpeg-master-latest-win64-gpl.zip") && full.sums_url.ends_with("checksums.sha256"));
+        assert!(source_for(Tool::Ffmpeg, "linux-aarch64", "full").unwrap().asset.ends_with("linuxarm64-gpl.tar.xz"));
+        assert!(source_for(Tool::Ffmpeg, "macos-aarch64", "full").is_none(), "macOS 没有官方构建");
+        // 未知的取值按精简版处理；yt-dlp 不受影响
+        assert!(source_for(Tool::Ffmpeg, "linux-x86_64", "weird").unwrap().asset.contains("lgpl"));
+        assert_eq!(source_for(Tool::YtDlp, "windows-x86_64", "full").unwrap().asset, "yt-dlp.exe");
+    }
+
+    #[test]
+    fn extra_dirs_cover_homebrew_on_macos() {
+        let d = extra_dirs();
+        match std::env::consts::OS {
+            "macos" => assert!(d.iter().any(|p| p.ends_with("homebrew/bin"))),
+            "linux" => assert!(d.iter().any(|p| p.ends_with("local/bin"))),
+            _ => {}
+        }
+    }
+
+    #[test]
     fn sources_per_platform() {
-        let s = source_for(Tool::YtDlp, "windows-x86_64").unwrap();
+        let s = source_for(Tool::YtDlp, "windows-x86_64", "lite").unwrap();
         assert_eq!(s.file_url, "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe");
         assert_eq!(s.archive, Archive::None);
-        let f = source_for(Tool::Ffmpeg, "linux-x86_64").unwrap();
+        let f = source_for(Tool::Ffmpeg, "linux-x86_64", "lite").unwrap();
         assert!(f.asset.ends_with("lgpl.tar.xz"), "only LGPL ffmpeg builds");
         assert_eq!(f.archive, Archive::TarXz);
-        assert!(source_for(Tool::Ffmpeg, "macos-aarch64").is_none());
-        assert!(source_for(Tool::YtDlp, "macos-aarch64").is_some());
+        assert!(source_for(Tool::Ffmpeg, "macos-aarch64", "lite").is_none());
+        assert!(source_for(Tool::YtDlp, "macos-aarch64", "lite").is_some());
     }
 
     #[test]

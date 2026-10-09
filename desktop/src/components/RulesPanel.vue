@@ -1,11 +1,14 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onMounted, ref } from 'vue'
+import { api } from '../api'
 import { useAppStore } from '../stores/app'
-import type { AutoRule } from '../types'
+import type { AutoRule, NormPreset } from '../types'
 
 const rules = defineModel<AutoRule[]>({ required: true })
 const app = useAppStore()
 const platforms = computed(() => app.info?.providers ?? [])
+const presets = ref<NormPreset[]>([])
+onMounted(async () => (presets.value = await api.videoPresets().catch(() => [])))
 
 function add() {
   rules.value.push({
@@ -13,7 +16,7 @@ function add() {
     name: `规则 ${rules.value.length + 1}`,
     enabled: true,
     when: { platform: '', author: '', title: '', kind: 'video', source: '', minSizeMb: 0 },
-    then: { addTags: [], favorite: false, moveTo: '', extractAudio: '', upload: false, notify: false },
+    then: { addTags: [], favorite: false, moveTo: '', extractAudio: '', upload: false, notify: false, normalize: '' },
   })
 }
 
@@ -71,6 +74,10 @@ function move(i: number, d: number) {
           <label>提取音频</label>
           <el-select v-model="r.then.extractAudio" size="small" clearable placeholder="不提取">
             <el-option value="mp3" label="MP3" /><el-option value="m4a" label="M4A" /><el-option value="flac" label="FLAC" /><el-option value="opus" label="Opus" />
+          </el-select>
+          <label>视频规整</label>
+          <el-select v-model="r.then.normalize" size="small" clearable placeholder="不规整">
+            <el-option v-for="p in presets" :key="p.id" :value="p.id" :label="p.name" />
           </el-select>
           <el-checkbox v-model="r.then.upload" size="small">上传（需先在“自动上传”里填好目标）</el-checkbox>
           <el-checkbox v-model="r.then.notify" size="small">推送一条通知</el-checkbox>

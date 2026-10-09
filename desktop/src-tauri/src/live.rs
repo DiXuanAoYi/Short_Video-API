@@ -42,6 +42,8 @@ pub struct LiveSettings {
     pub convert_mp4: bool,
     /// 录完后合并同一场的分段（需要转 MP4）
     pub merge_segments: bool,
+    /// 录完后按这个视频规整预设处理（见“工具箱 → 视频规整”）；留空不处理。会在录制文件旁边生成新文件，原文件保留
+    pub normalize: String,
     /// 保存目录；为空时为“下载目录 / 直播 / 主播名”
     pub dir: String,
     pub notify: bool,
@@ -106,6 +108,7 @@ impl Default for LiveSettings {
             segment_mb: 0,
             convert_mp4: false,
             merge_segments: false,
+            normalize: String::new(),
             dir: String::new(),
             notify: true,
             schedule: vec![],
@@ -121,6 +124,9 @@ impl LiveSettings {
         self.dir = self.dir.trim().to_string();
         if !self.convert_mp4 {
             self.merge_segments = false;
+        }
+        if crate::vidnorm::spec::preset(&self.normalize).is_none() {
+            self.normalize.clear();
         }
         self.schedule.retain(|w| parse_hhmm(&w.start).is_some() && parse_hhmm(&w.end).is_some() && w.start.trim() != w.end.trim());
         self.schedule.truncate(14);
@@ -648,11 +654,26 @@ async fn record_session(app: &AppHandle, id: i64, initial: Option<LiveStatus>, m
         r.rec_file = None;
     });
     emit(app);
+    let mut finals = files.clone();
     if !files.is_empty() && room.settings.convert_mp4 {
         let converted = post_process(&state, &files, room.settings.merge_segments).await;
         if let Ok(f) = converted {
             let size = f.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
             let _ = state.db.rec_update(rec_id, &f, size, status_name, true);
+            finals = f;
+        }
+    }
+    // 按预设规整录制文件：修正时间戳和音画不同步、统一响度等
+    if let Some(spec) = crate::vidnorm::spec::preset(&room.settings.normalize) {
+        for f in finals.iter().filter(|f| Path::new(f).is_file()) {
+            let job = crate::media_tools::ToolJob {
+                inputs: vec![f.clone()],
+                op: crate::media_tools::ToolOp::Normalize { spec: spec.clone(), preset: Some(room.settings.normalize.clone()) },
+                output_dir: None,
+            };
+            if let Err(e) = crate::media_tools::start(app, job) {
+                log::warn!("live recording normalize failed to start: {e}");
+            }
         }
     }
     if room.settings.notify {

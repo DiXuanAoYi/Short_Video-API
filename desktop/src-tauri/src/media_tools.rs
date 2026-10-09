@@ -78,6 +78,15 @@ pub enum ToolOp {
     Chapters {
         chapters: Vec<crate::model::Chapter>,
     },
+    /// 视频规整：把画面、帧率、色彩、声音统一成指定规格（见 `vidnorm`）。`preset` 只用于记录来自哪个预设
+    Normalize {
+        spec: crate::vidnorm::NormSpec,
+        preset: Option<String>,
+    },
+    /// 防抖。strength：light / normal / strong
+    Stabilize {
+        strength: String,
+    },
     /// 写入标签。None 表示不改，Some("") 表示清除
     Tags {
         title: Option<String>,
@@ -107,6 +116,8 @@ impl ToolOp {
             ToolOp::Mute => "去除音轨",
             ToolOp::Chapters { .. } => "写入章节",
             ToolOp::Tags { .. } => "音频标签",
+            ToolOp::Normalize { .. } => "视频规整",
+            ToolOp::Stabilize { .. } => "防抖",
         }
     }
 }
@@ -133,6 +144,18 @@ pub struct Encoders {
     pub opus: bool,
 }
 
+impl Encoders {
+    /// 加入试编码通过的硬件 H.264 编码器：有 x264 时仍用 x264；没有 x264 时硬件编码器排在 openh264 前面。
+    pub fn with_hardware(mut self, hw: Option<&'static str>) -> Encoders {
+        if let Some(hw) = hw {
+            if !matches!(self.h264, Some("libx264")) {
+                self.h264 = Some(hw);
+            }
+        }
+        self
+    }
+}
+
 pub fn parse_encoders(out: &str) -> Encoders {
     let has = |name: &str| out.lines().any(|l| l.split_whitespace().nth(1) == Some(name));
     Encoders {
@@ -157,38 +180,77 @@ pub async fn detect_encoders(ffmpeg: &Path) -> Encoders {
 }
 
 /// 视频编码方案：编码参数 + 适合的容器 + 对应的音频编码。
-struct VideoCodec {
-    args: Vec<String>,
+pub(crate) struct VideoCodec {
+    pub(crate) args: Vec<String>,
     /// 输出容器扩展名（要求 mp4 却没有 H.264 时改用 mkv）
-    ext: &'static str,
-    audio: Vec<String>,
-    note: Option<String>,
+    pub(crate) ext: &'static str,
+    pub(crate) audio: Vec<String>,
+    pub(crate) note: Option<String>,
+    /// 编码器要求的像素格式（滤镜链最后一个 format 用它）
+    pub(crate) pix: &'static str,
 }
 
-fn s(v: &[&str]) -> Vec<String> {
+pub(crate) fn s(v: &[&str]) -> Vec<String> {
     v.iter().map(|x| x.to_string()).collect()
 }
 
-fn video_codec(enc: &Encoders, quality: &str, want_ext: &str) -> VideoCodec {
+/// 按画面大小和帧率估一个目标码率（kbps）：`level` 0/1/2 对应小/均衡/高质量，每像素每帧约 0.045 / 0.075 / 0.12 比特。
+pub(crate) fn target_kbps(pixels_per_sec: f64, level: usize) -> u32 {
+    let bpp = [0.045, 0.075, 0.12][level.min(2)];
+    ((pixels_per_sec * bpp / 1000.0) as u32).clamp(600, 40_000)
+}
+
+/// 硬件 H.264 编码器的参数。
+fn hw_h264_args(name: &str, level: usize, kbps: u32) -> (Vec<String>, &'static str) {
+    let q = ["30", "25", "21"][level.min(2)];
+    let rate = format!("{kbps}k");
+    match name {
+        "h264_nvenc" => (s(&["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", q, "-b:v", "0", "-profile:v", "high"]), "yuv420p"),
+        "h264_qsv" => (s(&["-c:v", "h264_qsv", "-global_quality", q, "-preset", "medium", "-profile:v", "high"]), "nv12"),
+        "h264_amf" => (s(&["-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", q, "-qp_p", q, "-profile:v", "high"]), "yuv420p"),
+        // VideoToolbox 的质量参数在旧版本上不可用，统一用码率
+        _ => (s(&["-c:v", name, "-b:v", &rate, "-profile:v", "high", "-allow_sw", "1"]), "yuv420p"),
+    }
+}
+
+pub(crate) fn video_codec(enc: &Encoders, quality: &str, want_ext: &str) -> VideoCodec {
+    video_codec_for(enc, quality, want_ext, None)
+}
+
+/// `pixels_per_sec`（宽 × 高 × 帧率）已知时，码率型编码器（硬件编码器、openh264）按它估码率，否则用固定码率。
+pub(crate) fn video_codec_for(enc: &Encoders, quality: &str, want_ext: &str, pixels_per_sec: Option<f64>) -> VideoCodec {
     let level = match quality {
         "small" => 0,
         "high" => 2,
         _ => 1,
     };
     let aac = |k: &str| s(&["-c:a", "aac", "-b:a", k]);
+    let mp4_or_mkv = if want_ext == "mkv" { "mkv" } else { "mp4" };
     match enc.h264 {
         Some("libx264") => VideoCodec {
             args: [s(&["-c:v", "libx264", "-preset", "medium", "-crf", ["30", "25", "21"][level], "-pix_fmt", "yuv420p"])].concat(),
-            ext: if want_ext == "mkv" { "mkv" } else { "mp4" },
+            ext: mp4_or_mkv,
             audio: aac(["96k", "128k", "192k"][level]),
             note: None,
+            pix: "yuv420p",
         },
-        Some(_) => VideoCodec {
-            args: [s(&["-c:v", "libopenh264", "-b:v", ["900k", "2500k", "6000k"][level], "-pix_fmt", "yuv420p"])].concat(),
-            ext: if want_ext == "mkv" { "mkv" } else { "mp4" },
-            audio: aac(["96k", "128k", "192k"][level]),
-            note: None,
-        },
+        Some("libopenh264") => {
+            let rate = pixels_per_sec.map(|p| format!("{}k", target_kbps(p, level))).unwrap_or_else(|| ["900k", "2500k", "6000k"][level].to_string());
+            VideoCodec {
+                args: [s(&["-c:v", "libopenh264", "-b:v", &rate, "-pix_fmt", "yuv420p"])].concat(),
+                ext: mp4_or_mkv,
+                audio: aac(["96k", "128k", "192k"][level]),
+                note: None,
+                pix: "yuv420p",
+            }
+        }
+        Some(hw) => {
+            let kbps = pixels_per_sec.map(|p| target_kbps(p, level)).unwrap_or([900, 2500, 6000][level]);
+            let (args, pix) = hw_h264_args(hw, level, kbps);
+            VideoCodec {
+                args, ext: mp4_or_mkv, audio: aac(["96k", "128k", "192k"][level]), note: Some(format!("没有 x264，使用硬件编码器 {hw}。")), pix
+            }
+        }
         None if enc.vp9 => VideoCodec {
             args: [s(&[
                 "-c:v",
@@ -209,13 +271,15 @@ fn video_codec(enc: &Encoders, quality: &str, want_ext: &str) -> VideoCodec {
             .concat(),
             ext: "mkv",
             audio: if enc.opus { s(&["-c:a", "libopus", "-b:a", ["64k", "96k", "128k"][level]]) } else { aac("128k") },
-            note: Some("当前的 ffmpeg 没有 H.264 编码器，已改用 VP9 编码并保存为 MKV。要输出 H.264，请在“设置 → 组件”里导入完整版 ffmpeg。".into()),
+            note: Some("当前的 ffmpeg 没有 H.264 编码器，已改用 VP9 编码并保存为 MKV。要输出 H.264，请在“设置 → 组件”里安装完整版 ffmpeg。".into()),
+            pix: "yuv420p",
         },
         None => VideoCodec {
             args: [s(&["-c:v", "mpeg4", "-q:v", ["8", "5", "3"][level], "-pix_fmt", "yuv420p"])].concat(),
-            ext: if want_ext == "mkv" { "mkv" } else { "mp4" },
+            ext: mp4_or_mkv,
             audio: aac("128k"),
-            note: Some("当前的 ffmpeg 没有 H.264 和 VP9 编码器，已改用 MPEG-4 编码，压缩效果较差。".into()),
+            note: Some("当前的 ffmpeg 没有 H.264 和 VP9 编码器，已改用 MPEG-4 编码，压缩效果较差。在“设置 → 组件”里安装完整版 ffmpeg 可以解决。".into()),
+            pix: "yuv420p",
         },
     }
 }
@@ -263,7 +327,7 @@ fn stem_of(p: &Path) -> String {
     p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "output".into())
 }
 
-fn out_path(input: &Path, dir: Option<&Path>, tag: &str, ext: &str) -> PathBuf {
+pub(crate) fn out_path(input: &Path, dir: Option<&Path>, tag: &str, ext: &str) -> PathBuf {
     let dir = dir.map(Path::to_path_buf).or_else(|| input.parent().map(Path::to_path_buf)).unwrap_or_default();
     crate::naming::unique_path(dir.join(format!("{}.{tag}.{ext}", stem_of(input))), &|p: &Path| p.exists())
 }
@@ -272,7 +336,7 @@ fn path_arg(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
-fn muxer_args(ext: &str, out: &Path) -> Vec<String> {
+pub(crate) fn muxer_args(ext: &str, out: &Path) -> Vec<String> {
     let mut a = vec![];
     if ext == "mp4" || ext == "m4a" || ext == "mov" {
         a.extend(s(&["-movflags", "+faststart"]));
@@ -677,6 +741,7 @@ pub fn plan(job: &ToolJob, inputs: &[Input], enc: &Encoders) -> AppResult<Plan> 
             p.args = s(&["-i", &inp, "-i", &path_arg(&meta), "-map", "0", "-map_metadata", "0", "-map_chapters", "1", "-c", "copy"]);
             p.args.extend(muxer_args(ext, &p.output));
         }
+        ToolOp::Normalize { .. } | ToolOp::Stabilize { .. } => return Err(AppError::msg("视频规整和防抖由专用流程处理。")),
         ToolOp::Tags { title, artist, album, year, genre, comment, cover } => {
             if !first.probe.has_audio {
                 return Err(AppError::invalid("文件里没有音频。"));
@@ -1060,12 +1125,20 @@ pub fn start(app: &tauri::AppHandle, job: ToolJob) -> AppResult<u64> {
     let label = job.op.label();
     Ok(spawn_job(app, title, label, move |ctx| async move {
         let out = run_job(&ctx, &job).await?;
-        register_output(&ctx.app, &ctx.st, &job, &out).await;
+        // 视频规整发现素材已经符合规格时返回输入文件本身，没有新文件可登记
+        if !job.inputs.iter().any(|i| Path::new(i) == out) {
+            register_output(&ctx.app, &ctx.st, &job, &out).await;
+        }
         Ok(out)
     }))
 }
 
 async fn run_job(ctx: &JobCtx, job: &ToolJob) -> AppResult<PathBuf> {
+    match &job.op {
+        ToolOp::Normalize { spec, .. } => return crate::vidnorm::job::run_normalize(ctx, job, spec).await,
+        ToolOp::Stabilize { strength } => return crate::vidnorm::job::run_stabilize(ctx, job, strength).await,
+        _ => {}
+    }
     let st = &ctx.st;
     let ffmpeg = find_ffmpeg(st).ok_or_else(crate::postprocess::ffmpeg_missing)?;
     let mut inputs = vec![];
@@ -1077,7 +1150,7 @@ async fn run_job(ctx: &JobCtx, job: &ToolJob) -> AppResult<PathBuf> {
         }
         inputs.push(Input { path, probe: pr });
     }
-    let enc = detect_encoders(&ffmpeg).await;
+    let enc = st.vcaps.get(&ffmpeg).await.encoders.clone();
     let plan = plan(job, &inputs, &enc)?;
     if let Some(n) = &plan.note {
         ctx.note(n.clone());
