@@ -98,12 +98,12 @@ impl Graph {
     }
 
     /// 等比放进 w×h，两侧或上下用同一画面放大后模糊的背景补满。
-    fn blur_fill(&mut self, w: u32, h: u32) {
+    fn blur_fill(&mut self, w: u32, h: u32, blur: &str) {
         self.n += 1;
         let (a, b, bg, fg) = (format!("b{}a", self.n), format!("b{}b", self.n), format!("b{}g", self.n), format!("b{}f", self.n));
         self.push(&format!("split[{a}][{b}]"));
         self.stmts.push(std::mem::take(&mut self.chain));
-        self.stmts.push(format!("[{a}]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},boxblur=25:5[{bg}]"));
+        self.stmts.push(format!("[{a}]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},{blur}[{bg}]"));
         self.stmts.push(format!("[{b}]scale={w}:{h}:force_original_aspect_ratio=decrease[{fg}]"));
         self.chain = format!("[{bg}][{fg}]overlay=(W-w)/2:(H-h)/2");
         self.fresh = false;
@@ -432,7 +432,7 @@ pub fn video_graph(spec: &NormSpec, facts: &Facts, an: &Analysis, caps: &Caps, t
     match op {
         SizeOp::None => {}
         SizeOp::Filter(f) => g.push(&f),
-        SizeOp::Blur(tw, th) => g.blur_fill(tw, th),
+        SizeOp::Blur(tw, th) => g.blur_fill(tw, th, caps.background_blur()),
     }
     if shrinks {
         denoise_push(&mut g, &mut out);
@@ -549,7 +549,7 @@ const GRAPH_INLINE_MAX: usize = 12_000;
 
 /// 传滤镜图的参数。分段色彩匹配的镜头很多时滤镜图会很长，Windows 的命令行上限约 32K 字符，
 /// 所以长的滤镜图写进临时文件再让 ffmpeg 去读：新版（7.0 起）是 `-/filter_complex 文件`，旧版是 `-filter_complex_script 文件`。
-fn graph_args(graph: &str, caps: &Caps, tmp: &Path) -> AppResult<Vec<String>> {
+pub(crate) fn graph_args(graph: &str, caps: &Caps, tmp: &Path) -> AppResult<Vec<String>> {
     if graph.len() <= GRAPH_INLINE_MAX {
         return Ok(s(&["-filter_complex", graph]));
     }
@@ -569,7 +569,7 @@ fn replace_arg(args: &mut [String], key: &str, value: &str) {
 }
 
 /// HEVC 编码参数：(参数, 像素格式)。没有可用的 HEVC 编码器时返回 None。
-fn hevc_args(caps: &Caps, level: usize, kbps: u32) -> Option<(Vec<String>, &'static str)> {
+pub(crate) fn hevc_args(caps: &Caps, level: usize, kbps: u32) -> Option<(Vec<String>, &'static str)> {
     let name = caps.hevc?;
     let q = |a: [&str; 3]| a[level.min(2)].to_string();
     let rate = format!("{}k", (f64::from(kbps) * 0.65) as u32);

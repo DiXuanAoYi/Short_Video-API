@@ -136,6 +136,12 @@ function toNormalize() {
   app.goToolbox([props.item.path], undefined, { tab: 'normalize', hint })
 }
 
+function toEdit() {
+  if (!props.item) return
+  emit('update:modelValue', false)
+  app.goToolbox([props.item.path], undefined, { tab: 'edit' })
+}
+
 function toAi(aiMode: 'transcribe' | 'translate' | 'summarize') {
   if (!props.item) return
   emit('update:modelValue', false)
@@ -164,6 +170,7 @@ function cover(i: LibraryItem) {
         <el-button v-if="item.sourceUrl" size="small" @click="copyUrl">复制原链接</el-button>
         <el-button v-if="item.exists && (item.kind === 'video' || item.kind === 'audio')" size="small" @click="toTools">用工具箱处理…</el-button>
         <el-button v-if="item.exists && item.kind === 'video'" size="small" @click="toNormalize">视频规整…</el-button>
+        <el-button v-if="item.exists && item.kind === 'video'" size="small" @click="toEdit">放进剪辑…</el-button>
         <el-button v-if="item.exists && (item.kind === 'video' || item.kind === 'audio')" size="small" @click="toAi('transcribe')">语音转文字</el-button>
         <template v-if="item.exists && item.kind === 'subtitle' && !item.path.endsWith('.xml')">
           <el-button size="small" @click="toAi('translate')">翻译字幕</el-button>

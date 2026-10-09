@@ -218,6 +218,11 @@ fn mime_for(p: &Path) -> &'static str {
         Some("flac") => "audio/flac",
         Some("wav") => "audio/wav",
         Some("ogg" | "opus") => "audio/ogg",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        Some("bmp") => "image/bmp",
         _ => "application/octet-stream",
     }
 }

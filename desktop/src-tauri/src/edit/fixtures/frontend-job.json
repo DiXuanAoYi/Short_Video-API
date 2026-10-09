@@ -1,0 +1,112 @@
+{
+  "op": "edit",
+  "project": {
+    "title": "",
+    "clips": [
+      {
+        "id": 1,
+        "path": "/media/red.webm",
+        "kind": "video",
+        "inMs": 0,
+        "outMs": 1500,
+        "speed": 1,
+        "volume": 1.05,
+        "mute": false,
+        "fadeInMs": 0,
+        "fadeOutMs": 0,
+        "rotate": 0,
+        "flipH": false,
+        "flipV": false,
+        "brightness": 0,
+        "contrast": 1,
+        "saturation": 1,
+        "transition": null
+      },
+      {
+        "id": 3,
+        "path": "/media/red.webm",
+        "kind": "video",
+        "inMs": 1500,
+        "outMs": 4000,
+        "speed": 1,
+        "volume": 1,
+        "mute": false,
+        "fadeInMs": 0,
+        "fadeOutMs": 0,
+        "rotate": 0,
+        "flipH": false,
+        "flipV": false,
+        "brightness": 0,
+        "contrast": 1,
+        "saturation": 1,
+        "transition": {
+          "kind": "fade",
+          "durationMs": 500
+        }
+      },
+      {
+        "id": 2,
+        "path": "/media/green.webm",
+        "kind": "video",
+        "inMs": 0,
+        "outMs": 5003,
+        "speed": 1,
+        "volume": 1,
+        "mute": false,
+        "fadeInMs": 0,
+        "fadeOutMs": 0,
+        "rotate": 0,
+        "flipH": false,
+        "flipV": false,
+        "brightness": 0,
+        "contrast": 1,
+        "saturation": 1,
+        "transition": null
+      }
+    ],
+    "texts": [
+      {
+        "id": 4,
+        "text": "你好 Hello",
+        "startMs": 500,
+        "endMs": 3500,
+        "x": 0.3,
+        "y": 0.25,
+        "size": 6,
+        "color": "#FFFFFF",
+        "opacity": 1,
+        "outline": true,
+        "outlineColor": "#000000",
+        "boxed": false,
+        "boxColor": "#000000",
+        "boxOpacity": 0.5,
+        "font": null
+      }
+    ],
+    "audio": [
+      {
+        "id": 5,
+        "path": "/media/music.ogg",
+        "startMs": 5000,
+        "inMs": 0,
+        "outMs": null,
+        "volume": 1,
+        "fadeInMs": 0,
+        "fadeOutMs": 0,
+        "looped": false,
+        "duck": false
+      }
+    ],
+    "out": {
+      "width": 0,
+      "height": 0,
+      "fps": 0,
+      "fit": "contain",
+      "quality": "balanced",
+      "codec": "h264",
+      "format": "mp4"
+    }
+  },
+  "inputs": [],
+  "outputDir": null
+}

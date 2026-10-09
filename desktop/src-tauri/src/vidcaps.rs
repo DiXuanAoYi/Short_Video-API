@@ -36,6 +36,16 @@ impl Caps {
         self.filters.contains(name)
     }
 
+    /// “模糊背景”用的模糊滤镜。`boxblur` 是 GPL 滤镜，精简版（LGPL）ffmpeg 里没有，改用 `gblur`
+    /// （σ≈30 和 `boxblur=25:5` 的模糊程度接近）；两个都没探测到时保持 `boxblur`，让 ffmpeg 自己报错。
+    pub fn background_blur(&self) -> &'static str {
+        if !self.has_filter("boxblur") && self.has_filter("gblur") {
+            "gblur=sigma=30"
+        } else {
+            "boxblur=25:5"
+        }
+    }
+
     /// `-fps_mode` 从 5.1 开始提供，更早的版本只能用 `-vsync`。
     pub fn has_fps_mode(&self) -> bool {
         self.major == 0 || (self.major, self.minor) >= (5, 1)
@@ -271,6 +281,14 @@ pub async fn current(st: &crate::AppState) -> Option<(PathBuf, Arc<Caps>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blurred_backgrounds_fall_back_to_gblur_when_boxblur_is_missing() {
+        let with = |names: &[&str]| Caps { filters: names.iter().map(|n| n.to_string()).collect(), ..Default::default() };
+        assert_eq!(with(&["boxblur", "gblur"]).background_blur(), "boxblur=25:5");
+        assert_eq!(with(&["gblur", "avgblur"]).background_blur(), "gblur=sigma=30", "精简版 ffmpeg 没有 boxblur");
+        assert_eq!(with(&[]).background_blur(), "boxblur=25:5", "没探测到任何滤镜时保持原来的写法");
+    }
 
     #[test]
     fn versions() {

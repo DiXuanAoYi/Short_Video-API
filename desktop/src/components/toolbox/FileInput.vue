@@ -14,6 +14,13 @@ const props = defineProps<{
   /** 媒体库里只列出这些类型 */
   kinds?: string[]
   label?: string
+  /** 只显示按钮，不列出已选的文件（选完马上交给调用方处理的场景） */
+  compact?: boolean
+  /** 按钮上的字（默认“选择文件…”和“从媒体库选择…”） */
+  browseText?: string
+  libraryText?: string
+  /** 两个按钮都用普通样式（页面上已经有更主要的操作时） */
+  plain?: boolean
 }>()
 const emit = defineEmits<{ 'update:modelValue': [paths: string[]] }>()
 
@@ -86,12 +93,12 @@ function move(i: number, d: number) {
 <template>
   <div class="fi">
     <div class="bar">
-      <el-button size="small" type="primary" @click="browse">选择{{ multiple ? '多个' : '' }}文件…</el-button>
-      <el-button size="small" @click="openPicker">从媒体库选择…</el-button>
-      <el-button v-if="modelValue.length" link size="small" @click="emit('update:modelValue', [])">清空</el-button>
+      <el-button size="small" :type="plain ? undefined : 'primary'" @click="browse">{{ browseText ?? `选择${multiple ? '多个' : ''}文件…` }}</el-button>
+      <el-button size="small" @click="openPicker">{{ libraryText ?? '从媒体库选择…' }}</el-button>
+      <el-button v-if="modelValue.length && !compact" link size="small" @click="emit('update:modelValue', [])">清空</el-button>
     </div>
-    <div v-if="!modelValue.length" class="mute hint">{{ label ? `请选择${label}` : '请选择文件' }}，也可以在媒体库的“详情”里点“用工具箱处理”。</div>
-    <div v-for="(p, i) in modelValue" :key="p" class="file">
+    <div v-if="!modelValue.length && !compact" class="mute hint">{{ label ? `请选择${label}` : '请选择文件' }}，也可以在媒体库的“详情”里点“用工具箱处理”。</div>
+    <div v-for="(p, i) in compact ? [] : modelValue" :key="p" class="file">
       <span class="ellipsis selectable" :title="p">{{ name(p) }}</span>
       <span class="ops">
         <template v-if="multiple && modelValue.length > 1">

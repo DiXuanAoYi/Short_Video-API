@@ -10,6 +10,7 @@ pub mod cookies;
 pub mod db;
 pub mod diagnostics;
 pub mod download;
+pub mod edit;
 pub mod engine;
 pub mod error;
 pub mod i18n;
@@ -509,6 +510,14 @@ pub fn run() {
             media_cmds::video_analyze,
             media_cmds::video_color,
             media_cmds::video_preview,
+            edit::cmds::edit_probe,
+            edit::cmds::edit_thumb,
+            edit::cmds::edit_preview_url,
+            edit::cmds::edit_preview_start,
+            edit::cmds::edit_save,
+            edit::cmds::edit_open,
+            edit::cmds::edit_missing,
+            edit::cmds::edit_fonts,
             lut::cmds::lut_looks,
             lut::cmds::lut_inspect,
             lut::cmds::lut_sample,

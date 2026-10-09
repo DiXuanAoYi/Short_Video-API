@@ -5,7 +5,7 @@ import type { AppInfo, ErrorKind, HistoryItem, LockStatus, MediaInfo, Settings, 
 
 export type ViewName = 'parse' | 'queue' | 'subs' | 'live' | 'library' | 'tools' | 'safebox' | 'settings'
 export type LibraryTab = 'files' | 'inbox' | 'history'
-export type ToolboxTab = 'video' | 'normalize' | 'lut' | 'subtitle' | 'tags' | 'ai'
+export type ToolboxTab = 'video' | 'normalize' | 'edit' | 'lut' | 'subtitle' | 'tags' | 'ai'
 export type SettingsTab = 'download' | 'parse' | 'network' | 'accounts' | 'phone' | 'ai' | 'automation' | 'security' | 'components' | 'diagnostics' | 'general'
 
 /** 设置、主题与当前页面。 */

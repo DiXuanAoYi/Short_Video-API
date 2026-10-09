@@ -284,6 +284,7 @@ export type ToolOp =
   | { op: 'chapters'; chapters: Chapter[] }
   | { op: 'normalize'; spec: NormSpec; preset?: string | null }
   | { op: 'stabilize'; strength: 'light' | 'normal' | 'strong' }
+  | { op: 'edit'; project: EditProject }
   | { op: 'tags'; title?: string | null; artist?: string | null; album?: string | null; year?: string | null; genre?: string | null; comment?: string | null; cover?: string | null }
 
 export type ToolJob = ToolOp & { inputs: string[]; outputDir?: string | null }
@@ -1239,4 +1240,101 @@ export interface LutSaved {
   path: string
   size: number
   bytes: number
+}
+
+// ---------- 剪辑 ----------
+
+export interface EditTransition {
+  kind: string
+  durationMs: number
+}
+
+export interface EditClip {
+  id: number
+  path: string
+  kind: 'video' | 'image'
+  inMs: number
+  outMs: number
+  speed: number
+  volume: number
+  mute: boolean
+  fadeInMs: number
+  fadeOutMs: number
+  rotate: 0 | 90 | 180 | 270
+  flipH: boolean
+  flipV: boolean
+  brightness: number
+  contrast: number
+  saturation: number
+  transition: EditTransition | null
+}
+
+export interface EditText {
+  id: number
+  text: string
+  startMs: number
+  endMs: number
+  x: number
+  y: number
+  size: number
+  color: string
+  opacity: number
+  outline: boolean
+  outlineColor: string
+  boxed: boolean
+  boxColor: string
+  boxOpacity: number
+  font: string | null
+}
+
+export interface EditAudio {
+  id: number
+  path: string
+  startMs: number
+  inMs: number
+  outMs: number | null
+  volume: number
+  fadeInMs: number
+  fadeOutMs: number
+  looped: boolean
+  duck: boolean
+}
+
+export interface EditOutput {
+  width: number
+  height: number
+  fps: number
+  fit: 'contain' | 'cover' | 'blur'
+  quality: 'small' | 'balanced' | 'high'
+  codec: 'h264' | 'hevc'
+  format: 'mp4' | 'mkv'
+}
+
+export interface EditProject {
+  title: string
+  clips: EditClip[]
+  texts: EditText[]
+  audio: EditAudio[]
+  out: EditOutput
+}
+
+/** 素材文件的信息（`edit_probe`） */
+export interface EditSource {
+  path: string
+  name: string
+  kind: 'video' | 'audio' | 'image'
+  durationMs: number | null
+  width: number
+  height: number
+  fps: number | null
+  hasVideo: boolean
+  hasAudio: boolean
+  hdr: boolean
+  thumb: string | null
+  url: string
+}
+
+export interface OpenedEdit {
+  project: EditProject
+  missing: string[]
 }
