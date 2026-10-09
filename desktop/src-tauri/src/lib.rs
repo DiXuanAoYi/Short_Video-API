@@ -325,11 +325,6 @@ pub fn run() {
             library_cmds::spawn_maintenance(&handle);
             security::spawn_idle_watch(&handle);
             security::apply_window_protection(&handle, settings.security.content_protection);
-            // Windows：悬浮窗不需要拖动边缘改大小（配置里的 resizable 只是为了让 Linux 接受 set_size）
-            #[cfg(windows)]
-            if let Some(w) = app.get_webview_window("float") {
-                let _ = w.set_resizable(false);
-            }
             tray::apply_float(&handle, settings.float_ball && !locked);
             spawn_account_reminders(handle.clone());
 
@@ -356,30 +351,19 @@ pub fn run() {
             }
             Ok(())
         })
-        .on_page_load(|webview, payload| {
-            if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
-                tray::on_small_window_loaded(webview.app_handle(), webview.label());
-            }
-        })
         .on_window_event(|window, event| {
+            // 迷你窗、悬浮拖拽窗是按需创建的，关闭就是销毁，不用拦截
             if let WindowEvent::CloseRequested { api, .. } = event {
-                match window.label() {
-                    "main" => {
-                        let app = window.app_handle();
-                        let to_tray = app.state::<Arc<AppState>>().settings().close_to_tray;
-                        if to_tray {
-                            api.prevent_close();
-                            let _ = window.hide();
-                            security::on_hide(app);
-                        } else {
-                            app.exit(0);
-                        }
-                    }
-                    "mini" | "float" => {
+                if window.label() == "main" {
+                    let app = window.app_handle();
+                    let to_tray = app.state::<Arc<AppState>>().settings().close_to_tray;
+                    if to_tray {
                         api.prevent_close();
                         let _ = window.hide();
+                        security::on_hide(app);
+                    } else {
+                        app.exit(0);
                     }
-                    _ => {}
                 }
             }
         })
@@ -529,6 +513,7 @@ pub fn run() {
             commands::open_url,
             commands::show_main,
             commands::hide_mini,
+            commands::mini_ready,
             commands::open_login,
             commands::save_login_cookies,
             commands::check_update,

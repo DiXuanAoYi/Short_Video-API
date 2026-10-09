@@ -259,7 +259,10 @@ fn tonemap_chain(v: &VideoFacts, caps: &Caps, tmp: &Path, g: &mut VideoGraph) ->
             return None;
         }
         g.temp_files.push(path.clone());
-        g.warnings.push("当前的 ffmpeg 没有 zscale，HDR 转 SDR 使用了程序内置的色调映射（3D LUT），效果接近。安装完整版 ffmpeg 可以用 zscale。".into());
+        g.warnings.push(format!(
+            "当前的 ffmpeg 没有 zscale，HDR 转 SDR 使用了程序内置的色调映射（3D LUT），效果接近。{}",
+            if caps.gpl { "" } else { "安装完整版 ffmpeg 可以用 zscale。" }
+        ));
         g.notes.push(format!("{} 转 SDR（内置 3D LUT 色调映射）", v.hdr.label()));
         return Some(format!(
             "scale=in_color_matrix=bt2020:in_range=tv,format=gbrp16le,lut3d=file={}:interp=tetrahedral,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p",
@@ -510,12 +513,23 @@ pub fn build(input: &Path, spec: &NormSpec, facts: &Facts, an: &Analysis, caps: 
     let mut tag_patch = false;
     if reencode {
         let (w, h) = (vg.out_w.max(2), vg.out_h.max(2));
+        let color_tag = out_color(v, vg.out_h, spec.fix_color, vg.reasons.contains(&"hdr")).filter(|_| v.hdr == Hdr::None || vg.reasons.contains(&"hdr"));
+        // 新版 ffmpeg（2026 年的开发版）不再用 -color_primaries / -color_trc 给输出写标记，只认画面上的标记；
+        // 没有别的滤镜时也要走一遍 setparams，否则这两项会被写成 unknown。
+        if vg.graph.is_none() {
+            if let Some(tag) = color_tag {
+                vg.graph = Some(format!("[0:v:0]setparams=colorspace={tag}:color_primaries={tag}:color_trc={tag}:range=tv[v]"));
+            }
+        }
         let fps = vg.out_fps.or(v.fps).unwrap_or(30.0).clamp(1.0, 240.0);
         let pps = f64::from(w) * f64::from(h) * fps;
         let want_hevc = spec.codec == "hevc";
         let hevc = if want_hevc { hevc_args(caps, level, target_kbps(pps, level)) } else { None };
         if want_hevc && hevc.is_none() {
-            plan.warnings.push("当前的 ffmpeg 没有 HEVC 编码器，已改用 H.264。在“设置 → 组件”里安装完整版 ffmpeg 可以使用 libx265。".into());
+            plan.warnings.push(format!(
+                "当前的 ffmpeg 没有 HEVC 编码器，已改用 H.264。{}",
+                if caps.gpl { "" } else { "在“设置 → 组件”里安装完整版 ffmpeg 可以使用 libx265。" }
+            ));
         }
         // 重新编码的画质要比“压缩”高一档
         let q_for_codec = match spec.quality.as_str() {
@@ -550,7 +564,7 @@ pub fn build(input: &Path, spec: &NormSpec, facts: &Facts, an: &Analysis, caps: 
         if vg.out_fps == v.fps && an.vfr.as_ref().is_some_and(|f| f.variable) && spec.fps == "keep" {
             a.extend(if caps.has_fps_mode() { s(&["-fps_mode", "vfr"]) } else { s(&["-vsync", "vfr"]) });
         }
-        if let Some(tag) = out_color(v, vg.out_h, spec.fix_color, vg.reasons.contains(&"hdr")).filter(|_| v.hdr == Hdr::None || vg.reasons.contains(&"hdr")) {
+        if let Some(tag) = color_tag {
             a.extend(s(&["-colorspace", tag, "-color_primaries", tag, "-color_trc", tag, "-color_range", "tv"]));
         }
         if v.rotation != 0 {

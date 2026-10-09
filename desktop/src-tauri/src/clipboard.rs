@@ -30,6 +30,39 @@ pub struct AutoResult {
     pub message: String,
 }
 
+/// 迷你窗是用到时才创建的，页面加载好之前发出的事件它收不到；最近一次的链接和自动下载结果记在这里，
+/// 迷你窗页面准备好后用 `mini_ready` 取走。
+#[derive(Default)]
+struct MiniMemory {
+    link: Option<ClipboardLink>,
+    result: Option<AutoResult>,
+}
+
+static MINI_MEMORY: std::sync::Mutex<MiniMemory> = std::sync::Mutex::new(MiniMemory { link: None, result: None });
+
+/// 迷你窗页面刚加载好时需要的内容。
+#[derive(Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MiniState {
+    pub link: Option<ClipboardLink>,
+    pub result: Option<AutoResult>,
+}
+
+pub fn take_mini_state() -> MiniState {
+    let m = MINI_MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    MiniState { link: m.link.clone(), result: m.result.clone() }
+}
+
+pub fn forget_mini_state() {
+    let mut m = MINI_MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    m.link = None;
+    m.result = None;
+}
+
+fn remember_result(r: &AutoResult) {
+    MINI_MEMORY.lock().unwrap_or_else(|e| e.into_inner()).result = Some(r.clone());
+}
+
 pub fn start_watcher(app: AppHandle) {
     std::thread::spawn(move || {
         // 启动时剪贴板里已有的内容不触发
@@ -94,6 +127,7 @@ pub(crate) fn on_links(app: &AppHandle, text: String, links: Vec<DetectedLink>, 
                         Err(e) => AutoResult { url: link.url, ok: false, message: e.to_string() },
                     },
                 };
+                remember_result(&payload);
                 let _ = app.emit(EVT_AUTO_RESULT, payload);
             });
         }
@@ -102,7 +136,13 @@ pub(crate) fn on_links(app: &AppHandle, text: String, links: Vec<DetectedLink>, 
 
 /// 通知前端识别到链接；主窗口不在前台时弹出迷你窗。
 pub(crate) fn notify_links(app: &AppHandle, text: String, links: Vec<DetectedLink>) {
-    let _ = app.emit(EVT_CLIPBOARD, ClipboardLink { text, links });
+    let payload = ClipboardLink { text, links };
+    {
+        let mut m = MINI_MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+        m.link = Some(payload.clone());
+        m.result = None;
+    }
+    let _ = app.emit(EVT_CLIPBOARD, payload);
     if !tray::main_is_focused(app) {
         tray::show_mini(app);
     }

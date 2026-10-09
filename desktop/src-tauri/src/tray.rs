@@ -1,18 +1,18 @@
 //! 系统托盘、主窗口 / 迷你窗的显示控制。
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, LogicalSize, Manager, PhysicalPosition, WebviewWindow, Wry};
+use tauri::{AppHandle, LogicalSize, Manager, PhysicalPosition, Wry};
 
 use crate::{clipboard, AppState};
 
-/// 与 tauri.conf.json 中 mini 窗口的尺寸一致
+/// 迷你窗的尺寸（逻辑像素）
 const MINI_W: f64 = 320.0;
 const MINI_H: f64 = 196.0;
-/// 与 tauri.conf.json 中 float 窗口的尺寸一致
+/// 悬浮拖拽窗的尺寸（逻辑像素）
 const FLOAT_W: f64 = 156.0;
 const FLOAT_H: f64 = 64.0;
 
@@ -101,9 +101,7 @@ pub fn show_main(app: &AppHandle) {
         let _ = w.show();
         let _ = w.set_focus();
     }
-    if let Some(m) = app.get_webview_window("mini") {
-        let _ = m.hide();
-    }
+    close_mini(app);
 }
 
 /// 托盘提示里的速度，例如 `3.2 MB/s`。
@@ -140,7 +138,6 @@ pub fn spawn_speed_ticker(app: &AppHandle) {
         let mut last = String::new();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            hide_stray_small_windows(&app);
             let st = app.state::<Arc<AppState>>();
             let snaps = st.downloads.snapshots();
             let running: Vec<_> = snaps.iter().filter(|s| s.status == crate::download::TaskStatus::Running).collect();
@@ -164,9 +161,6 @@ pub fn main_is_focused(app: &AppHandle) -> bool {
     app.get_webview_window("main").map(|w| w.is_visible().unwrap_or(false) && w.is_focused().unwrap_or(false)).unwrap_or(false)
 }
 
-/// 迷你窗这次运行里是否被程序主动显示过。没显示过却出现在屏幕上的，一律收起来。
-static MINI_SHOWN: AtomicBool = AtomicBool::new(false);
-
 /// 工作区右下角的位置：窗口右边缘、下边缘离工作区边缘 `right`、`bottom`（物理像素）。
 /// `area` 是工作区的 (x, y, 宽, 高)，`size` 是窗口的物理尺寸。
 fn corner_position(area: (i32, i32, u32, u32), size: (u32, u32), right: i32, bottom: i32) -> (i32, i32) {
@@ -174,105 +168,162 @@ fn corner_position(area: (i32, i32, u32, u32), size: (u32, u32), right: i32, bot
     (x + w as i32 - size.0 as i32 - right, y + h as i32 - size.1 as i32 - bottom)
 }
 
-/// 窗口所在屏幕右下角的位置（边距按逻辑像素给）。
-fn corner_of(w: &WebviewWindow, size: LogicalSize<f64>, right: f64, bottom: f64) -> Option<(i32, i32)> {
-    let monitor = w.current_monitor().ok().flatten().or_else(|| w.primary_monitor().ok().flatten())?;
+/// 小窗（迷你窗、悬浮拖拽窗）的创建参数。
+struct SmallWindow {
+    label: &'static str,
+    title: &'static str,
+    url: &'static str,
+    width: f64,
+    height: f64,
+    /// 窗口右边缘、下边缘离工作区边缘的距离（逻辑像素）
+    right: f64,
+    bottom: f64,
+    /// 关掉 Tauri 自己接管的文件拖放，让页面能收到浏览器拖来的链接
+    page_handles_drops: bool,
+    /// 能不能拖动边缘改大小。Linux 上不可调整大小的窗口会忽略设定的尺寸、按页面的最小尺寸来，
+    /// 所以悬浮窗在 Linux / macOS 上要保持“可调整”，并给出最小尺寸；Windows 上不需要
+    resizable: bool,
+    min_size: Option<(f64, f64)>,
+}
+
+const MINI: SmallWindow = SmallWindow {
+    label: "mini",
+    title: "清影",
+    url: "index.html#mini",
+    width: MINI_W,
+    height: MINI_H,
+    right: 16.0,
+    bottom: 16.0,
+    page_handles_drops: false,
+    resizable: false,
+    min_size: None,
+};
+const FLOAT: SmallWindow = SmallWindow {
+    label: "float",
+    title: "清影拖拽区",
+    url: "index.html#float",
+    width: FLOAT_W,
+    height: FLOAT_H,
+    right: 24.0,
+    bottom: MINI_H + 40.0,
+    page_handles_drops: true,
+    resizable: cfg!(not(windows)),
+    min_size: Some((120.0, 48.0)),
+};
+
+/// 正在创建中的小窗，避免连续触发时建出两个。
+static CREATING: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+
+/// 窗口右下角的位置（逻辑像素）和对应的物理像素位置：在主窗口所在的屏幕，没有就用主屏幕。
+fn corner_for(app: &AppHandle, size: LogicalSize<f64>, right: f64, bottom: f64) -> Option<((f64, f64), (i32, i32))> {
+    let monitor = app.get_webview_window("main").and_then(|w| w.current_monitor().ok().flatten()).or_else(|| app.primary_monitor().ok().flatten())?;
     let scale = monitor.scale_factor();
     let phys = size.to_physical::<u32>(scale);
     let area = monitor.work_area();
-    Some(corner_position(
+    let (x, y) = corner_position(
         (area.position.x, area.position.y, area.size.width, area.size.height),
         (phys.width, phys.height),
         (right * scale) as i32,
         (bottom * scale) as i32,
-    ))
+    );
+    Some(((f64::from(x) / scale, f64::from(y) / scale), (x, y)))
 }
 
-/// 在指定位置显示小窗（不抢焦点）。
-///
-/// Windows 上窗口第一次显示时，可能把位置改回系统默认的左上角、忽略显示前设置的尺寸，
-/// 还会把原生标题栏的样式带回来，所以显示前后各放一次位置和尺寸，显示后再去掉标题栏样式。
-fn show_at(w: &WebviewWindow, pos: Option<(i32, i32)>, size: LogicalSize<f64>) {
-    let place = || {
-        if let Some((x, y)) = pos {
-            let _ = w.set_position(PhysicalPosition::new(x, y));
+/// 迷你窗、悬浮拖拽窗不再写在配置里预先建成隐藏窗口，而是用到时才创建、不用了就销毁：
+/// 隐藏着的窗口在 Windows 上出现过自己冒出来、带着原生标题栏停在左上角的情况，不存在的窗口不会有这个问题。
+/// 创建时就把位置、尺寸、无边框、置顶等参数定好，不依赖“先建好再显示再改位置”。
+fn ensure_small_window(app: &AppHandle, spec: &'static SmallWindow) {
+    if app.get_webview_window(spec.label).is_some() {
+        return;
+    }
+    {
+        let mut busy = CREATING.lock().unwrap_or_else(|e| e.into_inner());
+        if busy.contains(&spec.label) {
+            return;
         }
-        let _ = w.set_size(size);
-    };
-    place();
-    let _ = w.show();
-    crate::winframe::strip_caption(w);
-    place();
+        busy.push(spec.label);
+    }
+    let app = app.clone();
+    // 创建窗口要等界面线程响应，放到单独的线程里做，调用方（可能就在界面线程上）不会被卡住
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = build_small_window(&app, spec);
+        CREATING.lock().unwrap_or_else(|e| e.into_inner()).retain(|l| *l != spec.label);
+        if let Err(e) = result {
+            log::warn!("创建{}失败：{e}", spec.title);
+        }
+    });
 }
 
-/// 显示或隐藏悬浮拖拽窗；首次显示时放在屏幕右侧、迷你窗上方。
+fn build_small_window(app: &AppHandle, spec: &SmallWindow) -> tauri::Result<()> {
+    use tauri::{WebviewUrl, WebviewWindowBuilder};
+    let size = LogicalSize::new(spec.width, spec.height);
+    let corner = corner_for(app, size, spec.right, spec.bottom);
+    let protected = app.try_state::<Arc<AppState>>().is_some_and(|st| st.settings_raw().security.content_protection);
+    let mut builder = WebviewWindowBuilder::new(app, spec.label, WebviewUrl::App(spec.url.into()))
+        .title(spec.title)
+        .inner_size(spec.width, spec.height)
+        .resizable(spec.resizable)
+        .decorations(false)
+        .shadow(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .focused(false)
+        .content_protected(protected);
+    if spec.page_handles_drops {
+        builder = builder.disable_drag_drop_handler();
+    }
+    if let Some((w, h)) = spec.min_size {
+        builder = builder.min_inner_size(w, h);
+    }
+    if let Some(((x, y), _)) = corner {
+        builder = builder.position(x, y);
+    }
+    let window = builder.build()?;
+    crate::winframe::guard(&window);
+    if let Some((_, (x, y))) = corner {
+        // 创建时给的是逻辑坐标，跨屏、不同缩放比例时可能有偏差，创建好后再按物理像素放一次
+        let _ = window.set_position(PhysicalPosition::new(x, y));
+    }
+    Ok(())
+}
+
+/// 显示或隐藏悬浮拖拽窗；显示时放在屏幕右侧、迷你窗上方。
 pub fn apply_float(app: &AppHandle, on: bool) {
-    let Some(w) = app.get_webview_window("float") else { return };
     if !on {
-        let _ = w.hide();
+        close_small_window(app, FLOAT.label);
         return;
     }
     if app.try_state::<Arc<AppState>>().is_some_and(|st| crate::security::status(&st).locked) {
         return;
     }
-    let size = LogicalSize::new(FLOAT_W, FLOAT_H);
-    let pos = if w.is_visible().unwrap_or(false) { None } else { corner_of(&w, size, 24.0, MINI_H + 40.0) };
-    show_at(&w, pos, size);
+    ensure_small_window(app, &FLOAT);
 }
 
-/// 在屏幕右下角显示迷你窗（不抢焦点）。
+/// 在屏幕右下角显示迷你窗（不抢焦点）。窗口刚创建时页面还没加载好，它的内容由页面加载后调用 `mini_ready` 取走。
 pub fn show_mini(app: &AppHandle) {
     // 锁定时迷你窗会露出任务标题，不显示
     if app.try_state::<Arc<AppState>>().is_some_and(|st| crate::security::status(&st).locked) {
         return;
     }
-    let Some(w) = app.get_webview_window("mini") else { return };
-    let size = LogicalSize::new(MINI_W, MINI_H);
-    MINI_SHOWN.store(true, Ordering::SeqCst);
-    show_at(&w, corner_of(&w, size, 16.0, 16.0), size);
+    ensure_small_window(app, &MINI);
 }
 
-/// 迷你窗、悬浮拖拽窗是配置里预先建好的隐藏窗口：页面第一次加载完成时，没有理由显示的就收起来，
-/// 不让它们出现在启动时的屏幕上。
-pub fn on_small_window_loaded(app: &AppHandle, label: &str) {
-    match label {
-        "mini" if !MINI_SHOWN.load(Ordering::SeqCst) => {
-            if let Some(w) = app.get_webview_window("mini") {
-                let _ = w.hide();
-            }
-        }
-        "float" => {
-            if let Some(st) = app.try_state::<Arc<AppState>>() {
-                let want = st.settings_raw().float_ball && !crate::security::status(&st).locked;
-                if !want {
-                    apply_float(app, false);
-                }
-            }
-        }
-        _ => {}
+fn close_small_window(app: &AppHandle, label: &str) {
+    if let Some(w) = app.get_webview_window(label) {
+        let _ = w.destroy();
     }
 }
 
-/// 兜底：小窗不该出现却出现了（没被程序显示过的迷你窗、设置里关掉了或已锁定时的悬浮窗），就收起来。
-fn hide_stray_small_windows(app: &AppHandle) {
-    if !MINI_SHOWN.load(Ordering::SeqCst) {
-        if let Some(w) = app.get_webview_window("mini") {
-            if w.is_visible().unwrap_or(false) {
-                log::warn!("迷你窗没有被显示却出现在屏幕上，已收起");
-                let _ = w.hide();
-            }
-        }
-    }
-    let Some(st) = app.try_state::<Arc<AppState>>() else { return };
-    let want = st.settings_raw().float_ball && !crate::security::status(&st).locked;
-    if !want {
-        if let Some(w) = app.get_webview_window("float") {
-            if w.is_visible().unwrap_or(false) {
-                log::warn!("悬浮窗不该显示却出现在屏幕上，已收起");
-                let _ = w.hide();
-            }
-        }
-    }
+/// 收起迷你窗（销毁，下次需要时再创建），同时忘掉上一次给它的内容。
+pub fn close_mini(app: &AppHandle) {
+    close_small_window(app, MINI.label);
+    crate::clipboard::forget_mini_state();
+}
+
+/// 锁定时收起所有小窗。
+pub fn close_small_windows(app: &AppHandle) {
+    close_mini(app);
+    close_small_window(app, FLOAT.label);
 }
 
 #[cfg(test)]

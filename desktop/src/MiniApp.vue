@@ -3,7 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 import { api, errorText, events } from './api'
 import { useLanguage } from './i18n/useLanguage'
 import { useAppStore, useQueueStore } from './stores/app'
-import type { ClipboardLink } from './types'
+import type { AutoResult, ClipboardLink } from './types'
 import { formatSpeed } from './utils/format'
 
 const app = useAppStore()
@@ -33,20 +33,32 @@ function scheduleHide(ms = 10000) {
   hideTimer = window.setTimeout(() => api.hideMini(), ms)
 }
 
+function showLink(p: ClipboardLink) {
+  link.value = p
+  message.value = app.settings?.autoDownload ? '正在解析并加入下载…' : ''
+  failed.value = false
+  scheduleHide()
+}
+
+function showResult(r: AutoResult) {
+  message.value = r.message
+  failed.value = !r.ok
+  scheduleHide(6000)
+}
+
 onMounted(async () => {
   await app.load()
   await queue.start()
-  await events.onClipboardLink((p) => {
-    link.value = p
-    message.value = app.settings?.autoDownload ? '正在解析并加入下载…' : ''
-    failed.value = false
-    scheduleHide()
-  })
-  await events.onAutoResult((r) => {
-    message.value = r.message
-    failed.value = !r.ok
-    scheduleHide(6000)
-  })
+  await events.onClipboardLink(showLink)
+  await events.onAutoResult(showResult)
+  // 迷你窗是用到时才创建的：页面加载好之前发出的链接和自动下载结果在这里补上
+  try {
+    const s = await api.miniReady()
+    if (s.link) showLink(s.link)
+    if (s.result) showResult(s.result)
+  } catch {
+    // 取不到就等下一次事件
+  }
 })
 
 async function downloadNow() {

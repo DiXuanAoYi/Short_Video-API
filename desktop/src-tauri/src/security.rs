@@ -137,11 +137,7 @@ pub fn lock_now(app: &AppHandle) -> bool {
     st.lock.set(true);
     st.media.clear();
     seal_safebox(&st);
-    for label in ["mini", "float"] {
-        if let Some(w) = app.get_webview_window(label) {
-            let _ = w.hide();
-        }
-    }
+    crate::tray::close_small_windows(app);
     let _ = app.emit(EVT_LOCK, serde_json::json!({ "locked": true }));
     true
 }

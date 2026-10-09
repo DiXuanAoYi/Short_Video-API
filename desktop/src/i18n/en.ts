@@ -1563,6 +1563,8 @@ export const en: Record<string, string> = {
   "当前的 ffmpeg 没有 HEVC 编码器，选 HEVC 时会改用 H.264。": "The current ffmpeg has no HEVC encoder; choosing HEVC falls back to H.264.",
   "当前的 ffmpeg 没有 vidstab，会改用 deshake，效果较弱。在“设置 → 组件”里安装完整版 ffmpeg 可以使用 vidstab。": "The current ffmpeg has no vidstab, so deshake is used, which is weaker. Install the full ffmpeg in Settings → Components to use vidstab.",
   "当前的 ffmpeg 没有防抖滤镜。在“设置 → 组件”里安装完整版 ffmpeg 后可以使用。": "The current ffmpeg has no stabilization filter. Install the full ffmpeg in Settings → Components to use it.",
+  "当前的 ffmpeg 没有 vidstab，会改用 deshake，效果较弱。": "The current ffmpeg has no vidstab, so deshake is used, which is weaker.",
+  "当前的 ffmpeg 没有防抖滤镜（vidstab、deshake）。": "The current ffmpeg has no stabilization filter (vidstab or deshake).",
   "所选的项目里没有可以规整的视频文件。": "None of the selected items is a video file that can be normalized.",
   "打开后，竖屏素材自动用竖屏的目标尺寸（例如 1080×1920），横屏素材用横屏的。": "When on, portrait footage uses the portrait target size (e.g. 1080×1920) and landscape footage the landscape one.",
   "把手机录屏、直播录制、平台下载的成片统一成同一种规格：画面尺寸、固定帧率、色彩（HDR 转 SDR、LUT、自动色阶）、黑边、声音响度。不会修改原文件，处理结果会生成新文件。": "Brings phone screen recordings, live recordings and downloaded videos to one spec: picture size, constant frame rate, color (HDR to SDR, LUT, auto levels), black bars and loudness. Originals are never modified; results are new files.",

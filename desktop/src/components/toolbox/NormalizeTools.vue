@@ -189,9 +189,9 @@ const stabNote = computed(() => {
     case 'vidstab':
       return '使用 vidstab 两遍防抖：先分析抖动，再平滑并适当放大裁掉边缘，效果好，耗时约为视频长度的 1–2 倍。'
     case 'deshake':
-      return '当前的 ffmpeg 没有 vidstab，会改用 deshake，效果较弱。在“设置 → 组件”里安装完整版 ffmpeg 可以使用 vidstab。'
+      return caps.value.edition === 'full' ? '当前的 ffmpeg 没有 vidstab，会改用 deshake，效果较弱。' : '当前的 ffmpeg 没有 vidstab，会改用 deshake，效果较弱。在“设置 → 组件”里安装完整版 ffmpeg 可以使用 vidstab。'
     case 'none':
-      return '当前的 ffmpeg 没有防抖滤镜。在“设置 → 组件”里安装完整版 ffmpeg 后可以使用。'
+      return caps.value.edition === 'full' ? '当前的 ffmpeg 没有防抖滤镜（vidstab、deshake）。' : '当前的 ffmpeg 没有防抖滤镜。在“设置 → 组件”里安装完整版 ffmpeg 后可以使用。'
     default:
       return ''
   }
@@ -238,7 +238,7 @@ const imgSrc = (p: string) => convertFileSrc(p)
         <ul>
           <li v-for="n in caps.notes" :key="n">{{ n }}</li>
         </ul>
-        <el-button size="small" link type="primary" @click="app.goSettings('components')">去“设置 → 组件”安装完整版 ffmpeg</el-button>
+        <el-button v-if="caps.edition !== 'full'" size="small" link type="primary" @click="app.goSettings('components')">去“设置 → 组件”安装完整版 ffmpeg</el-button>
       </el-alert>
 
       <el-button link type="primary" class="adv" @click="showAdvanced = !showAdvanced">{{ showAdvanced ? '收起详细设置' : '详细设置（可以改预设里的每一项）' }}</el-button>

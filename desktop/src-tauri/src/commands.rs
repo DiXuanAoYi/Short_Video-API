@@ -785,9 +785,13 @@ pub fn show_main(app: AppHandle) {
 
 #[tauri::command]
 pub fn hide_mini(app: AppHandle) {
-    if let Some(w) = app.get_webview_window("mini") {
-        let _ = w.hide();
-    }
+    tray::close_mini(&app);
+}
+
+/// 迷你窗页面加载好、事件监听都挂上之后调用，取回创建它时对应的链接和已经出来的自动下载结果。
+#[tauri::command]
+pub fn mini_ready() -> crate::clipboard::MiniState {
+    crate::clipboard::take_mini_state()
 }
 
 // ---------- 账号与 Cookie ----------
